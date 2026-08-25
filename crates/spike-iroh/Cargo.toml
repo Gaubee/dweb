@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 tokio = { workspace = true }
 iroh = { workspace = true }
-iroh-relay = { workspace = true }
+# `server` feature is required to run a self-hosted iroh-relay Server.
+iroh-relay = { workspace = true, features = ["server"] }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Stream extensions for consuming Connection::path_events() / address_lookup resolve streams.
+n0-future = "0.3"
