@@ -1,8 +1,9 @@
-//! dweb 自托管服务端：rendezvous 登记/解析（HTTP）+ iroh relay（按 spike 结论接入中）。
+//! dweb 自托管服务端：rendezvous 登记/解析（HTTP）+ iroh relay 桥接。
 
+mod relay;
 mod rendezvous;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// HTTP（rendezvous + healthz）监听地址
 fn http_bind() -> String {
@@ -18,13 +19,21 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let bind = http_bind();
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("bind {bind}"))?;
-    tracing::info!("dweb-server listening on http://{bind}");
+    let relay = relay::start_from_env().await?;
 
-    // TODO(fabric-mvp 4.2): 按 spike-iroh 结论嵌入 iroh-relay 服务端（DWEB_RELAY_ENABLED/DWEB_RELAY_BIND）
-    axum::serve(listener, rendezvous::router()).await?;
+    let bind = http_bind();
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!("dweb-server rendezvous listening on http://{bind}");
+
+    let http = axum::serve(listener, rendezvous::router());
+    tokio::select! {
+        res = http => res?,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down");
+            if let Some(server) = relay {
+                server.shutdown().await?;
+            }
+        }
+    }
     Ok(())
 }

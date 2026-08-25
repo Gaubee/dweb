@@ -24,10 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /usr/local/bin/dweb-server /usr/local/bin/dweb-server
 
 ENV DWEB_HTTP_BIND=0.0.0.0:8787 \
-    DWEB_RELAY_BIND=0.0.0.0:7842 \
+    DWEB_RELAY_HTTP_BIND=0.0.0.0:3340 \
     DWEB_RELAY_ENABLED=true
 
-EXPOSE 8787 7842
+EXPOSE 8787 3340
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
   CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8787 && printf "GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n" >&3 && grep -q "200" <&3'

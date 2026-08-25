@@ -25,7 +25,7 @@
 ## 4. server（crates/dweb-server）
 
 - [x] 4.1 rendezvous 模块：axum 路由（POST/GET /rendezvous/:id、GET /healthz）、签名验证、TTL 过期清理；集成测试（签名受理/拒绝/过期）
-- [ ] 4.2 relay 集成：按 spike 结论嵌入 iroh-relay 服务端，环境变量配置开关与端口
+- [x] 4.2 relay 集成：按 spike 结论嵌入 iroh-relay 服务端，环境变量配置开关与端口
 - [ ] 4.3 端到端：fabric 节点以自托管 relay 完成组网（禁用 n0 默认）的集成测试
 
 ## 5. client-sdk（packages/client-sdk）
