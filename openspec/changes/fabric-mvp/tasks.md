@@ -16,11 +16,11 @@
 
 ## 3. fabric kernel（crates/dweb-fabric，codex P0 重构后）
 
-- [ ] 3.1 identity 模块重构：改用 iroh `SecretKey`（删除 ed25519-dalek 直接依赖），EndpointId 展示串统一 z-base-32（与 iroh 一致）；密钥持久化语义不变（0600/损坏报错）
-- [ ] 3.2 protocol 模块重构：Fact 增加 fabric_id；fact_id = BLAKE3(未签名规范字节)；域分隔签名；Genesis 事实；InviteV1（含 issuer EndpointAddr/max_uses=1/可选 recipient）；challenge-response PoP 材料；quarantine 解码器
-- [ ] 3.3 roster 模块重构：单根 Genesis 闭包（非 root 签发 fail-closed 入库不授权）；Revoke 精确目标 grant；事实集合原子落盘 + 启动重放；invite_id 持久化 CAS 消费
-- [ ] 3.4 session 模块：双 ALPN（redeem/regular）、两侧门控、控制流归属（发起方单条）、HELLO 全量同步、MSG 流、帧上限（1 MiB/32 KiB redeem/5s 时限）、path_events 归纳 LinkStatus、显式 close 语义；集成测试：invite→redeem→grant→session→revoke 全链路 + 窃取者无 PoP 被拒 + 重复兑换被拒
-- [ ] 3.5 public API 整理（Fabric::new/start/stop/invite/join/members/revoke/connect/disconnect/send + 事件 channel），crate 级文档
+- [x] 3.1 identity 模块重构：改用 iroh `SecretKey`（删除 ed25519-dalek 直接依赖），EndpointId 展示串统一 z-base-32（与 iroh 一致）；密钥持久化语义不变（0600/损坏报错）
+- [x] 3.2 protocol 模块重构：Fact 增加 fabric_id；fact_id = BLAKE3(未签名规范字节)；域分隔签名；Genesis 事实；InviteV1（含 issuer EndpointAddr/max_uses=1/可选 recipient）；challenge-response PoP 材料；quarantine 解码器
+- [x] 3.3 roster 模块重构：单根 Genesis 闭包（非 root 签发 fail-closed 入库不授权）；Revoke 精确目标 grant；事实集合原子落盘 + 启动重放；invite_id 持久化 CAS 消费
+- [x] 3.4 session 模块：双 ALPN（redeem/regular）、两侧门控、控制流归属（发起方单条）、HELLO 全量同步、MSG 流、帧上限（1 MiB/32 KiB redeem/5s 时限）、path_events 归纳 LinkStatus、显式 close 语义；集成测试：invite→redeem→grant→session→revoke 全链路 + 窃取者无 PoP 被拒 + 重复兑换被拒
+- [x] 3.5 public API 整理（Fabric::new/start/stop/invite/join/members/revoke/connect/disconnect/send + 事件 channel），crate 级文档
 
 ## 4. server（crates/dweb-server）
 

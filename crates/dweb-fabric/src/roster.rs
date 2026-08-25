@@ -883,6 +883,30 @@ pub fn roster_file_path(data_dir: &Path) -> PathBuf {
     data_dir.join(ROSTER_FILE_NAME)
 }
 
+/// 从已持久化的 roster.facts 头部读出 fabric_id（不加载事实集合）。
+/// 文件缺失返回 None；存在但头部不合法返回 Corrupted。
+pub fn peek_fabric_id(data_dir: &Path) -> Result<Option<FabricId>, RosterError> {
+    let path = roster_file_path(data_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|source| RosterError::Persistence {
+        path: path.clone(),
+        source,
+    })?;
+    let header_len = ROSTER_MAGIC.len() + 32;
+    if bytes.len() < header_len || &bytes[..ROSTER_MAGIC.len()] != ROSTER_MAGIC {
+        return Err(RosterError::Corrupted {
+            path,
+            reason: "bad roster header".to_owned(),
+        });
+    }
+    let id: [u8; 32] = bytes[ROSTER_MAGIC.len()..header_len]
+        .try_into()
+        .expect("len checked");
+    Ok(Some(FabricId(id)))
+}
+
 /// Path of the consumed-invite log inside `data_dir`.
 pub fn consumed_invites_file_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CONSUMED_INVITES_FILE_NAME)
