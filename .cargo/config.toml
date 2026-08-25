@@ -1,0 +1,4 @@
+# 仓库位于网络磁盘（/Volumes/dweb），必须把编译产物放到本地 SSD。
+# 本机开发：此绝对路径生效；CI/其它机器用 CARGO_TARGET_DIR 环境变量覆盖（env 优先级高于本配置）。
+[build]
+target-dir = "/Users/kzf/.cargo-target/dweb"

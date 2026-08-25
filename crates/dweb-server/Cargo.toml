@@ -1,0 +1,28 @@
+[package]
+name = "dweb-server"
+description = "dweb self-hostable server: iroh relay + rendezvous registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dweb-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+iroh-relay = { workspace = true }
+iroh-base = { workspace = true }
+ed25519-dalek = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

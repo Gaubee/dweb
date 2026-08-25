@@ -1,0 +1,14 @@
+{
+  "name": "dweb-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm -r --if-present run test",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "build:rs": "cargo build --workspace --release",
+    "test:rs": "cargo test --workspace",
+    "example": "pnpm --filter @dweb/example start"
+  }
+}

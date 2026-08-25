@@ -1,0 +1,21 @@
+[package]
+name = "dweb-fabric"
+description = "dweb application-level fabric kernel: identity, signed roster, iroh sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+iroh = { workspace = true }
+iroh-base = { workspace = true }
+ed25519-dalek = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

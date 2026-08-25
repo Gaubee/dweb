@@ -1,0 +1,21 @@
+{
+  "name": "@dweb/server-binary",
+  "version": "0.1.0",
+  "description": "dweb self-hostable server binary packaged for npm (darwin-arm64)",
+  "license": "MIT OR Apache-2.0",
+  "bin": {
+    "dweb-server": "./bin/dweb-server.mjs"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}

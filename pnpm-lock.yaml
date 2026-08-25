@@ -1,0 +1,19 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  packages/client-sdk: {}
+
+  packages/example:
+    dependencies:
+      '@dweb/client-sdk':
+        specifier: workspace:*
+        version: link:../client-sdk
+
+  packages/server-binary: {}

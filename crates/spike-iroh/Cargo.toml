@@ -1,0 +1,18 @@
+[package]
+name = "spike-iroh"
+description = "Spike crate validating iroh 1.x APIs before fabric session implementation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "spike-iroh"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+iroh = { workspace = true }
+iroh-relay = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }

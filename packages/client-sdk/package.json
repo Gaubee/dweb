@@ -1,0 +1,20 @@
+{
+  "name": "@dweb/client-sdk",
+  "version": "0.1.0",
+  "description": "dweb application-level fabric SDK for Node (napi-rs binding)",
+  "license": "MIT OR Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "napi build --platform --release --target aarch64-apple-darwin",
+    "build:debug": "napi build --platform --target aarch64-apple-darwin",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}
