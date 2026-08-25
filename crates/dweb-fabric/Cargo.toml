@@ -16,6 +16,10 @@ base64 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+# Debug (non-canonical) JSON projection of facts; canonical bytes are hand-written.
+serde_json = { workspace = true }
+# OS entropy for key generation (already in the workspace graph via rand).
+getrandom = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
