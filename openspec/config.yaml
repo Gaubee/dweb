@@ -1,0 +1,34 @@
+schema: spec-driven
+
+context: |
+  dweb（dweb-cloud）是应用级组网平台：让开发者的多设备应用组成逻辑网络（类似游戏房间，
+  不是系统级 VPN），支持受控邀请他人加入；优先 P2P 直连，回退到可自托管（Docker/VPS）的 Relay。
+  架构分层：身份层（Ed25519 EndpointId，复用 iroh 模型）→ 名册层（Roster = 签名成员/Grant/Revocation
+  事实，union-merge）→ 会话层（TransportAdapter 编排 + 连接门控）→ 同步层（不透明 envelope，Automerge 适配器后续接入）。
+  原生传输选用 iroh 1.0（QUIC 直连 + 打洞 + iroh-relay 自托管）。
+  Tech stack: Rust（fabric lib + server binary，axum）、TypeScript/Node（napi-rs 绑定为 client-sdk）、
+  pnpm workspace monorepo、vitest 测试、GitHub Actions CI。
+  硬约束：本仓库位于网络磁盘（/Volumes/dweb），Rust 编译必须使用本地 CARGO_TARGET_DIR。
+  v0.1 只编译 darwin-arm64。docker 镜像发布到 ghcr.io/gaubee/dweb。
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
