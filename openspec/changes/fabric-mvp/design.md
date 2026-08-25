@@ -24,25 +24,32 @@ docker/                  多阶段构建 → ghcr.io/gaubee/dweb
 
 `Endpoint::builder()` + `discovery_local()`（局域网）+ `discovery_dns()`（可选 n0 或自托管）+ `relay_mode(RelayMode::Custom | Default)`。直连失败自动经 relay。path 类型（direct/relay）经 `conn.remote_addr()`/` endpoint.conn_type()` 可观测。MVP 不用 iroh-blobs/docs/gossip（主线未达生产质量）。
 
-### D2：事实规范序列化与签名
+### D2：事实、签名与授权模型（codex 评审后重订，2026-08-26）
 
-- 事实结构：`Fact { id: Uuid v7, kind: Grant|Join|Revoke, issuer: EndpointId, subject: EndpointId, name: Option<String>, issued_at: unix_ms, expires_at: Option<unix_ms> }`
-- 规范字节：字段按固定顺序、显式长度前缀拼接（length-prefixed canonical bytes），避免 JSON 字典序歧义；签名 = Ed25519 over 规范字节；令牌 = `base64url(canonical bytes || signature)` 前置 `dweb1.` 版本头。
-- union-merge：`HashMap<FactId, Fact>`，插入时验证签名；同 id 不一致记 warn 保留先到。
-- 有效投影：`self ∪ (Grant 未过期未被撤销 ∧ issuer 在投影内)`。根成员 = 本机首个身份（首次创建时签发自 Grant，issuer=self, subject=self）。
+- 密钥统一：身份与事实签名共用 iroh 的 `SecretKey`/`EndpointId`/`Signature`（iroh 1.1 re-export，dalek 3 内核），**不引入第二套 ed25519-dalek 2**。EndpointId 展示串统一用 iroh 的 z-base-32（与 iroh CLI/票据一致），消除"同钥两串"。
+- Fabric 授权：`Genesis { fabric_id, root }`（root 自签、不可变）；v0.1 仅 root 可签 MemberGrant/Revoke；非 root 签发的事实入库但不产生授权（fail-closed）；事实规范字节含 fabric_id，跨 fabric 拒收。
+- 事实 id = BLAKE3(未签名规范字节)（内容寻址，删除随机 UUID）；域分隔前缀 `b"dweb/fact/v1\0"`；签名覆盖域分隔后的规范字节。
+- 邀请 InviteV1（`dweb1.` + base64url）：version | fabric_id | invite_id(16B 随机) | issuer EndpointId | issuer EndpointAddr（relay URL + 可选直连） | expires_at | optional recipient | max_uses=1 | issuer 签名。
+- 兑换 issuer-online：B 连 issuer 的兑换 ALPN，提交令牌 + B 对 (fabric_id, invite_id, 连接绑定材料) 的 PoP；issuer 验证 root 权限仍在、过期、PoP、TLS peer==B、持久化 CAS 消费 invite_id，然后签发 MemberGrant(subject=B) 回执。PoP 的连接绑定材料 v0.1 用（fabric_id, invite_id）与 channel 绑定的简化组合（TLS exporter 若 iroh 未暴露则退化为随机 challenge-response，由 issuer 发 challenge，B 签 challenge——防跨连接重放的效果等同且不依赖 exporter）。
+- 合并 = 内容寻址集合并；解码/签名失败进 quarantine（计数 + 保留样本供诊断）；事实集合原子落盘 + 启动重放。
+- 有效投影：Genesis 出发的确定性闭包；Join 仅自述信息非准入边；Revoke 精确指向 grant（或 subject 全部活 grant）；过期/未知签发者 fail-closed。
 
-### D3：会话协议（运行在 iroh connection 上的应用帧）
+### D3：会话协议（codex 评审后重订，2026-08-26）
 
-单个 iroh ALPN（`/dweb/fabric/1`）双向流，帧格式：`u32 len | u8 type | payload`。帧类型：
+双 ALPN：
 
 ```text
-0x01 HELLO      { roster full dump }   连接建立后双方各发一次
-0x02 FACT       { 单条或多条事实 }      增量同步与 join 交付
-0x03 MSG        { opaque bytes }       业务 envelope，不解析
-0x04 BYE        {}                     主动断开
+/dweb/fabric-redeem/1  兑换通道：单 bidi 流，首帧必为 Redeem{token, PoP 或 challenge 响应}，
+                       32 KiB 上限，5s 时限，单次成功（invite_id CAS 消费），完成即关闭
+/dweb/fabric/1         常规通道：接受/发起两侧先门控（对端 EndpointId ∈ 有效投影），
+                       发起方开唯一控制 bidi 流；HELLO(全量事实 dump) 在门控后交换；
+                       MSG 走后续流（或控制流内的带类型帧）
 ```
 
-门控在 accept 侧执行：对端 EndpointId ∈ 有效投影 → 放行；否则若携带 `INVITE_REDEEM` 帧（0x05：令牌 + Join 事实）则验证并兑换，随后按成员处理；都不满足则拒绝连接。accept 用 `endpoint.accept()` 循环 + ALPN 过滤。
+- 寻址：connect 必须带 EndpointAddr（relay URL/直连地址），来源 = 邀请令牌 / 同步的地址记录 / 显式配置；无线索快速失败（spike 实证 ~500µs）。
+- 帧资源边界：max_frame=1 MiB、max_facts/次同步上限、max_roster_bytes、读超时；长度前缀超限拒绝不预分配。
+- 路径观测：每连接一个 `path_events()` 消费任务归纳 LinkStatus{Direct|Relay}。
+- 关闭语义：显式 `conn.close(code, reason)` + `Endpoint::close().await`；accept 循环以 `accept()==None` 退出（spike 实证）。
 
 ### D4：网络磁盘编译约束
 
@@ -52,16 +59,22 @@ docker/                  多阶段构建 → ghcr.io/gaubee/dweb
 
 `packages/client-sdk` 用 napi-rs（`#[napi(object)]` 结构 + `#[napi]` async 方法）。回调走 `ThreadsafeFunction`。v0.1 用 `@napi-rs/cli` 构建 `darwin-arm64` 单平台 `.node`。API：`Fabric` 类（spec 见 sdk/node）。
 
-### D6：server 形态
+### D6：server 形态（codex 评审后修订）
 
-`crates/dweb-server`：单二进制。relay 复用 `iroh-relay` crate 的服务端（官方镜像同款代码）；rendezvous 用 axum：`POST /rendezvous/:id`（body: addrs + ttl + sig over canonical req），`GET /rendezvous/:id`，`GET /healthz`。配置：`DWEB_RELAY_ENABLED`、`DWEB_HTTP_BIND`、`DWEB_RELAY_BIND`、TLS offload 交给反代（v0.1）。Docker：multi-stage（chef 风格 cargo chef 缓存层 + distroless/debian-slim 运行层）。
+`crates/dweb-server`：单二进制。relay 用 `iroh-relay` 的 **server feature**（`Server::spawn` 自行绑定监听，无法把 axum 路由塞进同一 listener——spike 实证）；rendezvous 独立 HTTP 端口（axum 自行监听）。端口拓扑：`DWEB_HTTP_BIND`（rendezvous + healthz）、`DWEB_RELAY_HTTP_BIND`（relay 控制面，明文 HTTP 本地可用）、`DWEB_RELAY_QUIC_BIND`（relay 数据面 UDP）。TLS：本地/内网明文可用；生产由反代终结 TCP/WS，QUIC 数据面需原生证书（v0.1 文档写明降级边界）。rendezvous 是可选发现辅助，非信任边界。Docker：multi-stage（cargo chef 缓存层 + debian-slim 运行层）。
 
 ### D7：npm 包命名与发布策略
 
 - workspace 内部引用 `workspace:*`；不发布到 npm registry（用户未要求）。
-- `@dweb/server-binary` 的 `postinstall` 不自动下载（离线友好）：包内直接携带 darwin-arm64 二进制（`bin/dweb-server-aarch64-apple-darwin`），`optionalDependencies` 平台包模式留待多平台时启用。
-- ghcr 镜像：`ghcr.io/gaubee/dweb:latest` + `:0.1.0`。发布经 GitHub Actions（GITHUB_TOKEN，packages:write）。
+- `@dweb/server-binary` 保留（Owner 指定交付物，darwin-arm64）：包内直接携带二进制（`bin/dweb-server-aarch64-apple-darwin`）+ bin 入口；Docker 镜像是服务器侧主交付物，两者并存。
+- ghcr 镜像：`ghcr.io/gaubee/dweb`，版本 tag 优先（`:0.1.0`），`latest` 仅为便利不作为验证目标。发布经 GitHub Actions（GITHUB_TOKEN，packages:write）。
 - **本机不使用 docker（Owner 指令 2026-08-26）**：镜像本地构建/验证一律走远端 Mac mini `bngjdemac-mini-7.local` 的 docker daemon（`DOCKER_HOST=ssh://kzf@bngjdemac-mini-7.local`，统一入口 `scripts/docker.sh`）。
+
+### D8：版本锁定（codex 评审新增）
+
+- `iroh = "=1.1.0"`、`iroh-relay = { version = "=1.1.0", features = ["server"] }`、`iroh-base = "=1.1.0"`（1.x 仍在快速演进，含 breaking change；升级逐次读 release notes + 跑跨 NAT 回归）。
+- napi 三件套锁精确版本；`blake3` 进入 workspace deps。
+- `.cargo/config.toml` 的绝对 target-dir 为本机开发便利（CI 用 `CARGO_TARGET_DIR` env 覆盖，env 优先级高于 config）；在 README 注明。
 
 ## 风险与对策
 

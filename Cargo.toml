@@ -4,6 +4,7 @@ members = [
     "crates/dweb-fabric",
     "crates/dweb-server",
     "crates/spike-iroh",
+    "packages/client-sdk",
 ]
 
 [workspace.package]
@@ -14,9 +15,10 @@ repository = "https://github.com/Gaubee/dweb"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
-iroh = "1"
-iroh-relay = "1"
-iroh-base = "1"
+iroh = "=1.1.0"
+iroh-relay = { version = "=1.1.0", features = ["server"] }
+iroh-base = "=1.1.0"
+blake3 = "1"
 ed25519-dalek = "2"
 uuid = { version = "1", features = ["v7"] }
 axum = "0.8"
@@ -27,6 +29,8 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+napi = { version = "3", default-features = false, features = ["napi4", "async"] }
+napi-derive = "3"
 
 [profile.release]
 lto = "thin"

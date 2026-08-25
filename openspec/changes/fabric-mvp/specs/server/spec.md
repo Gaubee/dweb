@@ -8,16 +8,16 @@
 
 ### Requirement: relay 桥接
 
-服务端 SHALL 运行 iroh relay：接受客户端的 relay 协议连接（QUIC/UDP 与 HTTPS 端口可配置），为无法直连的节点对桥接流量。relay MUST NOT 能解密端到端会话内容。客户端 SHALL 能通过配置将本服务端指定为自定义 relay 并完成经 relay 的组网。
+服务端 SHALL 运行 iroh relay（`iroh-relay` crate 的 server feature）：接受客户端的 relay 协议连接，端口拓扑 MUST 明确可配置——HTTP(S) 端口（relay 控制与 WebSocket 桥接）与 QUIC/UDP 端口（数据面）分开配置。无 TLS 的本地/内网部署 SHALL 可用（明文 HTTP relay），生产部署的 TLS 终结职责 MUST 在文档中写明（反代终结 TCP/WS；QUIC 数据面需要原生证书或明确降级说明）。relay MUST NOT 能解密端到端会话内容；relay 不是成员授权点，其访问控制（若启用）仅限制 relay 使用。客户端 SHALL 能通过配置将本服务端指定为自定义 relay 并完成经 relay 的组网。
 
 #### Scenario: 硬 NAT 双方经自托管 relay 组网
 
 - **WHEN** 两节点直连不可达，均配置本服务端为 relay
 - **THEN** 两节点完成连接并交换消息，路径类型为 relay
 
-### Requirement: rendezvous 登记/解析
+### Requirement: rendezvous 登记/解析（可选，不可信发现辅助）
 
-服务端 SHALL 提供 HTTP API：节点可登记自己的 EndpointId 与可达地址（含 TTL），其它节点可按 EndpointId 查询仍在 TTL 内的登记项。登记请求 MUST 携带 EndpointId 对应私钥的签名，服务端 MUST 验证签名后受理；过期的登记项 MUST NOT 出现在查询结果中。
+服务端 SHALL 提供 HTTP API：节点可登记自己的 EndpointId 与可达地址（含 TTL），其它节点可按 EndpointId 查询仍在 TTL 内的登记项。登记请求 MUST 携带 EndpointId 对应私钥的签名（含时间戳与随机数防重放），服务端 MUST 验证签名后受理；过期的登记项 MUST NOT 出现在查询结果中。本 API 是发现辅助而非信任边界：客户端 MUST 把查询结果视为不可信输入，最终以 EndpointId 的 TLS 认证为准；常规会话与兑换的正确性 MUST NOT 依赖本 API。
 
 #### Scenario: 登记后可解析
 

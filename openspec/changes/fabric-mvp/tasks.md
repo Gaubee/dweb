@@ -11,15 +11,15 @@
 
 ## 2. iroh spike（先验证再铺开）
 
-- [ ] 2.1 spike：两进程 iroh Endpoint 按 EndpointId 互连（n0 默认 relay + discovery），发送一条自定义 ALPN 消息；记录 API 用法结论到 `docs/spike-iroh.md`
-- [ ] 2.2 spike：`iroh-relay` 服务端最小运行（本地 curl 健康检查 + 客户端 RelayMode::Custom 经其桥接连通）；结论追加到 `docs/spike-iroh.md`
+- [x] 2.1 spike：两进程 iroh Endpoint 按 EndpointId 互连（n0 默认 relay + discovery），发送一条自定义 ALPN 消息；记录 API 用法结论到 `docs/spike-iroh.md`
+- [x] 2.2 spike：`iroh-relay` 服务端最小运行（本地 curl 健康检查 + 客户端 RelayMode::Custom 经其桥接连通）；结论追加到 `docs/spike-iroh.md`
 
-## 3. fabric kernel（crates/dweb-fabric）
+## 3. fabric kernel（crates/dweb-fabric，codex P0 重构后）
 
-- [ ] 3.1 identity 模块：keypair 生成/加载、EndpointId 编码（z-base-32 或 hex，选定后写死测试）、密钥文件持久化与损坏报错；单元测试覆盖 spec 场景
-- [ ] 3.2 protocol 模块：Fact 结构、规范序列化（length-prefixed）、签名/验证、令牌 `dweb1.` 编解码；单元测试（含非规范编码一致性、过期判定）
-- [ ] 3.3 roster 模块：union-merge、有效投影推导（根成员自 Grant）、撤销/过期逻辑；单元测试覆盖收敛与投影场景
-- [ ] 3.4 session 模块：ALPN accept 循环 + 门控（成员/邀请兑换例外）、帧协议（HELLO/FACT/MSG/BYE/INVITE_REDEEM）、连接管理（connect/在线表/事件广播）、路径类型观测；集成测试：同机双节点 invite→join→send→revoke 全链路
+- [ ] 3.1 identity 模块重构：改用 iroh `SecretKey`（删除 ed25519-dalek 直接依赖），EndpointId 展示串统一 z-base-32（与 iroh 一致）；密钥持久化语义不变（0600/损坏报错）
+- [ ] 3.2 protocol 模块重构：Fact 增加 fabric_id；fact_id = BLAKE3(未签名规范字节)；域分隔签名；Genesis 事实；InviteV1（含 issuer EndpointAddr/max_uses=1/可选 recipient）；challenge-response PoP 材料；quarantine 解码器
+- [ ] 3.3 roster 模块重构：单根 Genesis 闭包（非 root 签发 fail-closed 入库不授权）；Revoke 精确目标 grant；事实集合原子落盘 + 启动重放；invite_id 持久化 CAS 消费
+- [ ] 3.4 session 模块：双 ALPN（redeem/regular）、两侧门控、控制流归属（发起方单条）、HELLO 全量同步、MSG 流、帧上限（1 MiB/32 KiB redeem/5s 时限）、path_events 归纳 LinkStatus、显式 close 语义；集成测试：invite→redeem→grant→session→revoke 全链路 + 窃取者无 PoP 被拒 + 重复兑换被拒
 - [ ] 3.5 public API 整理（Fabric::new/start/stop/invite/join/members/revoke/connect/disconnect/send + 事件 channel），crate 级文档
 
 ## 4. server（crates/dweb-server）
