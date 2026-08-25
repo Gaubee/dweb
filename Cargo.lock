@@ -888,8 +888,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
- "ed25519-dalek 2.2.0",
- "getrandom 0.4.3",
+ "blake3",
  "iroh",
  "iroh-base",
  "serde_json",
@@ -897,7 +896,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

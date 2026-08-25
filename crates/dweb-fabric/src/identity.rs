@@ -1,25 +1,39 @@
-//! Cryptographic node identity for the dweb fabric.
+//! Cryptographic node identity for the dweb fabric (v1, iroh-key based).
 //!
-//! An identity is an Ed25519 keypair. The public half doubles as the stable
-//! node identifier ([`EndpointId`]), fully decoupled from any network address.
-//! The 32-byte seed is persisted in a dedicated file inside the node's data
-//! directory so that identity survives restarts and directory migration.
+//! An identity is an Ed25519 keypair provided by iroh (`iroh_base::SecretKey`,
+//! dalek-3 under the hood). The public half doubles as the stable node
+//! identifier [`EndpointId`] (= `iroh_base::PublicKey`), fully decoupled from
+//! any network address. **Signing and verification for facts, invites and
+//! proofs-of-possession all go through the same iroh key types** — there is no
+//! second, unbound Ed25519 stack in this crate (design D2 / codex review §1).
+//!
+//! # Display form (z-base-32)
+//!
+//! `PublicKey`'s own `Display`/`FromStr` in iroh-base 1.1.0 are **hex**, not
+//! z-base-32 (see `iroh-base/src/key.rs`: `Display` writes `HEXLOWER`, the
+//! `FromStr` doc says "Display produces the hex encoding"). The dweb display
+//! form is therefore the explicit `to_z32()`/`from_z32()` methods, which match
+//! the iroh CLI and ticket encodings — use [`endpoint_id_display`] and
+//! [`endpoint_id_parse`] instead of `to_string`/`parse`.
 //!
 //! # Persistence contract (fabric/identity spec)
 //!
-//! - File: `<data_dir>/identity.key`, exactly 32 bytes (the Ed25519 seed),
-//!   permissions `0600` on unix.
-//! - Missing file: a fresh identity is generated and persisted.
-//! - Existing file with a length other than 32: [`IdentityError::Corrupted`]
-//!   is returned (including the file path). We never silently regenerate an
-//!   identity over a damaged key file, because that would orphan the node's
-//!   roster membership.
+//! - File: `<data_dir>/identity.key`, exactly 32 bytes (the Ed25519 seed via
+//!   `SecretKey::to_bytes`), permissions `0600` on unix.
+//! - Missing file: a fresh identity is generated and persisted atomically
+//!   (tmp + fsync + rename).
+//! - Existing file whose length is not exactly 32 bytes:
+//!   [`IdentityError::Corrupted`] including the file path. We never silently
+//!   regenerate an identity over a damaged key file: a fresh key would orphan
+//!   the node's roster membership.
+//! - Note: `SecretKey::from_bytes` accepts *any* 32 bytes (clamping happens
+//!   on use), so only the length is checkable — same contract as the spike
+//!   report (docs/spike-iroh.md §5).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use iroh_base::{PublicKey, SecretKey};
 use thiserror::Error;
 
 /// File name of the persisted seed inside the data directory.
@@ -28,7 +42,13 @@ pub const KEY_FILE_NAME: &str = "identity.key";
 /// Length in bytes of an Ed25519 seed and of an [`EndpointId`].
 pub const SEED_LEN: usize = 32;
 
-/// Errors produced by identity loading, persistence and [`EndpointId`] parsing.
+/// Stable public identifier of a node: the iroh Ed25519 public key.
+///
+/// Same key material as the iroh endpoint id, so the TLS-authenticated peer
+/// id of a connection is directly comparable to fact issuers and subjects.
+pub type EndpointId = PublicKey;
+
+/// Errors produced by identity loading, persistence and EndpointId parsing.
 #[derive(Debug, Error)]
 pub enum IdentityError {
     /// The key file exists but cannot be parsed as key material.
@@ -48,160 +68,64 @@ pub enum IdentityError {
         #[source]
         source: std::io::Error,
     },
-    /// The OS entropy source failed while generating a new keypair.
-    #[error("failed to gather entropy for a new identity: {source}")]
-    Entropy {
-        #[source]
-        source: getrandom::Error,
-    },
-    /// A string did not parse as an [`EndpointId`].
+    /// A string did not parse as an [`EndpointId`] (z-base-32 form).
     #[error("invalid EndpointId string: {reason}")]
     InvalidEndpointId { reason: String },
 }
 
-/// Stable public identifier of a node: the raw 32-byte Ed25519 verifying key.
-///
-/// The display form is exactly 64 lower-case hex characters, derived purely
-/// from the key bytes, so the same public key always renders identically on
-/// every device. [`FromStr`] is the inverse of [`fmt::Display`] (it accepts
-/// upper-case hex on input as well).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EndpointId([u8; EndpointId::LEN]);
-
-impl EndpointId {
-    /// Length of an EndpointId in bytes.
-    pub const LEN: usize = SEED_LEN;
-
-    /// Wraps raw key bytes.
-    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Raw key bytes.
-    pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
-        &self.0
-    }
-
-    /// Raw key bytes, by value.
-    pub const fn to_bytes(self) -> [u8; Self::LEN] {
-        self.0
-    }
-
-    /// Identifier derived from a signing key's verifying (public) key.
-    pub fn from_signing_key(key: &SigningKey) -> Self {
-        Self(key.verifying_key().to_bytes())
-    }
-
-    fn hex_encode(bytes: &[u8; Self::LEN]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0x0f) as usize] as char);
-        }
-        out
-    }
-
-    fn hex_decode(s: &str) -> Result<[u8; Self::LEN], IdentityError> {
-        let err = |reason: String| IdentityError::InvalidEndpointId {
-            reason: format!("{reason} (got {s:?})"),
-        };
-        if s.len() != Self::LEN * 2 {
-            return Err(err(format!(
-                "expected {} hex characters, found {}",
-                Self::LEN * 2,
-                s.len()
-            )));
-        }
-        let mut out = [0u8; Self::LEN];
-        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            let hi = hex_nibble(chunk[0]).ok_or_else(|| err("non-hex character".into()))?;
-            let lo = hex_nibble(chunk[1]).ok_or_else(|| err("non-hex character".into()))?;
-            out[i] = (hi << 4) | lo;
-        }
-        Ok(out)
-    }
+/// The display form of an [`EndpointId`]: z-base-32 (52 characters), the same
+/// encoding the iroh CLI and tickets use. Deterministic across devices.
+pub fn endpoint_id_display(id: &EndpointId) -> String {
+    id.to_z32()
 }
 
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+/// Parses the z-base-32 display form produced by [`endpoint_id_display`].
+pub fn endpoint_id_parse(s: &str) -> Result<EndpointId, IdentityError> {
+    PublicKey::from_z32(s).map_err(|e| IdentityError::InvalidEndpointId {
+        reason: format!("{e} (got {s:?})"),
+    })
 }
 
-impl fmt::Display for EndpointId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&EndpointId::hex_encode(&self.0))
-    }
-}
-
-impl fmt::Debug for EndpointId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "EndpointId({})", EndpointId::hex_encode(&self.0))
-    }
-}
-
-impl FromStr for EndpointId {
-    type Err = IdentityError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(EndpointId::hex_decode(s)?))
-    }
-}
-
-impl From<[u8; SEED_LEN]> for EndpointId {
-    fn from(bytes: [u8; SEED_LEN]) -> Self {
-        Self::from_bytes(bytes)
-    }
-}
-
-/// A node's Ed25519 identity: secret signing key plus derived
+/// A node's Ed25519 identity: the iroh secret key plus its derived
 /// [`EndpointId`].
 ///
-/// The signing key is zeroized on drop (ed25519-dalek default feature).
-/// `Debug` deliberately never prints the seed.
+/// The secret key is zeroized on drop (iroh-base default). `Debug` never
+/// prints the seed.
 #[derive(Clone)]
 pub struct NodeIdentity {
-    signing: SigningKey,
+    secret: SecretKey,
 }
 
 impl NodeIdentity {
-    /// Generates a fresh identity from OS entropy.
-    pub fn generate() -> Result<Self, IdentityError> {
-        let mut seed = [0u8; SEED_LEN];
-        getrandom::fill(&mut seed).map_err(|source| IdentityError::Entropy { source })?;
-        Ok(Self::from_seed(seed))
+    /// Generates a fresh identity from OS entropy (`SecretKey::generate`).
+    pub fn generate() -> Self {
+        Self {
+            secret: SecretKey::generate(),
+        }
     }
 
     /// Restores an identity from a 32-byte seed. Any 32 bytes are a valid
     /// Ed25519 seed (clamping is applied internally on use).
     pub fn from_seed(seed: [u8; SEED_LEN]) -> Self {
         Self {
-            signing: SigningKey::from_bytes(&seed),
+            secret: SecretKey::from_bytes(&seed),
         }
     }
 
-    /// The derived stable identifier (== Ed25519 verifying key).
+    /// The derived stable identifier (== the iroh endpoint id).
     pub fn endpoint_id(&self) -> EndpointId {
-        EndpointId::from_signing_key(&self.signing)
+        self.secret.public()
     }
 
-    /// The Ed25519 verifying key.
-    pub fn verifying_key(&self) -> VerifyingKey {
-        self.signing.verifying_key()
-    }
-
-    /// The Ed25519 signing key, for signing facts elsewhere in the crate.
-    pub fn signing_key(&self) -> &SigningKey {
-        &self.signing
+    /// The iroh secret key, for signing facts, invites and PoPs elsewhere in
+    /// the crate.
+    pub fn secret_key(&self) -> &SecretKey {
+        &self.secret
     }
 
     /// The secret seed. Handle with care: whoever holds it *is* this node.
     pub fn seed(&self) -> [u8; SEED_LEN] {
-        self.signing.to_bytes()
+        self.secret.to_bytes()
     }
 
     /// Path of the key file inside `data_dir`.
@@ -229,13 +153,13 @@ impl NodeIdentity {
                         ),
                     });
                 }
-                let mut seed = [0u8; SEED_LEN];
-                seed.copy_from_slice(&bytes);
+                let seed: [u8; SEED_LEN] =
+                    bytes.as_slice().try_into().expect("length checked above");
                 Ok(Self::from_seed(seed))
             }
             // Missing file: generate fresh material and persist it.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                let identity = Self::generate()?;
+                let identity = Self::generate();
                 identity.write_seed_file(&path)?;
                 Ok(identity)
             }
@@ -260,11 +184,12 @@ impl NodeIdentity {
                 source,
             })?;
         restrict_permissions(&tmp)?;
-        file.write_all(&self.seed())
-            .map_err(|source| IdentityError::Write {
+        std::io::Write::write_all(&mut file, &self.seed()).map_err(|source| {
+            IdentityError::Write {
                 path: tmp.clone(),
                 source,
-            })?;
+            }
+        })?;
         file.sync_all().map_err(|source| IdentityError::Write {
             path: tmp.clone(),
             source,
@@ -281,13 +206,10 @@ impl NodeIdentity {
 impl fmt::Debug for NodeIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeIdentity")
-            .field("endpoint_id", &self.endpoint_id())
+            .field("endpoint_id", &endpoint_id_display(&self.endpoint_id()))
             .finish_non_exhaustive()
     }
 }
-
-// `file.write_all` above needs `io::Write` in scope.
-use std::io::Write as _;
 
 /// Marks `path` as readable/writable by the current user only (unix).
 #[cfg(unix)]
@@ -312,38 +234,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_is_deterministic_and_roundtrips() {
+    fn z32_display_is_deterministic_and_roundtrips() {
         let a = NodeIdentity::from_seed([7u8; 32]);
         let b = NodeIdentity::from_seed([7u8; 32]);
-        let id_a = a.endpoint_id();
-        let id_b = b.endpoint_id();
-        // Same public key -> same string, regardless of instance.
-        assert_eq!(id_a.to_string(), id_b.to_string());
-        assert_eq!(id_a.to_string().len(), 64);
-        // Lower-case hex only.
+        // Same public key -> same display string, regardless of instance.
+        let sa = endpoint_id_display(&a.endpoint_id());
+        let sb = endpoint_id_display(&b.endpoint_id());
+        assert_eq!(sa, sb);
+        // z-base-32 of 32 bytes is 52 characters.
+        assert_eq!(sa.len(), 52);
         assert!(
-            id_a.to_string()
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            sa.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         );
 
         // Round-trip.
-        let parsed: EndpointId = id_a.to_string().parse().unwrap();
-        assert_eq!(parsed, id_a);
-        // Upper-case input accepted too.
-        let upper: EndpointId = id_a.to_string().to_uppercase().parse().unwrap();
-        assert_eq!(upper, id_a);
+        let parsed = endpoint_id_parse(&sa).unwrap();
+        assert_eq!(parsed, a.endpoint_id());
+
+        // Distinct keys -> distinct strings.
+        let other = endpoint_id_display(&NodeIdentity::from_seed([8u8; 32]).endpoint_id());
+        assert_ne!(sa, other);
     }
 
     #[test]
     fn endpoint_id_parse_rejects_garbage() {
-        for bad in ["", "zz", &"a".repeat(63), &"a".repeat(65), &"x".repeat(64)] {
-            let res: Result<EndpointId, _> = bad.parse();
-            assert!(res.is_err(), "expected parse failure for {bad:?}");
+        for bad in ["", "zz", &"a".repeat(51), &"a".repeat(53), "not-a-z32-id!!"] {
+            assert!(
+                endpoint_id_parse(bad).is_err(),
+                "expected parse failure for {bad:?}"
+            );
         }
-        // 64 valid hex chars parse fine.
-        let ok: EndpointId = "0".repeat(64).parse().unwrap();
-        assert_eq!(ok.as_bytes(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn display_is_hex_in_iroh_but_z32_is_ours() {
+        // Guard the documented iroh-base fact: PublicKey's Display is hex
+        // (64 chars), NOT z32. Our display helpers must use z32.
+        let id = NodeIdentity::from_seed([7u8; 32]).endpoint_id();
+        assert_eq!(id.to_string().len(), 64, "iroh Display is hex");
+        assert_ne!(id.to_string(), endpoint_id_display(&id));
+        assert_eq!(endpoint_id_display(&id), id.to_z32());
     }
 
     #[test]
@@ -358,6 +289,14 @@ mod tests {
         let id2 = NodeIdentity::load_or_create(dir.path()).unwrap();
         assert_eq!(id1.endpoint_id(), id2.endpoint_id());
         assert_eq!(id1.seed(), id2.seed());
+    }
+
+    #[test]
+    fn seed_roundtrip_through_secret_key_bytes() {
+        // to_bytes -> from_bytes -> public() restores the same id (spike §5).
+        let id = NodeIdentity::from_seed([3u8; 32]);
+        let restored = NodeIdentity::from_seed(id.seed());
+        assert_eq!(id.endpoint_id(), restored.endpoint_id());
     }
 
     #[test]
@@ -436,6 +375,6 @@ mod tests {
         let id = NodeIdentity::from_seed([9u8; 32]);
         let dbg = format!("{id:?}");
         assert!(!dbg.contains("seed"));
-        assert!(dbg.contains(&id.endpoint_id().to_string()));
+        assert!(dbg.contains(&endpoint_id_display(&id.endpoint_id())));
     }
 }

@@ -26,7 +26,7 @@ docker/                  多阶段构建 → ghcr.io/gaubee/dweb
 
 ### D2：事实、签名与授权模型（codex 评审后重订，2026-08-26）
 
-- 密钥统一：身份与事实签名共用 iroh 的 `SecretKey`/`EndpointId`/`Signature`（iroh 1.1 re-export，dalek 3 内核），**不引入第二套 ed25519-dalek 2**。EndpointId 展示串统一用 iroh 的 z-base-32（与 iroh CLI/票据一致），消除"同钥两串"。
+- 密钥统一：身份与事实签名共用 iroh 的 `SecretKey`/`EndpointId`/`Signature`（iroh 1.1 re-export，dalek 3 内核），**不引入第二套 ed25519-dalek 2**。EndpointId 展示串统一用 iroh 的 z-base-32（与 iroh CLI/票据一致），消除"同钥两串"。注意：iroh `PublicKey` 的 `Display`/`FromStr` 是 **hex**（iroh-base 1.1.0 源码实证），因此 dweb 一律走 `identity::endpoint_id_display/endpoint_id_parse`（z32），并有测试守护防止误用 `to_string()`。
 - Fabric 授权：`Genesis { fabric_id, root }`（root 自签、不可变）；v0.1 仅 root 可签 MemberGrant/Revoke；非 root 签发的事实入库但不产生授权（fail-closed）；事实规范字节含 fabric_id，跨 fabric 拒收。
 - 事实 id = BLAKE3(未签名规范字节)（内容寻址，删除随机 UUID）；域分隔前缀 `b"dweb/fact/v1\0"`；签名覆盖域分隔后的规范字节。
 - 邀请 InviteV1（`dweb1.` + base64url）：version | fabric_id | invite_id(16B 随机) | issuer EndpointId | issuer EndpointAddr（relay URL + 可选直连） | expires_at | optional recipient | max_uses=1 | issuer 签名。
