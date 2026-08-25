@@ -5,4 +5,4 @@ pub mod roster;
 pub mod session;
 
 pub use fabric::{Fabric, FabricConfig, FabricError, FabricEvent, MemberInfo, RelayConfig};
-pub use session::SessionError;
+pub use session::{LinkStatus, SessionError};

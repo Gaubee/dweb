@@ -30,8 +30,8 @@
 
 ## 5. client-sdk（packages/client-sdk）
 
-- [ ] 5.1 napi-rs 工程接入（build.rs、index.d.ts 生成、@napi-rs/cli 构建脚本 darwin-arm64）
-- [ ] 5.2 Fabric 类绑定 + ThreadsafeFunction 事件；vitest 单测（生命周期幂等、API 面）；不支持平台的明确报错路径
+- [x] 5.1 napi-rs 工程接入（build.rs、index.d.ts 生成、@napi-rs/cli 构建脚本 darwin-arm64）
+- [x] 5.2 Fabric 类绑定 + ThreadsafeFunction 事件；vitest 单测（生命周期幂等、API 面）；不支持平台的明确报错路径
 - [ ] 5.3 README（API 表 + 最小示例代码）
 
 ## 6. example（packages/example）
@@ -41,7 +41,7 @@
 
 ## 7. server-binary 包 + docker
 
-- [ ] 7.1 `packages/server-binary`：拷贝 darwin-arm64 二进制、bin 入口（`dweb-server`）+ Node API（start/stop）、健康检查自测脚本
+- [x] 7.1 `packages/server-binary`：拷贝 darwin-arm64 二进制、bin 入口（`dweb-server`）+ Node API（start/stop）、健康检查自测脚本
 - [ ] 7.2 `docker/Dockerfile`：cargo chef 缓存层 + 运行层；本地构建镜像并以两个容器验证 relay 组网
 - [ ] 7.3 发布 ghcr.io/gaubee/dweb（:0.1.0 与 :latest）；验证 pull 后 healthz
 

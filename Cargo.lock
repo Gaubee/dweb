@@ -875,10 +875,12 @@ dependencies = [
 name = "dweb-client-sdk"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "dweb-fabric",
  "napi",
  "napi-build",
  "napi-derive",
+ "serde_json",
  "tokio",
 ]
 
@@ -889,8 +891,10 @@ dependencies = [
  "anyhow",
  "base64",
  "blake3",
+ "hex",
  "iroh",
  "iroh-base",
+ "n0-future",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",

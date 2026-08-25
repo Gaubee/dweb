@@ -1,0 +1,28 @@
+// 从 cargo target 拷贝 darwin-arm64 release 二进制到包内 bin/
+import { spawnSync } from "node:child_process";
+import { cpSync, chmodSync, mkdirSync, existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const pkgDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const binDir = path.join(pkgDir, "bin");
+mkdirSync(binDir, { recursive: true });
+
+const built = spawnSync(
+  "cargo",
+  ["build", "--release", "-p", "dweb-server"],
+  { stdio: "inherit", cwd: path.join(pkgDir, "..", "..") },
+);
+if (built.status !== 0) {
+  throw new Error("cargo build failed");
+}
+
+const targetDir = process.env.CARGO_TARGET_DIR ?? path.join(process.env.HOME ?? "~", ".cargo-target", "dweb");
+const src = path.join(targetDir, "release", "dweb-server");
+if (!existsSync(src)) {
+  throw new Error(`binary not found at ${src}`);
+}
+const dest = path.join(binDir, "dweb-server-aarch64-apple-darwin");
+cpSync(src, dest);
+chmodSync(dest, 0o755);
+console.log("packed: bin/dweb-server-aarch64-apple-darwin");

@@ -8,14 +8,20 @@
   },
   "main": "index.js",
   "types": "index.d.ts",
+  "type": "module",
+  "scripts": {
+    "pack:binary": "node scripts/pack.mjs",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  },
   "os": [
     "darwin"
   ],
   "cpu": [
     "arm64"
-  ],
-  "scripts": {
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
-  }
+  ]
 }

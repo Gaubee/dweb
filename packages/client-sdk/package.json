@@ -5,11 +5,22 @@
   "license": "MIT OR Apache-2.0",
   "main": "index.js",
   "types": "index.d.ts",
+  "napi": {
+    "binaryName": "dweb",
+    "targets": [
+      "aarch64-apple-darwin"
+    ]
+  },
   "scripts": {
-    "build": "napi build --platform --release --target aarch64-apple-darwin",
-    "build:debug": "napi build --platform --target aarch64-apple-darwin",
-    "test": "vitest run",
+    "build": "napi build --platform --release --target aarch64-apple-darwin --no-js",
+    "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js",
+    "test": "node --test",
     "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
   },
   "os": [
     "darwin"
