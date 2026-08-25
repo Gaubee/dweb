@@ -60,7 +60,8 @@ docker/                  多阶段构建 → ghcr.io/gaubee/dweb
 
 - workspace 内部引用 `workspace:*`；不发布到 npm registry（用户未要求）。
 - `@dweb/server-binary` 的 `postinstall` 不自动下载（离线友好）：包内直接携带 darwin-arm64 二进制（`bin/dweb-server-aarch64-apple-darwin`），`optionalDependencies` 平台包模式留待多平台时启用。
-- ghcr 镜像：`ghcr.io/gaubee/dweb:latest` + `:0.1.0`。
+- ghcr 镜像：`ghcr.io/gaubee/dweb:latest` + `:0.1.0`。发布经 GitHub Actions（GITHUB_TOKEN，packages:write）。
+- **本机不使用 docker（Owner 指令 2026-08-26）**：镜像本地构建/验证一律走远端 Mac mini `bngjdemac-mini-7.local` 的 docker daemon（`DOCKER_HOST=ssh://kzf@bngjdemac-mini-7.local`，统一入口 `scripts/docker.sh`）。
 
 ## 风险与对策
 

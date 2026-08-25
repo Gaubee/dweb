@@ -5,8 +5,8 @@
 
 ## 1. 工作区骨架
 
-- [ ] 1.1 创建根 `Cargo.toml`（workspace: crates/*）、`pnpm-workspace.yaml`（packages/*）、根 `package.json`、`.gitignore`（target/ node_modules/ dist/ .env 等）、`.cargo/config.toml` 占位、`rust-toolchain.toml`（stable）
-- [ ] 1.2 `packages/*` 三包骨架（package.json + tsconfig 继承根配置）；`crates/*` 两 crate 骨架（lib.rs/bin.rs 空实现可编译）
+- [x] 1.1 创建根 `Cargo.toml`（workspace: crates/*）、`pnpm-workspace.yaml`（packages/*）、根 `package.json`、`.gitignore`（target/ node_modules/ dist/ .env 等）、`.cargo/config.toml` 占位、`rust-toolchain.toml`（stable）
+- [x] 1.2 `packages/*` 三包骨架（package.json + tsconfig 继承根配置）；`crates/*` 两 crate 骨架（lib.rs/bin.rs 空实现可编译）
 - [ ] 1.3 验证：`cargo check` 通过（本地 target dir）、`pnpm install` 通过、`pnpm -r build` 空跑通过
 
 ## 2. iroh spike（先验证再铺开）
@@ -24,7 +24,7 @@
 
 ## 4. server（crates/dweb-server）
 
-- [ ] 4.1 rendezvous 模块：axum 路由（POST/GET /rendezvous/:id、GET /healthz）、签名验证、TTL 过期清理；集成测试（签名受理/拒绝/过期）
+- [x] 4.1 rendezvous 模块：axum 路由（POST/GET /rendezvous/:id、GET /healthz）、签名验证、TTL 过期清理；集成测试（签名受理/拒绝/过期）
 - [ ] 4.2 relay 集成：按 spike 结论嵌入 iroh-relay 服务端，环境变量配置开关与端口
 - [ ] 4.3 端到端：fabric 节点以自托管 relay 完成组网（禁用 n0 默认）的集成测试
 
