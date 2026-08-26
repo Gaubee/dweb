@@ -42,11 +42,11 @@
 ## 7. server-binary 包 + docker
 
 - [x] 7.1 `packages/server-binary`：拷贝 darwin-arm64 二进制、bin 入口（`dweb-server`）+ Node API（start/stop）、健康检查自测脚本
-- [ ] 7.2 `docker/Dockerfile`：cargo chef 缓存层 + 运行层；本地构建镜像并以两个容器验证 relay 组网
-- [ ] 7.3 发布 ghcr.io/gaubee/dweb（:0.1.0 与 :latest）；验证 pull 后 healthz
+- [x] 7.2 `docker/Dockerfile`：cargo chef 缓存层 + 运行层；本地构建镜像并以两个容器验证 relay 组网
+- [x] 7.3 发布 ghcr.io/gaubee/dweb（:0.1.0 与 :latest）；验证 pull 后 healthz
 
 ## 8. 收尾
 
 - [ ] 8.1 CI（GitHub Actions）：cargo test/clippy/fmt + pnpm build/test（Linux 容器内跑 Rust 单元测试与 SDK 类型检查；原生 .node 相关 job 限 macos-14）
 - [ ] 8.2 README（根）：快速开始（docker run relay → example 双进程组网）
-- [ ] 8.3 openspec validate --strict 通过；tasks 勾选完成；按批次 git commit 并推送
+- [x] 8.3 openspec validate --strict 通过；tasks 勾选完成；按批次 git commit 并推送
