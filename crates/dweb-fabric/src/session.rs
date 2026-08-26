@@ -60,6 +60,13 @@ pub mod frame_type {
     pub const REDEEM_ERR: u8 = 0x14;
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 帧头：u32 BE 长度（type + payload）+ u8 类型
 pub async fn write_frame(
     send: &mut SendStream,
@@ -105,15 +112,20 @@ pub enum LinkStatus {
     Unknown,
 }
 
-/// 监听一条连接的 path_events，把选中路径归纳为 LinkStatus 并回写。
-pub fn spawn_path_watcher(conn: Connection, tx: Arc<std::sync::Mutex<LinkStatus>>) {
+/// 监听一条连接的 path_events，把选中路径归纳为 LinkStatus 回写并在变化时发事件。
+pub fn spawn_path_watcher(
+    conn: Connection,
+    tx: Arc<std::sync::Mutex<LinkStatus>>,
+    events_tx: tokio::sync::broadcast::Sender<crate::FabricEvent>,
+    endpoint_id: EndpointId,
+) {
     use n0_future::StreamExt;
     let mut events = conn.path_events();
     tokio::spawn(async move {
+        let mut last: Option<LinkStatus> = None;
         while let Some(ev) = events.next().await {
-            match &ev {
-                iroh::endpoint::PathEvent::Selected { .. } => {}
-                _ => continue,
+            if !matches!(&ev, iroh::endpoint::PathEvent::Selected { .. }) {
+                continue;
             }
             let status = conn
                 .paths()
@@ -126,6 +138,13 @@ pub fn spawn_path_watcher(conn: Connection, tx: Arc<std::sync::Mutex<LinkStatus>
                 })
                 .unwrap_or(LinkStatus::Unknown);
             *tx.lock().unwrap() = status;
+            if last != Some(status) {
+                last = Some(status);
+                let _ = events_tx.send(crate::FabricEvent::PathChanged {
+                    endpoint_id: crate::identity::endpoint_id_display(&endpoint_id),
+                    status,
+                });
+            }
         }
     });
 }
@@ -230,8 +249,9 @@ pub async fn handle_redeem_as_issuer(
     conn: &Connection,
     roster: &Arc<tokio::sync::Mutex<Roster>>,
     identity: &crate::identity::NodeIdentity,
-    now_ms: u64,
 ) -> Result<(), SessionError> {
+    // PoP 声明的 redeemer 必须等于 TLS 已认证的连接对端
+    let expected_remote = conn.remote_id();
     tokio::time::timeout(REDEEM_DEADLINE, async {
         let (mut send, mut recv) = conn.accept_bi().await?;
         let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME).await?;
@@ -267,18 +287,24 @@ pub async fn handle_redeem_as_issuer(
         let redeemer = EndpointId::from_bytes(payload[0..32].try_into().unwrap())
             .map_err(|_| SessionError::RedeemRejected("bad redeemer key".into()))?;
         let sig = iroh_base::Signature::from_bytes(payload[32..96].try_into().unwrap());
+        if redeemer != expected_remote {
+            return Err(SessionError::RedeemRejected(
+                "redeemer key does not match TLS peer".into(),
+            ));
+        }
 
         let mut r = roster.lock().await;
-        if let Err(e) = r.redeem_verify(&token, &redeemer, &challenge, &sig, now_ms) {
+        // 过期判断取当前时间，而非任务开始时的快照
+        if let Err(e) = r.redeem_verify(&token, &redeemer, &challenge, &sig, now_ms()) {
             let _ = write_frame(&mut send, frame_type::REDEEM_ERR, e.to_string().as_bytes()).await;
             return Err(SessionError::RedeemRejected(e.to_string()));
         }
-        if !r.consume_invite(&token.invite.invite_id, now_ms)? {
+        if !r.consume_invite(&token.invite.invite_id, now_ms())? {
             return Err(SessionError::RedeemRejected(
                 "invite already consumed".into(),
             ));
         }
-        r.grant(identity, redeemer, None, None, now_ms)?;
+        r.grant(identity, redeemer, None, None, now_ms())?;
         // grant 已入库，回执 = 全量事实 dump（joiner 首次获得名册）
         let receipt = SignedFact::encode_all(r.facts())?;
         write_frame(&mut send, frame_type::REDEEM_OK, &receipt).await?;

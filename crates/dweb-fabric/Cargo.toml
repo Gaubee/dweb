@@ -19,6 +19,7 @@ anyhow = { workspace = true }
 # Debug (non-canonical) JSON projection of facts; canonical bytes are hand-written.
 serde_json = { workspace = true }
 hex = "0.4"
+libc = "0.2"
 n0-future = "0.3"
 
 [dev-dependencies]

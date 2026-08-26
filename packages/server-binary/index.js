@@ -29,15 +29,23 @@ if (SUPPORTED !== EXPECTED) {
 export async function startServer(options = {}) {
   const binDir = path.dirname(fileURLToPath(import.meta.url));
   const srcBin = path.join(binDir, "bin", "dweb-server-aarch64-apple-darwin");
-  // SMB 网络磁盘上的原生二进制会触发 CODESIGNING Invalid Page：拷到 tmp 内容寻址新路径执行
+  // SMB 网络磁盘上的原生二进制会触发 CODESIGNING Invalid Page：拷到私有 tmp 目录执行
   const buf = fs.readFileSync(srcBin);
   const hash = createHash("sha256").update(buf).digest("hex").slice(0, 24);
-  const binPath = path.join(os.tmpdir(), `dweb-server-${hash}`);
+  let binPath = srcBin;
   try {
-    fs.rmSync(binPath, { force: true });
-    fs.writeFileSync(binPath, buf, { mode: 0o755 });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dweb-server-"));
+    const dest = path.join(dir, hash);
+    const fd = fs.openSync(dest, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o755);
+    try {
+      fs.writeFileSync(fd, buf);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    binPath = dest;
   } catch {
-    // 退回直接执行
+    binPath = srcBin; // 退回直接执行源路径
   }
 
   const httpBind = options.httpBind ?? "127.0.0.1:8787";

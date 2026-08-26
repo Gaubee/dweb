@@ -895,6 +895,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-base",
+ "libc",
  "n0-future",
  "serde_json",
  "tempfile",

@@ -90,6 +90,8 @@ struct PeerEntry {
     ctrl_send: Arc<Mutex<endpoint::SendStream>>,
     /// 连接是否已关闭（watcher 异步置位；幂等快捷路径据此判断存活）
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// 连接代次：旧连接的 watcher 只允许删除同代次条目
+    epoch: u64,
 }
 
 pub struct FabricInner {
@@ -102,6 +104,8 @@ pub struct FabricInner {
     advertise_addrs: Vec<String>,
     /// 从邀请令牌/连接学到的对端可达信息（relay URL 或 ip:port）
     known_addrs: Mutex<HashMap<EndpointId, Vec<String>>>,
+    /// peer 连接代次计数器（防旧 watcher 误删新连接）
+    peer_epoch: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -187,6 +191,7 @@ impl Fabric {
             relay: config.relay.clone(),
             advertise_addrs: config.advertise_addrs.clone(),
             known_addrs: Mutex::new(HashMap::new()),
+            peer_epoch: std::sync::atomic::AtomicU64::new(0),
         });
         spawn_accept_loop(&inner);
         Ok(Fabric { inner })
@@ -389,7 +394,7 @@ impl Fabric {
         Ok(())
     }
 
-    /// 优雅关闭：断开全部会话并关闭 endpoint。
+    /// 优雅关闭：断开全部会话并关闭 endpoint；释放 data-dir 排他锁（幂等）。
     pub async fn shutdown(&self) -> Result<(), FabricError> {
         let peers = self.inner.peers.lock().await;
         for entry in peers.values() {
@@ -484,9 +489,35 @@ impl Fabric {
         &self,
         facts: Vec<crate::protocol::SignedFact>,
     ) -> Result<(), FabricError> {
-        let report = self.inner.roster.lock().await.merge(facts)?;
-        if report.inserted > 0 {
-            let _ = self.inner.events.send(FabricEvent::RosterUpdated);
+        let removed: Vec<EndpointId> = {
+            let mut roster = self.inner.roster.lock().await;
+            let before: Vec<EndpointId> = roster
+                .effective_members(now_ms())
+                .into_iter()
+                .map(|m| m.endpoint_id)
+                .collect();
+            let report = roster.merge(facts)?;
+            let after: Vec<EndpointId> = roster
+                .effective_members(now_ms())
+                .into_iter()
+                .map(|m| m.endpoint_id)
+                .collect();
+            if report.inserted > 0 {
+                let _ = self.inner.events.send(FabricEvent::RosterUpdated);
+            }
+            before
+                .into_iter()
+                .filter(|id| !after.contains(id))
+                .collect()
+        };
+        // 远端同步到的 Revoke：摘除并断开失效成员的既有会话（撤销前向生效）
+        if !removed.is_empty() {
+            let mut peers = self.inner.peers.lock().await;
+            for id in removed {
+                if let Some(entry) = peers.remove(&id) {
+                    entry.conn.close(1u32.into(), b"revoked via sync");
+                }
+            }
         }
         Ok(())
     }
@@ -498,13 +529,23 @@ impl Fabric {
         ctrl_send: endpoint::SendStream,
     ) {
         let link = Arc::new(std::sync::Mutex::new(LinkStatus::Unknown));
-        session::spawn_path_watcher(conn.clone(), link.clone());
+        session::spawn_path_watcher(
+            conn.clone(),
+            link.clone(),
+            self.inner.events.clone(),
+            remote,
+        );
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let epoch = self
+            .inner
+            .peer_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let entry = PeerEntry {
             conn: conn.clone(),
             link,
             ctrl_send: Arc::new(Mutex::new(ctrl_send)),
             closed: closed.clone(),
+            epoch,
         };
         self.inner.peers.lock().await.insert(remote, entry);
         let _ = self.inner.events.send(FabricEvent::PeerConnected {
@@ -516,10 +557,26 @@ impl Fabric {
             conn.closed().await;
             closed.store(true, std::sync::atomic::Ordering::SeqCst);
             if let Some(inner) = inner.upgrade() {
-                inner.peers.lock().await.remove(&remote);
-                let _ = inner.events.send(FabricEvent::PeerDisconnected {
-                    endpoint_id: id_disp,
-                });
+                let mut peers = inner.peers.lock().await;
+                match peers.get(&remote) {
+                    // 同代次：摘除并广播下线
+                    Some(e) if e.epoch == epoch => {
+                        peers.remove(&remote);
+                        drop(peers);
+                        let _ = inner.events.send(FabricEvent::PeerDisconnected {
+                            endpoint_id: id_disp,
+                        });
+                    }
+                    // 更新代次的连接已接管：静默退出
+                    Some(_) => {}
+                    // 条目已被主动移除（revoke/disconnect）：仍广播下线
+                    None => {
+                        drop(peers);
+                        let _ = inner.events.send(FabricEvent::PeerDisconnected {
+                            endpoint_id: id_disp,
+                        });
+                    }
+                }
             }
         });
         // MSG 流接受循环
@@ -591,7 +648,6 @@ fn spawn_accept_loop(inner: &Arc<FabricInner>) {
                             &conn,
                             &inner2.roster,
                             &inner2.identity,
-                            now_ms(),
                         )
                         .await;
                         if res.is_ok() {

@@ -252,6 +252,9 @@ fn spawn_event_pump(fabric: &Fabric) {
         loop {
             let ev = match rx.recv().await {
                 Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue; // 消费滞后：跳过丢失批次，继续投递后续事件
+                }
                 Err(_) => break, // sender dropped（fabric 释放）
             };
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {

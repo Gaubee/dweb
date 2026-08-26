@@ -23,5 +23,11 @@
   ],
   "cpu": [
     "arm64"
+  ],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "bin/dweb-server.mjs",
+    "scripts/pack.mjs"
   ]
 }

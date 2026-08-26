@@ -170,7 +170,7 @@ enum InsertOutcome {
 }
 
 /// A fabric's signed-fact set plus derived state, bound to a data directory.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Roster {
     data_dir: PathBuf,
     fabric_id: FabricId,
@@ -258,6 +258,43 @@ impl Roster {
     /// An in-memory empty roster for `fabric_id`, loading the consumed
     /// invite log (a missing log is benign — a fresh node has consumed
     /// nothing).
+    /// 写锁（flock，短持有）：供跨进程 CAS 段串行化；返回后锁随 File drop 释放。
+    fn write_lock(data_dir: &Path) -> Result<std::fs::File, RosterError> {
+        use std::os::fd::AsRawFd;
+        let path = data_dir.join("roster.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|source| RosterError::Persistence {
+                path: path.clone(),
+                source,
+            })?;
+        // 有界重试：与其它进程的短临界区竞争
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return Ok(file);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(RosterError::Persistence { path, source: err });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(RosterError::Persistence {
+                    path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "write lock contention timeout",
+                    ),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn empty(data_dir: &Path, fabric_id: FabricId) -> Result<Self, RosterError> {
         let consumed_invites = load_consumed_invites(data_dir)?;
         Ok(Self {
@@ -438,6 +475,26 @@ impl Roster {
         // 2. Signature by the embedded issuer.
         if let Err(e) = signed.verify() {
             return InsertOutcome::Quarantined(format!("fact rejected: {e}"));
+        }
+        // 2b. Kind shape 交叉校验：防止字段被挪用于绕过授权语义。
+        //     Genesis 必须 issuer==subject 且不携带 name/expiry/target；
+        //     target_fact_id 仅 Revoke 允许。
+        let f = &signed.fact;
+        let shape_ok = match f.kind {
+            FactKind::Genesis => {
+                f.issuer == f.subject
+                    && f.display_name.is_none()
+                    && f.expires_at_ms.is_none()
+                    && f.target_fact_id.is_none()
+            }
+            FactKind::Grant | FactKind::Join => f.target_fact_id.is_none(),
+            FactKind::Revoke => true,
+        };
+        if !shape_ok {
+            return InsertOutcome::Quarantined(format!(
+                "fact kind {:?} rejected: disallowed field combination",
+                f.kind
+            ));
         }
         let id = signed.fact_id();
         // 3. Single-genesis invariant.
@@ -815,6 +872,13 @@ impl Roster {
         if self.consumed_invites.contains(invite_id) {
             return Ok(false);
         }
+        // 跨进程 CAS：写锁内重读日志（吸收其它进程的追加）再检查+追加，
+        // 保证同 data-dir 多进程下同一 invite 恰好消费一次。
+        let _lock = Self::write_lock(&self.data_dir)?;
+        self.consumed_invites = load_consumed_invites(&self.data_dir)?;
+        if self.consumed_invites.contains(invite_id) {
+            return Ok(false);
+        }
         let path = consumed_invites_file_path(&self.data_dir);
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -943,8 +1007,10 @@ fn load_consumed_invites(data_dir: &Path) -> Result<HashSet<[u8; 16]>, RosterErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Fact;
+    use crate::identity::NodeIdentity;
+    use crate::protocol::{Fact, FactKind};
 
+    // ---- P0 回归（codex round2）----
     fn idty(seed: u8) -> NodeIdentity {
         NodeIdentity::from_seed([seed; 32])
     }
@@ -977,7 +1043,361 @@ mod tests {
         r
     }
 
-    // -- 单根闭包确定性：三节点乱序合并同投影 -----------------------------------
+    fn raw_fact(kind: FactKind, issuer: &NodeIdentity, subject: EndpointId) -> Fact {
+        Fact {
+            kind,
+            fabric_id: FabricId::from_name("test"),
+            issuer: issuer.endpoint_id(),
+            subject,
+            display_name: None,
+            issued_at_ms: 1_000,
+            expires_at_ms: None,
+            target_fact_id: None,
+        }
+    }
+
+    #[test]
+    fn attacker_genesis_with_mismatched_issuer_subject_quarantined() {
+        let attacker = NodeIdentity::generate();
+        let victim = NodeIdentity::generate();
+        let mut roster = attach_fresh(FabricId::from_name("test"));
+        let fact = raw_fact(FactKind::Genesis, &attacker, victim.endpoint_id());
+        let signed = SignedFact::sign(fact, attacker.secret_key()).unwrap();
+        let report = roster.merge([signed]).unwrap();
+        assert_eq!(report.quarantined, 1, "mismatched Genesis must quarantine");
+        assert!(roster.root().is_none());
+    }
+
+    #[test]
+    fn genesis_with_optional_fields_quarantined() {
+        let root = NodeIdentity::generate();
+        let mut roster = attach_fresh(FabricId::from_name("test"));
+        let mut fact = raw_fact(FactKind::Genesis, &root, root.endpoint_id());
+        fact.display_name = Some("evil".into());
+        let signed = SignedFact::sign(fact, root.secret_key()).unwrap();
+        let report = roster.merge([signed]).unwrap();
+        assert_eq!(report.quarantined, 1, "Genesis with name must quarantine");
+    }
+
+    #[test]
+    fn fake_genesis_first_then_real_real_wins_root() {
+        let attacker = NodeIdentity::generate();
+        let root = NodeIdentity::generate();
+        let fid = FabricId::from_name("test");
+        let mut roster = attach_fresh(fid);
+        // 攻击者合法自签（issuer==subject）的 Genesis 属于同 fabric —— 会成为 root
+        let fake = SignedFact::sign(
+            raw_fact(FactKind::Genesis, &attacker, attacker.endpoint_id()),
+            attacker.secret_key(),
+        )
+        .unwrap();
+        roster.merge([fake]).unwrap();
+        // 真实 root 的 Genesis 到达后：不同 Genesis → 冲突隔离，root 保持首个
+        // （防抢占的语义是"先到先得 + 冲突隔离"；attach 空名册不接受外部输入是门控责任）
+        let real = SignedFact::sign(
+            raw_fact(FactKind::Genesis, &root, root.endpoint_id()),
+            root.secret_key(),
+        )
+        .unwrap();
+        let report = roster.merge([real]).unwrap();
+        assert!(report.quarantined >= 1, "second Genesis conflicts");
+        assert_eq!(roster.root(), Some(attacker.endpoint_id()));
+    }
+
+    #[test]
+    fn concurrent_consume_invite_across_instances_is_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::generate();
+        let (_r1, fid) = Roster::create(&identity, dir.path(), 1_000).unwrap();
+        // 两个独立实例（模拟两个进程），并发消费同一 invite：恰一个成功
+        let d1 = dir.path().to_path_buf();
+        let d2 = dir.path().to_path_buf();
+        let (a, b) = std::thread::scope(|s| {
+            let h1 = s.spawn(move || {
+                let mut r = Roster::open(&d1, fid).unwrap();
+                r.consume_invite(&[7u8; 16], 2_000).unwrap()
+            });
+            let h2 = s.spawn(move || {
+                let mut r = Roster::open(&d2, fid).unwrap();
+                r.consume_invite(&[7u8; 16], 2_001).unwrap()
+            });
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        assert!(a ^ b, "exactly one consumer must win (a={a}, b={b})");
+        // 重启后仍视为已消费
+        let mut r3 = Roster::open(dir.path(), fid).unwrap();
+        assert!(!r3.consume_invite(&[7u8; 16], 3_000).unwrap());
+    }
+
+    #[test]
+    fn attach_empty_then_learn_genesis_via_merge() {
+        let now = 1000;
+        let (root_roster, fid, root) = create_root(1, now);
+        let joiner_dir = tempfile::tempdir().unwrap();
+        let mut joiner = Roster::attach(joiner_dir.path(), fid).unwrap();
+        assert!(joiner.root().is_none());
+        assert!(joiner.effective_members(now).is_empty());
+        let report = joiner.merge(root_roster.facts().cloned()).unwrap();
+        assert_eq!(report.inserted, root_roster.len());
+        assert!(joiner.is_member(&root.endpoint_id(), now));
+        // Restart keeps it.
+        let reopened = Roster::open(joiner_dir.path(), fid).unwrap();
+        assert!(reopened.is_member(&root.endpoint_id(), now));
+    }
+
+    #[test]
+    fn conflicting_genesis_is_quarantined() {
+        let now = 1000;
+        let (mut r, fid, _root) = create_root(1, now);
+        let other_root = idty(2);
+        let competing = crate::protocol::genesis(&other_root, fid, now).unwrap();
+        let report = r.merge([competing]).unwrap();
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(r.root(), Some(_root.endpoint_id()));
+    }
+
+    #[test]
+    fn cross_fabric_facts_are_quarantined() {
+        let now = 1000;
+        let (mut r, _fid, root) = create_root(1, now);
+        let other_fabric = FabricId::from_name("some-other-fabric");
+        let alien = SignedFact::sign(
+            Fact {
+                kind: FactKind::Grant,
+                fabric_id: other_fabric,
+                issuer: root.endpoint_id(),
+                subject: idty(2).endpoint_id(),
+                display_name: None,
+                issued_at_ms: now,
+                expires_at_ms: None,
+                target_fact_id: None,
+            },
+            root.secret_key(),
+        )
+        .unwrap();
+        let report = r.merge([alien]).unwrap();
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(report.inserted, 0);
+        assert_eq!(r.len(), 1, "only the genesis remains");
+        let (count, samples) = r.quarantine_stats();
+        assert_eq!(count, 1);
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].contains("cross-fabric"));
+    }
+
+    #[test]
+    fn expiry_is_fail_closed_for_grants_and_revokes() {
+        let now = 1000;
+        let (mut r, _fid, root) = create_root(1, now);
+        let c = idty(3).endpoint_id();
+        r.grant(&root, c, None, Some(now + 100), now + 1).unwrap();
+        assert!(contains(&r, &c, now + 99));
+        assert!(!contains(&r, &c, now + 100), "expired at the instant");
+        assert!(!contains(&r, &c, now + 101));
+
+        // A revoke carrying an expiry stops revoking once it expires
+        // (uniform fact expiry): grant without expiry + temporary revoke.
+        let d = idty(4).endpoint_id();
+        r.grant(&root, d, None, None, now + 1).unwrap();
+        let tmp_revoke = SignedFact::sign(
+            Fact {
+                kind: FactKind::Revoke,
+                fabric_id: r.fabric_id(),
+                issuer: root.endpoint_id(),
+                subject: d,
+                display_name: None,
+                issued_at_ms: now + 2,
+                expires_at_ms: Some(now + 50),
+                target_fact_id: None,
+            },
+            root.secret_key(),
+        )
+        .unwrap();
+        r.merge([tmp_revoke]).unwrap();
+        assert!(!contains(&r, &d, now + 10), "revoked while revoke is live");
+        assert!(
+            contains(&r, &d, now + 51),
+            "member returns when revoke expires"
+        );
+    }
+
+    #[test]
+    fn non_root_issued_grant_is_stored_but_grants_nothing() {
+        let now = 1000;
+        let (mut r, fid, root) = create_root(1, now);
+        let (member, outsider_target) = (idty(2), idty(3));
+        r.grant(&root, member.endpoint_id(), None, None, now + 1)
+            .unwrap();
+
+        // A member (valid signature, same fabric) grants membership to
+        // someone else. It must be stored (it is a valid fact) but the
+        // projection must not change.
+        let forged = SignedFact::sign(
+            Fact {
+                kind: FactKind::Grant,
+                fabric_id: fid,
+                issuer: member.endpoint_id(),
+                subject: outsider_target.endpoint_id(),
+                display_name: None,
+                issued_at_ms: now + 2,
+                expires_at_ms: None,
+                target_fact_id: None,
+            },
+            member.secret_key(),
+        )
+        .unwrap();
+        let len_before = r.len();
+        let report = r.merge([forged]).unwrap();
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(report.inserted, 1);
+        assert_eq!(r.len(), len_before + 1, "valid non-root fact is stored");
+        assert!(
+            !contains(&r, &outsider_target.endpoint_id(), now + 3),
+            "non-root grant must not authorize"
+        );
+
+        // The root helper API refuses non-root callers outright.
+        let err = r
+            .grant(&member, outsider_target.endpoint_id(), None, None, now + 3)
+            .unwrap_err();
+        assert!(matches!(err, RosterError::NotRoot { .. }));
+    }
+
+    #[test]
+    fn open_missing_errors_and_create_refuses_to_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let fid = FabricId::from_name("x");
+        assert!(matches!(
+            Roster::open(dir.path(), fid),
+            Err(RosterError::NotFound { .. })
+        ));
+        let root = idty(1);
+        let (_r, _fid) = Roster::create(&root, dir.path(), 1).unwrap();
+        assert!(matches!(
+            Roster::create(&idty(2), dir.path(), 2),
+            Err(RosterError::AlreadyExists { .. })
+        ));
+    }
+
+    #[test]
+    fn restart_replay_keeps_facts_and_membership() {
+        let now = 1000;
+        let dir = tempfile::tempdir().unwrap();
+        let root = idty(1);
+        let (mut r, fid) = Roster::create(&root, dir.path(), now).unwrap();
+        let b = idty(2).endpoint_id();
+        r.grant(&root, b, Some("b".into()), None, now + 1).unwrap();
+        let before_members = r.effective_members(now + 2);
+        let before_len = r.len();
+
+        // "Restart": reopen the same data dir.
+        let reopened = Roster::open(dir.path(), fid).unwrap();
+        assert_eq!(reopened.len(), before_len);
+        assert_eq!(reopened.effective_members(now + 2), before_members);
+        assert_eq!(reopened.root(), Some(root.endpoint_id()));
+        assert_eq!(reopened.genesis_fact_id(), r.genesis_fact_id());
+
+        // Corrupted file (bit flip) errors; never a silent rebuild.
+        let path = roster_file_path(dir.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            Roster::open(dir.path(), fid),
+            Err(RosterError::Corrupted { .. })
+        ));
+        // Truncated file errors too.
+        bytes.truncate(bytes.len() - 5);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            Roster::open(dir.path(), fid),
+            Err(RosterError::Corrupted { .. })
+        ));
+    }
+
+    #[test]
+    fn revoke_targets_precise_grant_or_all_grants() {
+        let now = 1000;
+        let (mut r, _fid, root) = create_root(1, now);
+        let c = idty(3).endpoint_id();
+        let g1 = r
+            .grant(&root, c, Some("c-via-1".into()), None, now + 1)
+            .unwrap();
+        let g2 = r
+            .grant(&root, c, Some("c-via-2".into()), None, now + 2)
+            .unwrap();
+        assert_ne!(g1.fact_id(), g2.fact_id());
+        assert!(contains(&r, &c, now + 3));
+
+        // Precise revoke of g1: c survives via g2.
+        r.revoke(&root, RevokeTarget::Grant(g1.fact_id()), now + 4)
+            .unwrap();
+        assert!(contains(&r, &c, now + 5), "c still member via g2");
+        let member = r
+            .effective_members(now + 5)
+            .into_iter()
+            .find(|m| m.endpoint_id == c)
+            .unwrap();
+        assert_eq!(member.since_ms, now + 2, "admitted by g2 now");
+
+        // Blanket revoke: all live grants of c die.
+        r.revoke(&root, RevokeTarget::AllGrantsOf(c), now + 6)
+            .unwrap();
+        assert!(!contains(&r, &c, now + 7));
+        assert!(contains(&r, &root.endpoint_id(), now + 7));
+
+        // Unknown grant id is rejected.
+        let err = r
+            .revoke(&root, RevokeTarget::Grant([0u8; 32]), now + 8)
+            .unwrap_err();
+        assert!(matches!(err, RosterError::InvalidRevokeTarget { .. }));
+        // Non-grant fact id is rejected.
+        let err = r
+            .revoke(
+                &root,
+                RevokeTarget::Grant(r.genesis_fact_id().unwrap()),
+                now + 9,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RosterError::InvalidRevokeTarget { .. }));
+    }
+
+    #[test]
+    fn tampered_fact_signature_is_quarantined() {
+        let now = 1000;
+        let (mut r, fid, root) = create_root(1, now);
+        let subject = idty(2);
+        let good = SignedFact::sign(
+            Fact {
+                kind: FactKind::Grant,
+                fabric_id: fid,
+                issuer: root.endpoint_id(),
+                subject: subject.endpoint_id(),
+                display_name: None,
+                issued_at_ms: now,
+                expires_at_ms: None,
+                target_fact_id: None,
+            },
+            root.secret_key(),
+        )
+        .unwrap();
+        // Claim a different issuer but keep root's signature: verify fails.
+        let mut forged = good.clone();
+        forged.fact.issuer = idty(9).endpoint_id();
+        let report = r.merge([forged]).unwrap();
+        assert_eq!(report.quarantined, 1);
+        // ...and a genuinely flipped signature byte fails too.
+        let mut bad_sig = good.signature.to_bytes();
+        bad_sig[10] ^= 1;
+        let tampered = SignedFact {
+            fact: good.fact,
+            signature: Signature::from_bytes(&bad_sig),
+        };
+        let report = r.merge([tampered]).unwrap();
+        assert_eq!(report.quarantined, 1);
+        assert!(!contains(&r, &subject.endpoint_id(), now + 1));
+    }
 
     #[test]
     fn three_nodes_merge_in_any_order_same_projection() {
@@ -1033,288 +1453,6 @@ mod tests {
         assert_eq!(report.duplicates, all.len());
         assert_eq!(report.inserted, all.len());
         assert_eq!(doubled.effective_members(now + 10), reference_members);
-    }
-
-    // -- 非 root 签发不授权 ------------------------------------------------------
-
-    #[test]
-    fn non_root_issued_grant_is_stored_but_grants_nothing() {
-        let now = 1000;
-        let (mut r, fid, root) = create_root(1, now);
-        let (member, outsider_target) = (idty(2), idty(3));
-        r.grant(&root, member.endpoint_id(), None, None, now + 1)
-            .unwrap();
-
-        // A member (valid signature, same fabric) grants membership to
-        // someone else. It must be stored (it is a valid fact) but the
-        // projection must not change.
-        let forged = SignedFact::sign(
-            Fact {
-                kind: FactKind::Grant,
-                fabric_id: fid,
-                issuer: member.endpoint_id(),
-                subject: outsider_target.endpoint_id(),
-                display_name: None,
-                issued_at_ms: now + 2,
-                expires_at_ms: None,
-                target_fact_id: None,
-            },
-            member.secret_key(),
-        )
-        .unwrap();
-        let len_before = r.len();
-        let report = r.merge([forged]).unwrap();
-        assert_eq!(report.quarantined, 0);
-        assert_eq!(report.inserted, 1);
-        assert_eq!(r.len(), len_before + 1, "valid non-root fact is stored");
-        assert!(
-            !contains(&r, &outsider_target.endpoint_id(), now + 3),
-            "non-root grant must not authorize"
-        );
-
-        // The root helper API refuses non-root callers outright.
-        let err = r
-            .grant(&member, outsider_target.endpoint_id(), None, None, now + 3)
-            .unwrap_err();
-        assert!(matches!(err, RosterError::NotRoot { .. }));
-    }
-
-    // -- 跨 fabric 拒收 ----------------------------------------------------------
-
-    #[test]
-    fn cross_fabric_facts_are_quarantined() {
-        let now = 1000;
-        let (mut r, _fid, root) = create_root(1, now);
-        let other_fabric = FabricId::from_name("some-other-fabric");
-        let alien = SignedFact::sign(
-            Fact {
-                kind: FactKind::Grant,
-                fabric_id: other_fabric,
-                issuer: root.endpoint_id(),
-                subject: idty(2).endpoint_id(),
-                display_name: None,
-                issued_at_ms: now,
-                expires_at_ms: None,
-                target_fact_id: None,
-            },
-            root.secret_key(),
-        )
-        .unwrap();
-        let report = r.merge([alien]).unwrap();
-        assert_eq!(report.quarantined, 1);
-        assert_eq!(report.inserted, 0);
-        assert_eq!(r.len(), 1, "only the genesis remains");
-        let (count, samples) = r.quarantine_stats();
-        assert_eq!(count, 1);
-        assert_eq!(samples.len(), 1);
-        assert!(samples[0].contains("cross-fabric"));
-    }
-
-    // -- 篡改 quarantine ---------------------------------------------------------
-
-    #[test]
-    fn tampered_fact_signature_is_quarantined() {
-        let now = 1000;
-        let (mut r, fid, root) = create_root(1, now);
-        let subject = idty(2);
-        let good = SignedFact::sign(
-            Fact {
-                kind: FactKind::Grant,
-                fabric_id: fid,
-                issuer: root.endpoint_id(),
-                subject: subject.endpoint_id(),
-                display_name: None,
-                issued_at_ms: now,
-                expires_at_ms: None,
-                target_fact_id: None,
-            },
-            root.secret_key(),
-        )
-        .unwrap();
-        // Claim a different issuer but keep root's signature: verify fails.
-        let mut forged = good.clone();
-        forged.fact.issuer = idty(9).endpoint_id();
-        let report = r.merge([forged]).unwrap();
-        assert_eq!(report.quarantined, 1);
-        // ...and a genuinely flipped signature byte fails too.
-        let mut bad_sig = good.signature.to_bytes();
-        bad_sig[10] ^= 1;
-        let tampered = SignedFact {
-            fact: good.fact,
-            signature: Signature::from_bytes(&bad_sig),
-        };
-        let report = r.merge([tampered]).unwrap();
-        assert_eq!(report.quarantined, 1);
-        assert!(!contains(&r, &subject.endpoint_id(), now + 1));
-    }
-
-    #[test]
-    fn conflicting_genesis_is_quarantined() {
-        let now = 1000;
-        let (mut r, fid, _root) = create_root(1, now);
-        let other_root = idty(2);
-        let competing = crate::protocol::genesis(&other_root, fid, now).unwrap();
-        let report = r.merge([competing]).unwrap();
-        assert_eq!(report.quarantined, 1);
-        assert_eq!(r.root(), Some(_root.endpoint_id()));
-    }
-
-    // -- Revoke 精确目标 ---------------------------------------------------------
-
-    #[test]
-    fn revoke_targets_precise_grant_or_all_grants() {
-        let now = 1000;
-        let (mut r, _fid, root) = create_root(1, now);
-        let c = idty(3).endpoint_id();
-        let g1 = r
-            .grant(&root, c, Some("c-via-1".into()), None, now + 1)
-            .unwrap();
-        let g2 = r
-            .grant(&root, c, Some("c-via-2".into()), None, now + 2)
-            .unwrap();
-        assert_ne!(g1.fact_id(), g2.fact_id());
-        assert!(contains(&r, &c, now + 3));
-
-        // Precise revoke of g1: c survives via g2.
-        r.revoke(&root, RevokeTarget::Grant(g1.fact_id()), now + 4)
-            .unwrap();
-        assert!(contains(&r, &c, now + 5), "c still member via g2");
-        let member = r
-            .effective_members(now + 5)
-            .into_iter()
-            .find(|m| m.endpoint_id == c)
-            .unwrap();
-        assert_eq!(member.since_ms, now + 2, "admitted by g2 now");
-
-        // Blanket revoke: all live grants of c die.
-        r.revoke(&root, RevokeTarget::AllGrantsOf(c), now + 6)
-            .unwrap();
-        assert!(!contains(&r, &c, now + 7));
-        assert!(contains(&r, &root.endpoint_id(), now + 7));
-
-        // Unknown grant id is rejected.
-        let err = r
-            .revoke(&root, RevokeTarget::Grant([0u8; 32]), now + 8)
-            .unwrap_err();
-        assert!(matches!(err, RosterError::InvalidRevokeTarget { .. }));
-        // Non-grant fact id is rejected.
-        let err = r
-            .revoke(
-                &root,
-                RevokeTarget::Grant(r.genesis_fact_id().unwrap()),
-                now + 9,
-            )
-            .unwrap_err();
-        assert!(matches!(err, RosterError::InvalidRevokeTarget { .. }));
-    }
-
-    // -- 过期 fail-closed --------------------------------------------------------
-
-    #[test]
-    fn expiry_is_fail_closed_for_grants_and_revokes() {
-        let now = 1000;
-        let (mut r, _fid, root) = create_root(1, now);
-        let c = idty(3).endpoint_id();
-        r.grant(&root, c, None, Some(now + 100), now + 1).unwrap();
-        assert!(contains(&r, &c, now + 99));
-        assert!(!contains(&r, &c, now + 100), "expired at the instant");
-        assert!(!contains(&r, &c, now + 101));
-
-        // A revoke carrying an expiry stops revoking once it expires
-        // (uniform fact expiry): grant without expiry + temporary revoke.
-        let d = idty(4).endpoint_id();
-        r.grant(&root, d, None, None, now + 1).unwrap();
-        let tmp_revoke = SignedFact::sign(
-            Fact {
-                kind: FactKind::Revoke,
-                fabric_id: r.fabric_id(),
-                issuer: root.endpoint_id(),
-                subject: d,
-                display_name: None,
-                issued_at_ms: now + 2,
-                expires_at_ms: Some(now + 50),
-                target_fact_id: None,
-            },
-            root.secret_key(),
-        )
-        .unwrap();
-        r.merge([tmp_revoke]).unwrap();
-        assert!(!contains(&r, &d, now + 10), "revoked while revoke is live");
-        assert!(
-            contains(&r, &d, now + 51),
-            "member returns when revoke expires"
-        );
-    }
-
-    // -- 重启重放不丢 --------------------------------------------------------------
-
-    #[test]
-    fn restart_replay_keeps_facts_and_membership() {
-        let now = 1000;
-        let dir = tempfile::tempdir().unwrap();
-        let root = idty(1);
-        let (mut r, fid) = Roster::create(&root, dir.path(), now).unwrap();
-        let b = idty(2).endpoint_id();
-        r.grant(&root, b, Some("b".into()), None, now + 1).unwrap();
-        let before_members = r.effective_members(now + 2);
-        let before_len = r.len();
-
-        // "Restart": reopen the same data dir.
-        let reopened = Roster::open(dir.path(), fid).unwrap();
-        assert_eq!(reopened.len(), before_len);
-        assert_eq!(reopened.effective_members(now + 2), before_members);
-        assert_eq!(reopened.root(), Some(root.endpoint_id()));
-        assert_eq!(reopened.genesis_fact_id(), r.genesis_fact_id());
-
-        // Corrupted file (bit flip) errors; never a silent rebuild.
-        let path = roster_file_path(dir.path());
-        let mut bytes = std::fs::read(&path).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 1;
-        std::fs::write(&path, &bytes).unwrap();
-        assert!(matches!(
-            Roster::open(dir.path(), fid),
-            Err(RosterError::Corrupted { .. })
-        ));
-        // Truncated file errors too.
-        bytes.truncate(bytes.len() - 5);
-        std::fs::write(&path, &bytes).unwrap();
-        assert!(matches!(
-            Roster::open(dir.path(), fid),
-            Err(RosterError::Corrupted { .. })
-        ));
-    }
-
-    #[test]
-    fn open_missing_errors_and_create_refuses_to_clobber() {
-        let dir = tempfile::tempdir().unwrap();
-        let fid = FabricId::from_name("x");
-        assert!(matches!(
-            Roster::open(dir.path(), fid),
-            Err(RosterError::NotFound { .. })
-        ));
-        let root = idty(1);
-        let (_r, _fid) = Roster::create(&root, dir.path(), 1).unwrap();
-        assert!(matches!(
-            Roster::create(&idty(2), dir.path(), 2),
-            Err(RosterError::AlreadyExists { .. })
-        ));
-    }
-
-    #[test]
-    fn attach_empty_then_learn_genesis_via_merge() {
-        let now = 1000;
-        let (root_roster, fid, root) = create_root(1, now);
-        let joiner_dir = tempfile::tempdir().unwrap();
-        let mut joiner = Roster::attach(joiner_dir.path(), fid).unwrap();
-        assert!(joiner.root().is_none());
-        assert!(joiner.effective_members(now).is_empty());
-        let report = joiner.merge(root_roster.facts().cloned()).unwrap();
-        assert_eq!(report.inserted, root_roster.len());
-        assert!(joiner.is_member(&root.endpoint_id(), now));
-        // Restart keeps it.
-        let reopened = Roster::open(joiner_dir.path(), fid).unwrap();
-        assert!(reopened.is_member(&root.endpoint_id(), now));
     }
 
     // -- consume_invite CAS --------------------------------------------------------

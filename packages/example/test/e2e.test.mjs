@@ -92,9 +92,10 @@ function chatProc(dataDir) {
     send(line) {
       child.stdin.write(line + "\n");
     },
-    kill() {
+    async kill() {
       child.kill("SIGINT");
-      setTimeout(() => child.kill("SIGKILL"), 2000);
+      await new Promise((r) => child.once("exit", r));
+      setTimeout(() => child.kill("SIGKILL"), 2000).unref();
     },
   };
 }
@@ -136,8 +137,8 @@ test(
     await chatB.waitFor("hi-from-A");
 
     const idB = (await runCli(dirB, ["id"])).trim();
-    chatA.kill();
-    chatB.kill();
+    await chatA.kill();
+    await chatB.kill();
 
     // A 撤销 B，随后 B 发送必须失败
     await runCli(dirA, ["revoke", idB]);
