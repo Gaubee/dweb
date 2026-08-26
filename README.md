@@ -67,7 +67,7 @@ identity.key 文件          账号系统存 exportSecret 的     服务方持�
 ```
 
 ```js
-const token = await fabric.exportSecretPassphrase("用户口令"); // dweb1... 密文
+const token = await fabric.exportSecretPassphrase("用户口令"); // dwebkey1... 密文
 const handle = await importSecret(token, "用户口令");           // opaque 句柄
 const fabric2 = await Fabric.createRoot({ dataDir }, handle);   // 注入恢复同身份
 ```

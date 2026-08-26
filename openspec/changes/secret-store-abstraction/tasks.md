@@ -13,7 +13,7 @@
 ## 2. SDK
 
 - [x] 2.1 身份注入 API（实现为工厂参数 secret?: SecretSeedHandle——napi object 不支持 class 字段，codex 方案优先级一致的 opaque handle）
-- [ ] 2.2 `exportSecretPassphrase(passphrase)` / 静态 `importSecret(token, passphrase)`；d.ts 同步（fix-dts 后处理）
+- [x] 2.2 `exportSecretPassphrase(passphrase)` / 静态 `importSecret(token, passphrase)`；d.ts 同步（fix-dts 后处理）
 - [x] 2.3 node --test：seed 注入身份稳定、export→import→再注入恢复同 EndpointId、错误口令拒绝
 
 ## 3. 文档与收尾

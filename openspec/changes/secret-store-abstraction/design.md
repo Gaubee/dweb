@@ -57,6 +57,15 @@ pub trait SecretStore: Send + Sync + 'static {
 - SDK（codex 复审定稿）：opaque `SecretSeedHandle`（一次性 take、失败归还 put_back、endpointId 派生）+ 顶层 `importSecret(token, passphrase)` + 实例 `exportSecretPassphrase(passphrase)`；身份注入为工厂参数 `secret?: SecretSeedHandle`（napi object 不支持 class 字段）；**明文 hex seed 不经 JS**。KDF 调用经 spawn_blocking，不阻塞 Node 主线程。
 - 明确不做：JS 自定义 store 回调（napi 摩擦）、云端 FactStore、可插拔 InviteLog、Automerge StorageAdapter。
 
+## v1 已知边界（codex 终验记录）
+
+- `create_root` 的 roster 前置检查与 `Roster::create` 不在同一临界区：另一执行位置
+  可在其间创建 roster，本进程可能在收到 AlreadyExists 前写入新 identity（影响：目录
+  残留一个未使用 identity.key；无安全分叉）。并发多进程同目录 create_root 本身非
+  支持场景；若产品需要，后续以 data-dir 锁收口。
+- FileSecretStore 的 tmp 名含 PID：PID 复用 + 崩溃遗留 tmp 的极端碰撞未专门清理
+  （tmp 文件无害，`create_new` 使碰撞直接报 Write 错误而非覆盖）。
+
 ## 风险
 
 | 风险 | 对策 |
