@@ -3,6 +3,8 @@
 # ---- build stage ----
 FROM rust:1.98-slim AS builder
 WORKDIR /build
+# 覆盖仓库 .cargo/config.toml 的本机绝对 target-dir（容器内不可用）
+ENV CARGO_TARGET_DIR=/build/target
 
 # cargo-chef 缓存依赖层，避免源码变动触发全量重编
 RUN cargo install cargo-chef --locked
