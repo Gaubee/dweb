@@ -13,8 +13,6 @@
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   },
-  "os": ["darwin"],
-  "cpu": ["arm64"],
   "scripts": {
     "test": "node --test --test-force-exit"
   }

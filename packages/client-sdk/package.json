@@ -22,15 +22,10 @@
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   },
-  "os": [
-    "darwin"
-  ],
-  "cpu": [
-    "arm64"
-  ],
   "files": [
     "index.js",
     "index.d.ts",
-    "dweb.darwin-arm64.node"
+    "dweb.darwin-arm64.node",
+    "dweb.win32-x64.node"
   ]
 }

@@ -9,16 +9,20 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
+const PLATFORM_BINARIES = {
+  "darwin-arm64": "dweb.darwin-arm64.node",
+  "win32-x64": "dweb.win32-x64.node",
+};
 const SUPPORTED = `${process.platform}-${process.arch}`;
-const EXPECTED = "darwin-arm64";
+const BINARY = PLATFORM_BINARIES[SUPPORTED];
 
-if (SUPPORTED !== EXPECTED) {
+if (!BINARY) {
   throw new Error(
-    `@dweb/client-sdk: 当前平台 ${SUPPORTED} 暂不支持。v0.1 仅提供 ${EXPECTED} 原生二进制；其它平台支持将在后续版本提供。`,
+    `@jixo/opendweb-client-sdk: 当前平台 ${SUPPORTED} 暂不支持。v0.1 提供 ${Object.keys(PLATFORM_BINARIES).join(" / ")} 原生二进制。`,
   );
 }
 
-const SRC = path.join(__dirname, "dweb.darwin-arm64.node");
+const SRC = path.join(__dirname, BINARY);
 
 function loadViaTmp() {
   const buf = fs.readFileSync(SRC);

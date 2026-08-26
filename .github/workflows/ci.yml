@@ -17,9 +17,48 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: rustup target add x86_64-pc-windows-msvc
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Windows cfg 静态验证（不链接；ring 等 C 依赖的完整编译在 windows-test job）
+      - run: cargo check --workspace --target x86_64-pc-windows-msvc
+
+  windows-test:
+    # windows-x64：cargo test + 双产物构建 + node 套件
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TARGET_DIR: C:\\cargo-target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - name: Build artifacts
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc -p dweb-server
+          cargo build --release --target x86_64-pc-windows-msvc -p dweb-client-sdk
+      - name: Stage package binaries
+        shell: pwsh
+        run: |
+          Copy-Item "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/dweb-server.exe" "packages/server-binary/bin/dweb-server-x86_64-pc-windows-msvc.exe"
+          Copy-Item "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/dweb_client_sdk.dll" "packages/client-sdk/dweb.win32-x64.node"
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @jixo/opendweb-client-sdk test
+      - run: pnpm --filter opendweb test
+      - run: pnpm --filter @jixo/opendweb-server-binary test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            packages/client-sdk/dweb.win32-x64.node
+            packages/server-binary/bin/dweb-server-x86_64-pc-windows-msvc.exe
 
   node-build:
     # napi 原生模块与 example 只在 macos-arm64 上验证

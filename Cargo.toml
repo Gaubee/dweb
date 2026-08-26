@@ -36,5 +36,7 @@ napi = { version = "3", default-features = false, features = ["napi4", "async"] 
 napi-derive = "3"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
 strip = true

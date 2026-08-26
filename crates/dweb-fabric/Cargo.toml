@@ -22,7 +22,7 @@ hex = "0.4"
 argon2 = { workspace = true }
 zeroize = { workspace = true }
 chacha20poly1305 = { workspace = true }
-libc = "0.2"
+fs4 = "0.13"
 n0-future = "0.3"
 
 [dev-dependencies]

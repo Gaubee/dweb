@@ -6,11 +6,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+const PLATFORM_BINARIES = {
+  "darwin-arm64": "dweb-server-aarch64-apple-darwin",
+  "win32-x64": "dweb-server-x86_64-pc-windows-msvc.exe",
+};
 const SUPPORTED = `${process.platform}-${process.arch}`;
-const EXPECTED = "darwin-arm64";
-if (SUPPORTED !== EXPECTED) {
+const BINARY_NAME = PLATFORM_BINARIES[SUPPORTED];
+if (!BINARY_NAME) {
   throw new Error(
-    `@dweb/server-binary: 当前平台 ${SUPPORTED} 暂不支持。v0.1 仅提供 ${EXPECTED} 二进制；服务器部署请使用 docker 镜像 ghcr.io/gaubee/dweb。`,
+    `@jixo/opendweb-server-binary: 当前平台 ${SUPPORTED} 暂不支持。v0.1 提供 ${Object.keys(PLATFORM_BINARIES).join(" / ")}；其它平台请使用 docker 镜像 ghcr.io/gaubee/dweb。`,
   );
 }
 
@@ -28,7 +32,7 @@ if (SUPPORTED !== EXPECTED) {
  */
 export async function startServer(options = {}) {
   const binDir = path.dirname(fileURLToPath(import.meta.url));
-  const srcBin = path.join(binDir, "bin", "dweb-server-aarch64-apple-darwin");
+  const srcBin = path.join(binDir, "bin", BINARY_NAME);
   // SMB 网络磁盘上的原生二进制会触发 CODESIGNING Invalid Page：拷到私有 tmp 目录执行
   const buf = fs.readFileSync(srcBin);
   const hash = createHash("sha256").update(buf).digest("hex").slice(0, 24);

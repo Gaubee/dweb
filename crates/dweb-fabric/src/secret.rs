@@ -204,7 +204,6 @@ impl SecretStore for FileSecretStore {
     }
 
     fn create(&self, seed: &SecretSeed) -> Result<(), SecretStoreError> {
-        #[cfg(unix)]
         {
             let dir = self.path.parent().unwrap_or(Path::new("."));
             std::fs::create_dir_all(dir).map_err(|source| SecretStoreError::Write {
@@ -257,13 +256,6 @@ impl SecretStore for FileSecretStore {
                     source,
                 }),
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = seed;
-            Err(SecretStoreError::Unsupported(
-                "FileSecretStore::create requires unix atomic link semantics".into(),
-            ))
         }
     }
 }
@@ -448,8 +440,14 @@ fn fsync_dir(dir: &Path) -> Result<(), SecretStoreError> {
     })
 }
 
+/// Windows 无目录句柄 fsync 的可移植路径：rename 持久性依赖 NTFS 日志（文档化边界）。
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> Result<(), SecretStoreError> {
+    Ok(())
+}
+
 /// Marks `path` as readable/writable by the current user only (unix)。
-/// 非 Unix 平台无同等文件权限契约，`create` 整体返回 Unsupported（fail-closed）。
+/// Windows 无同等文件权限模型：降级为宿主/目录 ACL 责任（design D1 文档化边界）。
 #[cfg(unix)]
 fn restrict_permissions(path: &Path) -> Result<(), SecretStoreError> {
     use std::os::unix::fs::PermissionsExt;
@@ -459,6 +457,11 @@ fn restrict_permissions(path: &Path) -> Result<(), SecretStoreError> {
             source,
         }
     })
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path) -> Result<(), SecretStoreError> {
+    Ok(())
 }
 
 #[cfg(test)]

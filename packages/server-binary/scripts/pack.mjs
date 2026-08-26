@@ -43,3 +43,6 @@ const dest = path.join(binDir, "dweb-server-aarch64-apple-darwin");
 cpSync(src, dest);
 chmodSync(dest, 0o755);
 console.log("packed: bin/dweb-server-aarch64-apple-darwin");
+// windows 产物由 CI windows runner 构建（本地无 MSVC 工具链）：
+// cargo build --release --target x86_64-pc-windows-msvc -p dweb-server 后
+// 拷贝 target 下 dweb-server.exe 为 bin/dweb-server-x86_64-pc-windows-msvc.exe

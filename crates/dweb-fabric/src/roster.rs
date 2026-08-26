@@ -258,9 +258,10 @@ impl Roster {
     /// An in-memory empty roster for `fabric_id`, loading the consumed
     /// invite log (a missing log is benign — a fresh node has consumed
     /// nothing).
-    /// 写锁（flock，短持有）：供跨进程 CAS 段串行化；返回后锁随 File drop 释放。
+    /// 写锁（跨平台文件锁，短持有）：供跨进程 CAS 段串行化；返回后锁随 File drop 释放。
+    /// fs4：unix = flock，Windows = LockFileEx，语义一致。
     fn write_lock(data_dir: &Path) -> Result<std::fs::File, RosterError> {
-        use std::os::fd::AsRawFd;
+        use fs4::fs_std::FileExt;
         let path = data_dir.join("roster.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -274,24 +275,29 @@ impl Roster {
         // 有界重试：与其它进程的短临界区竞争
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
-                return Ok(file);
+            match file.try_lock_exclusive() {
+                // fs4 返回 Result<bool>：true = 拿到锁
+                Ok(true) => return Ok(file),
+                Ok(false) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(RosterError::Persistence {
+                            path,
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "write lock contention timeout",
+                            ),
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => {
+                    return Err(RosterError::Persistence {
+                        path,
+                        source: err,
+                    })
+                }
             }
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(RosterError::Persistence { path, source: err });
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(RosterError::Persistence {
-                    path,
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "write lock contention timeout",
-                    ),
-                });
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 

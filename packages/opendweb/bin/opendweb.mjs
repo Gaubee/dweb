@@ -7,11 +7,11 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
+const PLATFORMS = ["darwin-arm64", "win32-x64"];
 const SUPPORTED = `${process.platform}-${process.arch}`;
-const EXPECTED = "darwin-arm64";
-if (SUPPORTED !== EXPECTED) {
+if (!PLATFORMS.includes(SUPPORTED)) {
   console.error(
-    `opendweb: 当前平台 ${SUPPORTED} 暂不支持。v0.1 仅提供 ${EXPECTED}；服务器部署请使用 docker 镜像 ghcr.io/gaubee/dweb。`,
+    `opendweb: 当前平台 ${SUPPORTED} 暂不支持。v0.1 提供 ${PLATFORMS.join(" / ")}；服务器部署请使用 docker 镜像 ghcr.io/gaubee/dweb。`,
   );
   process.exit(1);
 }

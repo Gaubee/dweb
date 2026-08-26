@@ -19,17 +19,12 @@
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   },
-  "os": [
-    "darwin"
-  ],
-  "cpu": [
-    "arm64"
-  ],
   "files": [
     "index.js",
     "index.d.ts",
     "bin/dweb-server.mjs",
     "scripts/pack.mjs",
-    "bin/dweb-server-aarch64-apple-darwin"
+    "bin/dweb-server-aarch64-apple-darwin",
+    "bin/dweb-server-x86_64-pc-windows-msvc.exe"
   ]
 }
