@@ -8,13 +8,26 @@ const pkgDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const binDir = path.join(pkgDir, "bin");
 mkdirSync(binDir, { recursive: true });
 
-const built = spawnSync(
-  "cargo",
-  ["build", "--release", "-p", "dweb-server"],
-  { stdio: "inherit", cwd: path.join(pkgDir, "..", "..") },
-);
-if (built.status !== 0) {
-  throw new Error("cargo build failed");
+// workspace root：env 覆盖 > 向上探测含 Cargo.toml 的目录；找不到则跳过 build（复用已有产物）
+function findWorkspaceRoot() {
+  if (process.env.DWEB_ROOT) return process.env.DWEB_ROOT;
+  let dir = pkgDir;
+  for (let i = 0; i < 4; i++) {
+    if (existsSync(path.join(dir, "Cargo.toml"))) return dir;
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+const root = findWorkspaceRoot();
+if (root) {
+  const built = spawnSync("cargo", ["build", "--release", "-p", "dweb-server"], {
+    stdio: "inherit",
+    cwd: root,
+  });
+  if (built.status !== 0) {
+    throw new Error("cargo build failed");
+  }
 }
 
 const rawTarget = process.env.CARGO_TARGET_DIR ?? path.join(process.env.HOME ?? "~", ".cargo-target", "dweb");

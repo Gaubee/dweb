@@ -6,7 +6,7 @@ let s = fs.readFileSync(p, "utf8");
 s = s.replaceAll("=> any", "=> void");
 // on 的原生签名是 error-first 字符串；index.js 包装后是类型化事件对象
 s = s.replace(/on\(callback: [^\n]*\): void/, "on(callback: (event: FabricEventJs) => void): void");
-if (!s.includes("FabricEventJs")) {
+if (!s.includes("export interface FabricEventJs")) {
   s = `export interface FabricEventJs {
   type: 'peer-connected' | 'peer-disconnected' | 'roster-updated' | 'message' | 'path-changed'
   endpointId?: string

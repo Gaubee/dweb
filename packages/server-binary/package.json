@@ -12,7 +12,8 @@
   "scripts": {
     "pack:binary": "node scripts/pack.mjs",
     "test": "node scripts/pack.mjs && node --test --test-force-exit",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepack": "node scripts/pack.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

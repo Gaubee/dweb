@@ -1,0 +1,2 @@
+# 覆盖 .gitignore：发布 tarball 需要携带平台二进制（files 白名单已限定最终内容）
+!bin/dweb-server-aarch64-apple-darwin
