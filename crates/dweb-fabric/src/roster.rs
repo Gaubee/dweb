@@ -291,12 +291,7 @@ impl Roster {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                Err(err) => {
-                    return Err(RosterError::Persistence {
-                        path,
-                        source: err,
-                    })
-                }
+                Err(err) => return Err(RosterError::Persistence { path, source: err }),
             }
         }
     }
