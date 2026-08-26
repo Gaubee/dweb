@@ -8,3 +8,4 @@ target/
 *.node
 *.tsbuildinfo
 coverage/
+packages/server-binary/bin/dweb-server-aarch64-apple-darwin
