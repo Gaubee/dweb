@@ -78,3 +78,35 @@ test("identity persists across restart", async () => {
   assert.equal((await a2.members()).length, 1);
   await a2.shutdown();
 });
+
+test("secret injection + identity export/import lifecycle", async () => {
+  const dirA = tmpdir("dweb-sec-a-");
+  const dirB = tmpdir("dweb-sec-b-");
+
+  // Seed 注入：零存储副作用 + 确定性身份
+  const seedMod = await import("../index.js").then((m) => m.default ?? m);
+  const { importSecret } = seedMod;
+  const a = await Fabric.createRoot(opts(dirA));
+  const token = await a.exportSecretPassphrase("my-passphrase");
+  assert.ok(token.startsWith("dwebkey1."), "export token prefix");
+
+  // 导入 → 注入新环境：恢复同 EndpointId；期间不写任何 identity.key
+  const handle = importSecret(token, "my-passphrase");
+  assert.ok(handle.endpointId.length === 52, "handle derives endpointId");  // getter 属性
+  const b = await Fabric.createRoot(opts(dirB), handle);
+  assert.equal(b.endpointId, a.endpointId);  // getter 属性
+  assert.ok(
+    !fs.existsSync(path.join(dirB, "identity.key")),
+    "seed injection has no storage side effect",
+  );
+
+  // 句柄一次性：消费后再用必须报错
+  const again = Fabric.createRoot(opts(tmpdir("dweb-sec-c-")), handle);
+  await assert.rejects(again);
+
+  // 错误口令导入失败
+  assert.throws(() => importSecret(token, "wrong-pass"));
+
+  await a.shutdown();
+  await b.shutdown();
+});

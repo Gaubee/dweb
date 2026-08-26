@@ -16,19 +16,13 @@
 //! the iroh CLI and ticket encodings — use [`endpoint_id_display`] and
 //! [`endpoint_id_parse`] instead of `to_string`/`parse`.
 //!
-//! # Persistence contract (fabric/identity spec)
+//! # Persistence (secret-store-abstraction)
 //!
-//! - File: `<data_dir>/identity.key`, exactly 32 bytes (the Ed25519 seed via
-//!   `SecretKey::to_bytes`), permissions `0600` on unix.
-//! - Missing file: a fresh identity is generated and persisted atomically
-//!   (tmp + fsync + rename).
-//! - Existing file whose length is not exactly 32 bytes:
-//!   [`IdentityError::Corrupted`] including the file path. We never silently
-//!   regenerate an identity over a damaged key file: a fresh key would orphan
-//!   the node's roster membership.
-//! - Note: `SecretKey::from_bytes` accepts *any* 32 bytes (clamping happens
-//!   on use), so only the length is checkable — same contract as the spike
-//!   report (docs/spike-iroh.md §5).
+//! 私钥持久化经 [`crate::secret::SecretStore`] 抽象（信任模型中立）：默认
+//! [`crate::secret::FileSecretStore`] 即历史上的 `<data_dir>/identity.key`
+//! 行为（32B seed、0600、tmp+fsync+rename 原子写、损坏报含路径错误），
+//! `load_or_create` 是它的便捷封装。产品可注入自定义 store（Keychain、
+//! 加密托管等）或直接 `from_seed` 注入（零存储副作用）。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -36,8 +30,8 @@ use std::path::{Path, PathBuf};
 use iroh_base::{PublicKey, SecretKey};
 use thiserror::Error;
 
-/// File name of the persisted seed inside the data directory.
-pub const KEY_FILE_NAME: &str = "identity.key";
+/// File name of the persisted seed inside the data directory（再导出自 secret 模块）。
+pub use crate::secret::KEY_FILE_NAME;
 
 /// Length in bytes of an Ed25519 seed and of an [`EndpointId`].
 pub const SEED_LEN: usize = 32;
@@ -71,6 +65,28 @@ pub enum IdentityError {
     /// A string did not parse as an [`EndpointId`] (z-base-32 form).
     #[error("invalid EndpointId string: {reason}")]
     InvalidEndpointId { reason: String },
+    /// SecretStore 的非文件类错误（Conflict/Unsupported/Custom）。
+    #[error("secret store: {0}")]
+    Store(crate::secret::SecretStoreError),
+}
+
+impl From<crate::secret::SecretStoreError> for IdentityError {
+    /// 保留旧 `Corrupted/Read/Write` 顶层变体（零迁移的可观察等价契约）；
+    /// 其余（Conflict/Unsupported/Custom）落入 Store 包装。
+    fn from(e: crate::secret::SecretStoreError) -> Self {
+        match e {
+            crate::secret::SecretStoreError::Corrupted { path, reason } => {
+                IdentityError::Corrupted { path, reason }
+            }
+            crate::secret::SecretStoreError::Read { path, source } => {
+                IdentityError::Read { path, source }
+            }
+            crate::secret::SecretStoreError::Write { path, source } => {
+                IdentityError::Write { path, source }
+            }
+            other => IdentityError::Store(other),
+        }
+    }
 }
 
 /// The display form of an [`EndpointId`]: z-base-32 (52 characters), the same
@@ -128,78 +144,25 @@ impl NodeIdentity {
         self.secret.to_bytes()
     }
 
-    /// Path of the key file inside `data_dir`.
+    /// Path of the key file inside `data_dir`（FileSecretStore 默认布局）。
     pub fn key_path(data_dir: &Path) -> PathBuf {
-        data_dir.join(KEY_FILE_NAME)
+        data_dir.join(crate::secret::KEY_FILE_NAME)
     }
 
-    /// Loads the identity from `data_dir`, or creates and persists a new one
-    /// when no key file exists. See the module docs for the corruption
-    /// contract.
+    /// 以 SecretStore 载入身份；无身份则生成并 create（并发下不分叉）。
+    pub fn with_store(store: &dyn crate::secret::SecretStore) -> Result<Self, IdentityError> {
+        crate::secret::ensure_with(store).map_err(IdentityError::from)
+    }
+
+    /// 直接以 32B seed 构造（注入路径：零存储副作用）。
+    pub fn with_seed(seed: [u8; SEED_LEN]) -> Self {
+        Self::from_seed(seed)
+    }
+
+    /// Loads the identity from `data_dir` (FileSecretStore 默认实现), or
+    /// creates and persists a new one when no key file exists.
     pub fn load_or_create(data_dir: &Path) -> Result<Self, IdentityError> {
-        std::fs::create_dir_all(data_dir).map_err(|source| IdentityError::Write {
-            path: data_dir.to_path_buf(),
-            source,
-        })?;
-        let path = Self::key_path(data_dir);
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                if bytes.len() != SEED_LEN {
-                    return Err(IdentityError::Corrupted {
-                        path,
-                        reason: format!(
-                            "expected {SEED_LEN} bytes of Ed25519 seed, found {}",
-                            bytes.len()
-                        ),
-                    });
-                }
-                let seed: [u8; SEED_LEN] =
-                    bytes.as_slice().try_into().expect("length checked above");
-                Ok(Self::from_seed(seed))
-            }
-            // Missing file: generate fresh material and persist it.
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                let identity = Self::generate();
-                identity.write_seed_file(&path)?;
-                Ok(identity)
-            }
-            Err(source) => Err(IdentityError::Read { path, source }),
-        }
-    }
-
-    /// Persists the seed to `path` with `0600` permissions, atomically
-    /// (write to `<path>.tmp`, fsync, rename over `path`).
-    fn write_seed_file(&self, path: &Path) -> Result<(), IdentityError> {
-        let mut tmp = std::ffi::OsString::from(path.as_os_str());
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .map_err(|source| IdentityError::Write {
-                path: tmp.clone(),
-                source,
-            })?;
-        restrict_permissions(&tmp)?;
-        std::io::Write::write_all(&mut file, &self.seed()).map_err(|source| {
-            IdentityError::Write {
-                path: tmp.clone(),
-                source,
-            }
-        })?;
-        file.sync_all().map_err(|source| IdentityError::Write {
-            path: tmp.clone(),
-            source,
-        })?;
-        drop(file);
-        std::fs::rename(&tmp, path).map_err(|source| IdentityError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Ok(())
+        Self::with_store(&crate::secret::FileSecretStore::new(data_dir))
     }
 }
 
@@ -209,24 +172,6 @@ impl fmt::Debug for NodeIdentity {
             .field("endpoint_id", &endpoint_id_display(&self.endpoint_id()))
             .finish_non_exhaustive()
     }
-}
-
-/// Marks `path` as readable/writable by the current user only (unix).
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), IdentityError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
-        IdentityError::Write {
-            path: path.to_path_buf(),
-            source,
-        }
-    })
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), IdentityError> {
-    // Secret-file permissions are not representable on this platform.
-    Ok(())
 }
 
 #[cfg(test)]

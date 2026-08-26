@@ -4,8 +4,10 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use dweb_fabric::secret::SecretSeed;
 use dweb_fabric::{
     Fabric as RustFabric, FabricConfig as RustFabricConfig, FabricEvent, LinkStatus, RelayConfig,
+    SecretInjection,
 };
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -27,7 +29,7 @@ pub struct RelayOptions {
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct FabricOptions {
-    /// 数据目录（身份密钥与名册持久化位置）
+    /// 数据目录（名册持久化位置；secret 默认实现也指向此目录）
     pub data_dir: String,
     pub relay: Option<RelayOptions>,
     /// 写入邀请令牌的 issuer 直连地址（host:port）
@@ -53,12 +55,26 @@ fn to_relay_config(relay: Option<RelayOptions>) -> RelayConfig {
     }
 }
 
-fn to_options(opts: FabricOptions) -> RustFabricConfig {
-    RustFabricConfig {
-        data_dir: opts.data_dir.into(),
-        relay: to_relay_config(opts.relay),
-        advertise_addrs: opts.advertise_addrs.unwrap_or_default(),
-    }
+fn to_options(opts: &FabricOptions, secret: Option<&SecretSeedHandle>) -> Result<RustFabricConfig> {
+    let secret = match secret {
+        None => SecretInjection::Default,
+        // take 语义：句柄一次性，消费后不可复用
+        Some(handle) => {
+            if !handle.available() {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "secret handle already consumed by a previous Fabric construction",
+                ));
+            }
+            SecretInjection::Seed(handle.take().expect("checked available"))
+        }
+    };
+    Ok(RustFabricConfig {
+        data_dir: opts.data_dir.clone().into(),
+        relay: to_relay_config(opts.relay.clone()),
+        advertise_addrs: opts.advertise_addrs.clone().unwrap_or_default(),
+        secret,
+    })
 }
 
 fn link_status_str(s: LinkStatus) -> &'static str {
@@ -71,6 +87,64 @@ fn link_status_str(s: LinkStatus) -> &'static str {
 
 fn fabric_err(e: dweb_fabric::FabricError) -> Error {
     Error::new(Status::GenericFailure, format!("{e}"))
+}
+
+/// 受保护的身份种子句柄：内部持有 [`SecretSeed`]（zeroize-on-drop），
+/// 被 Fabric 构造消费（take）后即失效。用于"导入 token / 产品托管解密后"
+/// 向 Fabric 注入身份而不经手明文 JS 字符串。内部 Arc：句柄可 clone 进
+/// 配置对象，take 语义全局共享（一次消费）。
+#[napi]
+pub struct SecretSeedHandle {
+    seed: std::sync::Arc<std::sync::Mutex<Option<SecretSeed>>>,
+}
+
+impl Clone for SecretSeedHandle {
+    fn clone(&self) -> Self {
+        Self {
+            seed: self.seed.clone(),
+        }
+    }
+}
+
+#[napi]
+impl SecretSeedHandle {
+    /// 派生 EndpointId（z32 展示串；不暴露种子本体）。
+    #[napi(getter)]
+    pub fn endpoint_id(&self) -> Result<String> {
+        let g = self.seed.lock().unwrap();
+        match g.as_ref() {
+            Some(s) => Ok(dweb_fabric::identity::endpoint_id_display(&s.endpoint_id())),
+            None => Err(Error::new(
+                Status::GenericFailure,
+                "seed handle already consumed",
+            )),
+        }
+    }
+
+    /// 是否仍持有种子（未被消费）。
+    #[napi(getter)]
+    pub fn available(&self) -> bool {
+        self.seed.lock().unwrap().is_some()
+    }
+
+    fn take(&self) -> Result<SecretSeed> {
+        self.seed
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "seed handle already consumed"))
+    }
+}
+
+/// 导入 `dwebkey1.` 身份导出串：口令派生解密，返回受保护的种子句柄。
+/// （不落盘；注入 Fabric 用 `FabricOptions.secret`。）
+#[napi]
+pub fn import_secret(token: String, passphrase: String) -> Result<SecretSeedHandle> {
+    let seed = dweb_fabric::secret::import_secret(&token, &passphrase)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+    Ok(SecretSeedHandle {
+        seed: std::sync::Arc::new(std::sync::Mutex::new(Some(seed))),
+    })
 }
 
 /// dweb fabric：应用级组网的 Node SDK 入口。
@@ -86,26 +160,37 @@ pub struct Fabric {
 impl Fabric {
     /// 创建新 fabric（本节点成为 root，可签发邀请与撤销）。
     #[napi(factory)]
-    pub async fn create_root(opts: FabricOptions) -> Result<Fabric> {
-        Self::build(RustFabric::create_root(to_options(opts)).await)
+    pub async fn create_root(
+        opts: FabricOptions,
+        secret: Option<&SecretSeedHandle>,
+    ) -> Result<Fabric> {
+        Self::build(RustFabric::create_root(to_options(&opts, secret)?).await)
     }
 
     /// 打开已有 fabric（数据目录已含名册）。
     #[napi(factory)]
-    pub async fn open(opts: FabricOptions) -> Result<Fabric> {
-        Self::build(RustFabric::open(to_options(opts)).await)
+    pub async fn open(opts: FabricOptions, secret: Option<&SecretSeedHandle>) -> Result<Fabric> {
+        Self::build(RustFabric::open(to_options(&opts, secret)?).await)
     }
 
     /// 以加入者身份起步（空名册；随后调用 join 兑换邀请）。
     #[napi(factory)]
-    pub async fn attach(opts: FabricOptions, fabric_id_hex: String) -> Result<Fabric> {
-        Self::build(RustFabric::attach(to_options(opts), &fabric_id_hex).await)
+    pub async fn attach(
+        opts: FabricOptions,
+        fabric_id_hex: String,
+        secret: Option<&SecretSeedHandle>,
+    ) -> Result<Fabric> {
+        Self::build(RustFabric::attach(to_options(&opts, secret)?, &fabric_id_hex).await)
     }
 
     /// 一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。
     #[napi(factory)]
-    pub async fn join_with_token(opts: FabricOptions, token: String) -> Result<Fabric> {
-        let opts = to_options(opts);
+    pub async fn join_with_token(
+        opts: FabricOptions,
+        token: String,
+        secret: Option<&SecretSeedHandle>,
+    ) -> Result<Fabric> {
+        let opts = to_options(&opts, secret)?;
         // 先解码令牌取 fabric_id（不网络交互）
         let decoded = dweb_fabric::protocol::InviteToken::decode(&token)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
@@ -220,6 +305,13 @@ impl Fabric {
             .await
             .map_err(fabric_err)?;
         Ok(link_status_str(status).to_owned())
+    }
+
+    /// 显式导出身份（identity export，不含 roster）为 `dwebkey1.` 加密串。
+    /// 交由产品自行安全保存（如账号系统加密托管——密文上云、口令在用户）。
+    #[napi]
+    pub async fn export_secret_passphrase(&self, passphrase: String) -> Result<String> {
+        self.inner.export_secret(&passphrase).map_err(fabric_err)
     }
 
     /// 注册事件回调（可多次调用，多个回调都会收到全部事件）。

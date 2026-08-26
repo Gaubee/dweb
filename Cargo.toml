@@ -19,6 +19,9 @@ iroh = "=1.1.0"
 iroh-relay = { version = "=1.1.0", features = ["server"] }
 iroh-base = "=1.1.0"
 blake3 = "1"
+argon2 = "0.5"
+zeroize = "1"
+chacha20poly1305 = "0.10"
 ed25519-dalek = "2"
 uuid = { version = "1", features = ["v7"] }
 axum = "0.8"

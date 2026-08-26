@@ -20,12 +20,47 @@ pub enum RelayConfig {
     N0Default,
 }
 
-#[derive(Debug, Clone)]
+/// 身份注入方式（信任模型中立）：
+/// - `Default`：运行时以最终 `data_dir` 解析 FileSecretStore（不复制路径）
+/// - `Seed`：纯注入，绝不读写任何存储
+/// - `Store`：产品自定义实现（Keychain/托管后端等）
+#[derive(Clone)]
+pub enum SecretInjection {
+    Default,
+    Seed(crate::secret::SecretSeed),
+    Store(Arc<dyn crate::secret::SecretStore>),
+}
+
+impl std::fmt::Debug for SecretInjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => f.write_str("SecretInjection::Default"),
+            // 脱敏：绝不把 seed 打进日志
+            Self::Seed(_) => f.write_str("SecretInjection::Seed([REDACTED])"),
+            Self::Store(_) => f.write_str("SecretInjection::Store(<custom>)"),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct FabricConfig {
     pub data_dir: PathBuf,
     pub relay: RelayConfig,
     /// 写入邀请令牌的 issuer 直连地址（host:port），如 ["192.168.1.10:53210"]
     pub advertise_addrs: Vec<String>,
+    /// 身份来源；默认经 FileSecretStore 指向 `data_dir`
+    pub secret: SecretInjection,
+}
+
+impl std::fmt::Debug for FabricConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FabricConfig")
+            .field("data_dir", &self.data_dir)
+            .field("relay", &self.relay)
+            .field("advertise_addrs", &self.advertise_addrs)
+            .field("secret", &self.secret) // SecretInjection 的 Debug 已脱敏
+            .finish()
+    }
 }
 
 impl FabricConfig {
@@ -34,6 +69,7 @@ impl FabricConfig {
             data_dir: data_dir.into(),
             relay: RelayConfig::N0Default,
             advertise_addrs: Vec::new(),
+            secret: SecretInjection::Default,
         }
     }
 }
@@ -81,6 +117,14 @@ pub enum FabricError {
     Shutdown,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "data dir {0} has no identity; open() does not create one (use create_root/attach/join)"
+    )]
+    MissingIdentity(String),
+    #[error("identity {0} does not match the roster (not root and not an effective member)")]
+    IdentityRosterMismatch(String),
+    #[error("secret export/import: {0}")]
+    SecretExport(#[from] crate::secret::SecretExportError),
 }
 
 struct PeerEntry {
@@ -113,6 +157,21 @@ pub struct Fabric {
     inner: Arc<FabricInner>,
 }
 
+/// store 路径的身份解析：load 命中即用；缺失时按 allow_create 决定
+/// create（create_root/attach）或 MissingIdentity（open——绝不静默生成）。
+fn resolve_from_store(
+    store: &dyn crate::secret::SecretStore,
+    data_dir: &std::path::Path,
+    allow_create: bool,
+) -> Result<NodeIdentity, FabricError> {
+    match store.load() {
+        Ok(Some(seed)) => Ok(NodeIdentity::from_seed(*seed.as_bytes())),
+        Ok(None) if allow_create => NodeIdentity::with_store(store).map_err(FabricError::Identity),
+        Ok(None) => Err(FabricError::MissingIdentity(data_dir.display().to_string())),
+        Err(e) => Err(FabricError::Identity(e.into())),
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -121,34 +180,77 @@ fn now_ms() -> u64 {
 }
 
 impl Fabric {
-    /// 创建新 fabric（本节点成为 root）。
+    /// 按 SecretInjection 解析身份。
+    /// - `Default`/`Store`：`ensure_with`（load，缺失则 create；并发不分叉）
+    /// - `Seed`：纯注入，零存储副作用
+    fn resolve_identity(
+        config: &FabricConfig,
+        allow_create: bool,
+    ) -> Result<NodeIdentity, FabricError> {
+        match &config.secret {
+            SecretInjection::Seed(seed) => Ok(NodeIdentity::from_seed(*seed.as_bytes())),
+            SecretInjection::Store(store) => {
+                resolve_from_store(store.as_ref(), &config.data_dir, allow_create)
+            }
+            SecretInjection::Default => {
+                let store = crate::secret::FileSecretStore::new(&config.data_dir);
+                resolve_from_store(&store, &config.data_dir, allow_create)
+            }
+        }
+    }
+
+    /// 创建新 fabric（本节点成为 root）。既有 roster 报错（Roster::create 拒绝覆写）。
     pub async fn create_root(config: FabricConfig) -> Result<Self, FabricError> {
-        let identity = NodeIdentity::load_or_create(&config.data_dir)?;
+        let identity = Self::resolve_identity(&config, true)?;
         let (roster, _fid) = Roster::create(&identity, &config.data_dir, now_ms())?;
         Self::start(identity, roster, config).await
     }
 
-    /// 打开已有 fabric；数据目录为空时返回错误（需要 join 或 create_root）。
+    /// 打开已有 fabric。**缺失身份是错误**（不静默生成新身份——那会制造一个
+    /// 无成员关系的孤儿身份）；身份必须是 root 或有效成员（seed-roster 一致性）。
     pub async fn open(config: FabricConfig) -> Result<Self, FabricError> {
-        let identity = NodeIdentity::load_or_create(&config.data_dir)?;
+        let identity = Self::resolve_identity(&config, false)?;
         let fid = crate::roster::peek_fabric_id(&config.data_dir)?.ok_or(
             crate::roster::RosterError::NotFound {
                 path: crate::roster::roster_file_path(&config.data_dir),
             },
         )?;
         let roster = Roster::open(&config.data_dir, fid)?;
+        let id = identity.endpoint_id();
+        if !roster.is_member(&id, now_ms()) {
+            return Err(FabricError::IdentityRosterMismatch(endpoint_id_display(
+                &id,
+            )));
+        }
         Self::start(identity, roster, config).await
     }
 
-    /// 以加入者身份起步（空名册，等待 join 写入事实）。
+    /// 以加入者身份起步（空名册，等待 join 写入事实）；允许创建新身份。
+    /// 名册非空时（曾经 join 过）同样校验身份一致性。
     pub async fn attach(config: FabricConfig, fabric_id_hex: &str) -> Result<Self, FabricError> {
-        let identity = NodeIdentity::load_or_create(&config.data_dir)?;
+        let identity = Self::resolve_identity(&config, true)?;
         // fabric_id 以 hex 传递；z32 不适合 32B 演示（避免双编码），此处 hex 是内部参数而非展示串
         let mut buf = [0u8; 32];
         hex::decode_to_slice(fabric_id_hex, &mut buf)
             .map_err(|_| FabricError::BadEndpointId(fabric_id_hex.to_owned()))?;
         let roster = Roster::attach(&config.data_dir, crate::protocol::FabricId(buf))?;
+        if !roster.is_empty() {
+            let id = identity.endpoint_id();
+            if !roster.is_member(&id, now_ms()) {
+                return Err(FabricError::IdentityRosterMismatch(endpoint_id_display(
+                    &id,
+                )));
+            }
+        }
         Self::start(identity, roster, config).await
+    }
+
+    /// 显式导出身份（identity export，不含 roster）为 `dwebkey1.` 加密串。
+    pub fn export_secret(&self, passphrase: &str) -> Result<String, FabricError> {
+        Ok(crate::secret::export_secret(
+            &self.inner.identity,
+            passphrase,
+        )?)
     }
 
     async fn start(

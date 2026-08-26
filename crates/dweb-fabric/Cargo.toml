@@ -19,6 +19,9 @@ anyhow = { workspace = true }
 # Debug (non-canonical) JSON projection of facts; canonical bytes are hand-written.
 serde_json = { workspace = true }
 hex = "0.4"
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+chacha20poly1305 = { workspace = true }
 libc = "0.2"
 n0-future = "0.3"
 

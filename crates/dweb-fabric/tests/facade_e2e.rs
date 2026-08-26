@@ -10,6 +10,7 @@ fn cfg(dir: &TempDir) -> FabricConfig {
         data_dir: dir.path().to_owned(),
         relay: RelayConfig::Disabled,
         advertise_addrs: Vec::new(),
+        secret: dweb_fabric::SecretInjection::Default,
     }
 }
 
@@ -259,4 +260,83 @@ async fn remote_revoke_kicks_session_via_acceptor_path() {
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn secret_injection_semantics() {
+    use dweb_fabric::SecretInjection;
+    use dweb_fabric::secret::SecretSeed;
+
+    // 1) Seed 注入：确定性 + 零存储副作用（目录无 identity.key）
+    let dir = TempDir::new().unwrap();
+    let seed = SecretSeed::from_bytes([7u8; 32]);
+    let expected_id = seed.endpoint_id();
+    let f = Fabric::create_root(FabricConfig {
+        data_dir: dir.path().to_owned(),
+        relay: RelayConfig::Disabled,
+        advertise_addrs: Vec::new(),
+        secret: SecretInjection::Seed(seed),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.endpoint_id(),
+        dweb_fabric::identity::endpoint_id_display(&expected_id)
+    );
+    assert!(
+        !dir.path().join("identity.key").exists(),
+        "seed injection must not touch storage"
+    );
+
+    // 2) open 缺失身份 => MissingIdentity，不生成
+    let dir2 = TempDir::new().unwrap();
+    let f2 = Fabric::create_root(FabricConfig {
+        data_dir: dir2.path().to_owned(),
+        relay: RelayConfig::Disabled,
+        advertise_addrs: Vec::new(),
+        secret: SecretInjection::Seed(SecretSeed::from_bytes([8u8; 32])),
+    })
+    .await
+    .unwrap();
+    f2.shutdown().await.unwrap();
+    // data_dir 只有 roster（seed 注入没写 identity.key）
+    let opened = Fabric::open(FabricConfig {
+        data_dir: dir2.path().to_owned(),
+        relay: RelayConfig::Disabled,
+        advertise_addrs: Vec::new(),
+        secret: SecretInjection::Default,
+    })
+    .await;
+    assert!(
+        matches!(opened, Err(dweb_fabric::FabricError::MissingIdentity(_))),
+        "open without identity must fail"
+    );
+
+    // 3) seed 与 roster 不一致 => IdentityRosterMismatch（open）
+    let mismatch = Fabric::open(FabricConfig {
+        data_dir: dir2.path().to_owned(),
+        relay: RelayConfig::Disabled,
+        advertise_addrs: Vec::new(),
+        secret: SecretInjection::Seed(SecretSeed::from_bytes([9u8; 32])),
+    })
+    .await;
+    assert!(
+        matches!(
+            mismatch,
+            Err(dweb_fabric::FabricError::IdentityRosterMismatch(_))
+        ),
+        "foreign seed vs roster must fail"
+    );
+
+    // 4) 身份导出：同 seed 恢复同 EndpointId；不含 roster 语义
+    let token = f2.export_secret("pass-phrase").unwrap();
+    let restored = dweb_fabric::secret::import_secret(&token, "pass-phrase").unwrap();
+    assert_eq!(
+        restored.endpoint_id(),
+        dweb_fabric::identity::endpoint_id_parse(&f2.endpoint_id()).unwrap()
+    );
+    assert!(matches!(
+        dweb_fabric::secret::import_secret(&token, "wrong"),
+        Err(dweb_fabric::secret::SecretExportError::Auth)
+    ));
 }

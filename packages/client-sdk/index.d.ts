@@ -14,13 +14,13 @@ export interface FabricEventJs {
  */
 export declare class Fabric {
   /** 创建新 fabric（本节点成为 root，可签发邀请与撤销）。 */
-  static createRoot(opts: FabricOptions): Promise<Fabric>
+  static createRoot(opts: FabricOptions, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
   /** 打开已有 fabric（数据目录已含名册）。 */
-  static open(opts: FabricOptions): Promise<Fabric>
+  static open(opts: FabricOptions, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
   /** 以加入者身份起步（空名册；随后调用 join 兑换邀请）。 */
-  static attach(opts: FabricOptions, fabricIdHex: string): Promise<Fabric>
+  static attach(opts: FabricOptions, fabricIdHex: string, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
   /** 一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。 */
-  static joinWithToken(opts: FabricOptions, token: string): Promise<Fabric>
+  static joinWithToken(opts: FabricOptions, token: string, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
   /** 本节点 EndpointId（z-base-32，52 字符） */
   get endpointId(): string
   /** fabric id（hex） */
@@ -46,6 +46,11 @@ export declare class Fabric {
   /** 查询与某成员的当前路径类型："direct" | "relay" | "unknown" */
   linkStatus(endpointId: string): Promise<string>
   /**
+   * 显式导出身份（identity export，不含 roster）为 `dwebkey1.` 加密串。
+   * 交由产品自行安全保存（如账号系统加密托管——密文上云、口令在用户）。
+   */
+  exportSecretPassphrase(passphrase: string): Promise<string>
+  /**
    * 注册事件回调（可多次调用，多个回调都会收到全部事件）。
    * 事件对象见 FabricEventJs：{ type, endpointId?, from?, data?, status? }
    */
@@ -54,14 +59,33 @@ export declare class Fabric {
   shutdown(): Promise<void>
 }
 
+/**
+ * 受保护的身份种子句柄：内部持有 [`SecretSeed`]（zeroize-on-drop），
+ * 被 Fabric 构造消费（take）后即失效。用于"导入 token / 产品托管解密后"
+ * 向 Fabric 注入身份而不经手明文 JS 字符串。内部 Arc：句柄可 clone 进
+ * 配置对象，take 语义全局共享（一次消费）。
+ */
+export declare class SecretSeedHandle {
+  /** 派生 EndpointId（z32 展示串；不暴露种子本体）。 */
+  get endpointId(): string
+  /** 是否仍持有种子（未被消费）。 */
+  get available(): boolean
+}
+
 /** Fabric 构造配置 */
 export interface FabricOptions {
-  /** 数据目录（身份密钥与名册持久化位置） */
+  /** 数据目录（名册持久化位置；secret 默认实现也指向此目录） */
   dataDir: string
   relay?: RelayOptions
   /** 写入邀请令牌的 issuer 直连地址（host:port） */
   advertiseAddrs?: Array<string>
 }
+
+/**
+ * 导入 `dwebkey1.` 身份导出串：口令派生解密，返回受保护的种子句柄。
+ * （不落盘；注入 Fabric 用 `FabricOptions.secret`。）
+ */
+export declare function importSecret(token: string, passphrase: string): SecretSeedHandle
 
 /** 成员信息 */
 export interface Member {
