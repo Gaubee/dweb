@@ -13,8 +13,8 @@ COPY .cargo .cargo
 COPY packages/client-sdk packages/client-sdk
 
 RUN cargo chef prepare --recipe-path recipe.json
+# target 缓存卷会让 chef 的 dummy 清理失败（已知不兼容）；仅挂 registry 缓存
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
     cargo chef cook --release --recipe-path recipe.json -p dweb-server
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
