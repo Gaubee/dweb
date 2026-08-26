@@ -1,10 +1,10 @@
 {
-  "name": "@dweb/example",
+  "name": "@jixo/opendweb-example",
   "version": "0.1.0",
   "description": "dweb example app: two-process networking with invite, join, chat",
   "license": "MIT OR Apache-2.0",
   "bin": {
-    "dweb-example": "./bin/dweb-example.mjs"
+    "opendweb-example": "./bin/dweb-example.mjs"
   },
   "scripts": {
     "start": "tsx src/cli.ts",
@@ -12,7 +12,9 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "dependencies": {
-    "@dweb/client-sdk": "workspace:*",
-    "@dweb/server-binary": "workspace:*"
+    "@jixo/opendweb-client-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@jixo/opendweb-server-binary": "workspace:*"
   }
 }

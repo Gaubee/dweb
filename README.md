@@ -15,15 +15,37 @@
 
 - `crates/dweb-fabric` — 组网 kernel（Rust lib：identity/protocol/roster/session/fabric 门面）
 - `crates/dweb-server` — 自托管服务端：iroh-relay + rendezvous（Rust bin）
-- `packages/client-sdk` — `@dweb/client-sdk`（napi-rs，darwin-arm64）
-- `packages/example` — `@dweb/example` 双进程组网 CLI 样板
-- `packages/server-binary` — `@dweb/server-binary` 服务端 npm 包装（darwin-arm64）
+- `packages/client-sdk` — `@jixo/opendweb-client-sdk`（napi-rs，darwin-arm64）
+- `packages/example` — `@jixo/opendweb-example` 双进程组网 CLI 样板
+- `packages/server-binary` — `@jixo/opendweb-server-binary` 服务端 npm 包装（darwin-arm64）
 - `docker/` — 镜像 `ghcr.io/gaubee/dweb`（rendezvous 8787 + relay 3340）
 
-## 快速开始
+## 快速开始（体验 example）
 
 ```bash
-# 1. 自托管 relay（docker；也可用 npm 包 @dweb/server-binary）
+# 1. 启动自托管 server（relay + rendezvous）—— 顶层 CLI
+pnpm --filter opendweb exec node bin/opendweb.mjs server
+#   或发布后: npx opendweb server
+#   也可用 docker: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+
+# 2. 终端 A：初始化并常驻聊天
+export DWEB_RELAY=custom DWEB_RELAY_URLS=http://127.0.0.1:3340
+node packages/example/src/cli.mjs init --data ~/.dweb-a
+node packages/example/src/cli.mjs invite --data ~/.dweb-a   # 复制输出的 token
+node packages/example/src/cli.mjs chat --data ~/.dweb-a
+
+# 3. 终端 B（另一目录/设备）：兑换邀请并聊天
+export DWEB_RELAY=custom DWEB_RELAY_URLS=http://<A的IP>:3340
+node packages/example/src/cli.mjs join --data ~/.dweb-b <token>
+node packages/example/src/cli.mjs chat --data ~/.dweb-b
+```
+
+注意：本机设置了 `http_proxy` 等代理环境变量时，局域网 relay 需追加
+`export NO_PROXY=<relay主机名或IP>`，否则代理会劫持 relay 的 WS 连接。
+
+## 服务器部署（docker）
+
+```bash
 docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
 
 # 2. 机器 A：初始化 fabric 并常驻聊天
@@ -46,7 +68,7 @@ relay 模式不受影响）。本机代理（http_proxy 等）会劫持 relay WS
 ## SDK（Node，darwin-arm64）
 
 ```js
-const { Fabric } = require("@dweb/client-sdk");
+const { Fabric } = require("@jixo/opendweb-client-sdk");
 const a = await Fabric.createRoot({ dataDir: "/path/a", relay: { mode: "disabled" } });
 const token = await a.invite(10 * 60_000, null);          // root 签发
 const b = await Fabric.joinWithToken({ dataDir: "/path/b" }, token); // 在线兑换
@@ -81,8 +103,8 @@ const fabric2 = await Fabric.createRoot({ dataDir }, handle);   // 注入恢复�
 
 ```bash
 cargo test --workspace        # Rust（fabric 50 测试）
-pnpm --filter @dweb/client-sdk test     # node --test（SDK 生命周期）
-pnpm --filter @dweb/example test        # node --test（双进程 relay E2E）
+pnpm --filter @jixo/opendweb-client-sdk test     # node --test（SDK 生命周期）
+pnpm --filter @jixo/opendweb-example test        # node --test（双进程 relay E2E）
 ```
 
 - 仓库位于网络磁盘：Rust 编译走本地 `CARGO_TARGET_DIR`（`.cargo/config.toml` 本机配置，

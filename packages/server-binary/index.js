@@ -34,7 +34,7 @@ export async function startServer(options = {}) {
   const hash = createHash("sha256").update(buf).digest("hex").slice(0, 24);
   let binPath = srcBin;
   try {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dweb-server-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opendweb-server-"));
     const dest = path.join(dir, hash);
     const fd = fs.openSync(dest, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o755);
     try {

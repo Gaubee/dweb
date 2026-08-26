@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { startServer } from "@dweb/server-binary";
+import { startServer } from "@jixo/opendweb-server-binary";
 
 const NODE = process.execPath;
 const CLI = path.resolve(new URL("../src/cli.mjs", import.meta.url).pathname);

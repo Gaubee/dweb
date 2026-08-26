@@ -25,7 +25,7 @@ function loadViaTmp() {
   const hash = crypto.createHash("sha256").update(buf).digest("hex").slice(0, 24);
   try {
     // 0700 私有目录规避可预测路径的 symlink/TOCTOU 窗口
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dweb-sdk-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opendweb-sdk-"));
     const dest = path.join(dir, `${hash}.node`);
     const fd = fs.openSync(dest, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o755);
     try {

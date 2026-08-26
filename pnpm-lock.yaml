@@ -22,12 +22,26 @@ importers:
 
   packages/example:
     dependencies:
-      '@dweb/client-sdk':
+      '@jixo/opendweb-client-sdk':
         specifier: workspace:*
         version: link:../client-sdk
-      '@dweb/server-binary':
+    devDependencies:
+      '@jixo/opendweb-server-binary':
         specifier: workspace:*
         version: link:../server-binary
+
+  packages/opendweb:
+    dependencies:
+      '@jixo/opendweb-server-binary':
+        specifier: workspace:*
+        version: link:../server-binary
+    devDependencies:
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7
 
   packages/server-binary:
     devDependencies:

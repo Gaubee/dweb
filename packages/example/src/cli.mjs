@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // @dweb/example：dweb 组网示例 CLI。
-// 线性最小实现（无框架），作为开发者接入 @dweb/client-sdk 的参考样板。
+// 线性最小实现（无框架），作为开发者接入 @jixo/opendweb-client-sdk 的参考样板。
 // 用法：
 //   dweb-example init [--data <dir>]
 //   dweb-example id [--data <dir>]
@@ -20,7 +20,7 @@ import * as readline from "node:readline";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { Fabric } = require("@dweb/client-sdk");
+const { Fabric } = require("@jixo/opendweb-client-sdk");
 
 const args = process.argv.slice(2);
 const command = args[0] ?? "help";

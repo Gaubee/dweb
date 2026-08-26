@@ -1,5 +1,5 @@
 {
-  "name": "@dweb/server-binary",
+  "name": "@jixo/opendweb-server-binary",
   "version": "0.1.0",
   "description": "dweb self-hostable server binary packaged for npm (darwin-arm64)",
   "license": "MIT OR Apache-2.0",
