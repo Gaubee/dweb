@@ -366,6 +366,24 @@ impl Fabric {
         Ok(())
     }
 
+    /// 显式登记对端可达地址（relay URL 或 ip:port），供后续 connect 使用。
+    pub async fn add_known_addr(&self, id: &str, addr: String) -> Result<(), FabricError> {
+        let id = endpoint_id_parse(id).map_err(|_| FabricError::BadEndpointId(id.into()))?;
+        self.inner
+            .known_addrs
+            .lock()
+            .await
+            .entry(id)
+            .or_default()
+            .push(addr);
+        Ok(())
+    }
+
+    /// 对端当前可达地址提示（网卡地址 + 回环端口）。
+    pub async fn direct_addr_hints_public(&self) -> Vec<String> {
+        self.direct_addr_hints()
+    }
+
     pub async fn disconnect(&self, id: &str) -> Result<(), FabricError> {
         let id = endpoint_id_parse(id).map_err(|_| FabricError::BadEndpointId(id.into()))?;
         if let Some(entry) = self.inner.peers.lock().await.remove(&id) {

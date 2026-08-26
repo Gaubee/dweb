@@ -191,7 +191,8 @@ pub async fn acceptor_hello(
             limit: MAX_HELLO_FACTS,
         });
     }
-    roster.lock().await.merge(incoming.iter().cloned())?;
+    // 注意：此处不 merge——差集踢除（远端 Revoke 断开既有会话）依赖调用方
+    // 在 merge 前取投影快照，必须由 Fabric::merge_and_emit 统一执行。
     let dump = {
         let r = roster.lock().await;
         SignedFact::encode_all(r.facts())?

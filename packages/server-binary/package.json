@@ -28,6 +28,7 @@
     "index.js",
     "index.d.ts",
     "bin/dweb-server.mjs",
-    "scripts/pack.mjs"
+    "scripts/pack.mjs",
+    "bin/dweb-server-aarch64-apple-darwin"
   ]
 }

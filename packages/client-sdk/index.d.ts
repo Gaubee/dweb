@@ -41,7 +41,7 @@ export declare class Fabric {
    * 注册事件回调（可多次调用，多个回调都会收到全部事件）。
    * 事件对象见 FabricEventJs：{ type, endpointId?, from?, data?, status? }
    */
-  on(callback: ((err: Error | null, arg: string) => void)): void
+  on(callback: (event: FabricEventJs) => void): void
   /** 优雅关闭：断开全部会话并释放网络资源。幂等。 */
   shutdown(): Promise<void>
 }

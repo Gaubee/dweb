@@ -186,3 +186,77 @@ async fn root_restart_keeps_membership_and_identity() {
     assert_eq!(a2.members().await.len(), 1);
     a2.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn remote_revoke_kicks_session_via_acceptor_path() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let dir_c = TempDir::new().unwrap();
+
+    let a = Fabric::create_root(cfg(&dir_a)).await.unwrap();
+    let fid = a.fabric_id_hex().await;
+
+    let b = Fabric::attach(cfg(&dir_b), &fid).await.unwrap();
+    let c = Fabric::attach(cfg(&dir_c), &fid).await.unwrap();
+    let mut ev_c = c.subscribe();
+
+    // A 邀请 B 与 C
+    b.join(&a.invite(300_000, None).await.unwrap())
+        .await
+        .unwrap();
+    c.join(&a.invite(300_000, None).await.unwrap())
+        .await
+        .unwrap();
+
+    // B/C 各自再与 A 同步，互相知晓对方的 Grant
+    b.connect(&a.endpoint_id()).await.unwrap();
+    c.connect(&a.endpoint_id()).await.unwrap();
+
+    // relay 禁用场景：显式交换地址提示
+    for hint in c.direct_addr_hints_public().await {
+        b.add_known_addr(&c.endpoint_id(), hint.clone())
+            .await
+            .unwrap();
+        a.add_known_addr(&c.endpoint_id(), hint).await.unwrap();
+    }
+    for hint in b.direct_addr_hints_public().await {
+        c.add_known_addr(&b.endpoint_id(), hint.clone())
+            .await
+            .unwrap();
+        a.add_known_addr(&b.endpoint_id(), hint).await.unwrap();
+    }
+
+    // C 与 B 建立既有会话（B 主动拨号，C 为 acceptor）
+    b.connect(&c.endpoint_id()).await.unwrap();
+    let _ = wait_event(
+        &mut ev_c,
+        |e| matches!(e, FabricEvent::PeerConnected { .. }),
+        "C sees B",
+    )
+    .await;
+
+    // A 撤销 B
+    a.revoke(&b.endpoint_id()).await.unwrap();
+
+    // A 主动拨号 C：C 作为 acceptor 在 HELLO 中收到含 revoke(B) 的事实集，
+    // 必须在 merge 后差集踢除并断开与 B 的既有会话（codex round3 场景）。
+    // 先断开既有 A-C 连接，避免 connect 幂等短路不发 HELLO。
+    a.disconnect(&c.endpoint_id()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    a.connect(&c.endpoint_id()).await.unwrap();
+
+    // C 侧观察到 B 下线（acceptor 路径差集踢除）
+    let _ = wait_event(
+        &mut ev_c,
+        |e| matches!(e, FabricEvent::PeerDisconnected { .. }),
+        "C kicks B",
+    )
+    .await;
+
+    // B 不再是 C 的有效成员
+    assert!(!c.is_member(&b.endpoint_id()).await.unwrap());
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}

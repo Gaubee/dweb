@@ -672,6 +672,9 @@ impl InviteV1 {
         let invite_id = bytes[48..64].try_into().expect("slice len 16");
         let issuer = key_from_bytes(&bytes[64..96])?;
         let mut off = INVITE_FIXED_LEN;
+        if bytes.len() < off + 2 {
+            return Err(trunc("relay URL length prefix"));
+        }
         let relay_len = u16::from_be_bytes([bytes[off], bytes[off + 1]]) as usize;
         off += 2;
         if relay_len > MAX_RELAY_URL_BYTES {
@@ -686,6 +689,9 @@ impl InviteV1 {
             .map_err(|_| quarantine("relay URL is not valid UTF-8"))?
             .to_owned();
         off += relay_len;
+        if bytes.len() < off + 1 {
+            return Err(trunc("direct addr count"));
+        }
         let n_addrs = bytes[off] as usize;
         off += 1;
         if n_addrs > MAX_DIRECT_ADDRS {
@@ -695,6 +701,9 @@ impl InviteV1 {
         }
         let mut issuer_direct_addrs = Vec::with_capacity(n_addrs);
         for _ in 0..n_addrs {
+            if bytes.len() < off + 1 {
+                return Err(trunc("direct addr length prefix"));
+            }
             let addr_len = bytes[off] as usize;
             off += 1;
             if addr_len > MAX_DIRECT_ADDR_BYTES {
@@ -867,6 +876,39 @@ fn hex_str(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod round3_regress {
+    use super::*;
+
+    fn mk_invite_bytes(tail_len: usize) -> Vec<u8> {
+        // 域前缀 + 版本 + fabric/invite/issuer 定长段，尾部截到 tail_len
+        let mut v = Vec::new();
+        v.extend_from_slice(b"dweb/invite/v1\0");
+        v.push(1);
+        v.extend_from_slice(&[3u8; 32]);
+        v.extend_from_slice(&[4u8; 16]);
+        v.extend_from_slice(&[5u8; 32]);
+        v.truncate(16 + 1 + tail_len.min(v.len() - 17));
+        v
+    }
+
+    #[test]
+    fn malformed_invite_never_panics_only_quarantine() {
+        // 在固定头之后逐字节截断：任何前缀都必须 Err，绝不 panic
+        let base = mk_invite_bytes(usize::MAX);
+        for cut in 0..base.len() {
+            let sliced = &base[..cut];
+            let r = std::panic::catch_unwind(|| InviteV1::decode_strict(sliced));
+            assert!(r.is_ok(), "panic at cut={cut}");
+            assert!(r.unwrap().is_err(), "must error at cut={cut}");
+        }
+        // relay 长度前缀边界：截到刚好缺 2 字节
+        let mut b = base.clone();
+        b.truncate(INVITE_FIXED_LEN);
+        assert!(InviteV1::decode_strict(&b).is_err());
+    }
 }
 
 #[cfg(test)]

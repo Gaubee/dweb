@@ -26,7 +26,7 @@
 
 - [x] 4.1 rendezvous 模块：axum 路由（POST/GET /rendezvous/:id、GET /healthz）、签名验证、TTL 过期清理；集成测试（签名受理/拒绝/过期）
 - [x] 4.2 relay 集成：按 spike 结论嵌入 iroh-relay 服务端，环境变量配置开关与端口
-- [ ] 4.3 端到端：fabric 节点以自托管 relay 完成组网（禁用 n0 默认）的集成测试
+- [x] 4.3 端到端：fabric 节点以自托管 relay 完成组网（禁用 n0 默认）的集成测试
 
 ## 5. client-sdk（packages/client-sdk）
 
@@ -47,6 +47,6 @@
 
 ## 8. 收尾
 
-- [ ] 8.1 CI（GitHub Actions）：cargo test/clippy/fmt + pnpm build/test（Linux 容器内跑 Rust 单元测试与 SDK 类型检查；原生 .node 相关 job 限 macos-14）
-- [ ] 8.2 README（根）：快速开始（docker run relay → example 双进程组网）
+- [x] 8.1 CI（GitHub Actions）：cargo test/clippy/fmt + pnpm build/test（Linux 容器内跑 Rust 单元测试与 SDK 类型检查；原生 .node 相关 job 限 macos-14）
+- [x] 8.2 README（根）：快速开始（docker run relay → example 双进程组网）
 - [x] 8.3 openspec validate --strict 通过；tasks 勾选完成；按批次 git commit 并推送
