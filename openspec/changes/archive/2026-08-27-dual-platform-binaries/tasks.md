@@ -6,4 +6,4 @@
 - [x] 3.1 client-sdk loader 双平台选择 + files 白名单 + 平台错误
 - [x] 3.2 server-binary 双 exe 选择 + bin 入口
 - [x] 4.1 CI windows job（test + build + node 套件 + artifact）；rust-test 加 windows target check
-- [ ] 5.1 全门禁（本地 darwin 全绿 + CI 双平台绿）+ README 体积实测更新 + 提交推送
+- [x] 5.1 全门禁（本地 darwin 全绿 + CI 双平台绿）+ README 体积实测更新 + 提交推送
