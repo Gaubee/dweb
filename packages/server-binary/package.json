@@ -11,7 +11,7 @@
   "type": "module",
   "scripts": {
     "pack:binary": "node scripts/pack.mjs",
-    "test": "node scripts/pack.mjs && node --test",
+    "test": "node scripts/pack.mjs && node --test --test-force-exit",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

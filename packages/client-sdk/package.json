@@ -14,7 +14,7 @@
   "scripts": {
     "build": "napi build --platform --release --target aarch64-apple-darwin --no-js",
     "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js",
-    "test": "node --test",
+    "test": "node --test --test-force-exit",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
