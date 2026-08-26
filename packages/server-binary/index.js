@@ -33,23 +33,27 @@ if (!BINARY_NAME) {
 export async function startServer(options = {}) {
   const binDir = path.dirname(fileURLToPath(import.meta.url));
   const srcBin = path.join(binDir, "bin", BINARY_NAME);
-  // SMB 网络磁盘上的原生二进制会触发 CODESIGNING Invalid Page：拷到私有 tmp 目录执行
-  const buf = fs.readFileSync(srcBin);
-  const hash = createHash("sha256").update(buf).digest("hex").slice(0, 24);
+  // SMB 网络磁盘（开发机）上的原生二进制会触发 CODESIGNING Invalid Page：
+  // darwin 拷到私有 tmp 内容寻址路径执行。Windows 无此问题且 tmp 无扩展名
+  // 拷贝会被 Defender/路径解析干扰——直接执行源路径。
   let binPath = srcBin;
-  try {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opendweb-server-"));
-    const dest = path.join(dir, hash);
-    const fd = fs.openSync(dest, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o755);
+  if (process.platform === "darwin") {
     try {
-      fs.writeFileSync(fd, buf);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
+      const buf = fs.readFileSync(srcBin);
+      const hash = createHash("sha256").update(buf).digest("hex").slice(0, 24);
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opendweb-server-"));
+      const dest = path.join(dir, hash);
+      const fd = fs.openSync(dest, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o755);
+      try {
+        fs.writeFileSync(fd, buf);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      binPath = dest;
+    } catch {
+      binPath = srcBin; // 退回直接执行源路径
     }
-    binPath = dest;
-  } catch {
-    binPath = srcBin; // 退回直接执行源路径
   }
 
   const httpBind = options.httpBind ?? "127.0.0.1:8787";
