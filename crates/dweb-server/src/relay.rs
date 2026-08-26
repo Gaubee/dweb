@@ -25,8 +25,8 @@ pub async fn start_from_env() -> Result<Option<Server>> {
         return Ok(None);
     }
 
-    let http_bind = env_addr("DWEB_RELAY_HTTP_BIND")
-        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 3340)));
+    let http_bind =
+        env_addr("DWEB_RELAY_HTTP_BIND").unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 3340)));
     let mut relay = RelayServerConfig::new(http_bind);
     relay.tls = None; // 生产由反代终结 TCP/WS；QUIC 需原生证书（见下）
 

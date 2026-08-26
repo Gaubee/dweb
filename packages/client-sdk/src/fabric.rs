@@ -2,6 +2,8 @@
 //! 生命周期契约：所有异步方法在 shutdown 后返回错误；事件回调在 shutdown 后
 //! 不再触发；重复 shutdown 幂等。
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dweb_fabric::{
     Fabric as RustFabric, FabricConfig as RustFabricConfig, FabricEvent, LinkStatus, RelayConfig,
 };
@@ -9,8 +11,6 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::sync::Arc;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
-use base64::Engine as _;
 use tokio::sync::Mutex;
 
 /// relay 配置
@@ -110,8 +110,9 @@ impl Fabric {
         let decoded = dweb_fabric::protocol::InviteToken::decode(&token)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
         let fabric_id = hex::encode(decoded.invite.fabric_id.as_bytes());
-        let fabric =
-            RustFabric::attach(opts, &fabric_id).await.map_err(fabric_err)?;
+        let fabric = RustFabric::attach(opts, &fabric_id)
+            .await
+            .map_err(fabric_err)?;
         fabric.join(&token).await.map_err(fabric_err)?;
         Self::build(Ok(fabric))
     }
@@ -183,7 +184,10 @@ impl Fabric {
     /// 断开与某成员的会话
     #[napi]
     pub async fn disconnect(&self, endpoint_id: String) -> Result<()> {
-        self.inner.disconnect(&endpoint_id).await.map_err(fabric_err)
+        self.inner
+            .disconnect(&endpoint_id)
+            .await
+            .map_err(fabric_err)
     }
 
     /// 发送不透明二进制 envelope
@@ -272,13 +276,18 @@ fn spawn_event_pump(fabric: &Fabric) {
                     "from": from,
                     "dataBase64": BASE64.encode(data),
                 }),
-                FabricEvent::PathChanged { endpoint_id, status } => serde_json::json!({
+                FabricEvent::PathChanged {
+                    endpoint_id,
+                    status,
+                } => serde_json::json!({
                     "type": "path-changed",
                     "endpointId": endpoint_id,
                     "status": link_status_str(*status),
                 }),
             };
-            let Ok(payload) = serde_json::to_string(&payload) else { continue };
+            let Ok(payload) = serde_json::to_string(&payload) else {
+                continue;
+            };
             for cb in callbacks.lock().await.iter() {
                 cb.call(Ok(payload.clone()), ThreadsafeFunctionCallMode::NonBlocking);
             }

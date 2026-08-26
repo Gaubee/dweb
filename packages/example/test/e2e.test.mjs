@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { startServer } from "@dweb/server-binary";
 
-const NODE = "/Users/kzf/.local/node/bin/node";
+const NODE = process.execPath;
 const CLI = path.resolve(new URL("../src/cli.mjs", import.meta.url).pathname);
 
 function tmpdir(p) {

@@ -17,9 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, presets};
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
-};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use n0_future::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -30,8 +28,7 @@ const MSG_LIMIT: usize = 64 * 1024;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -85,7 +82,8 @@ fn parse_common(rest: &[String]) -> Result<CommonArgs> {
         match flag.as_str() {
             "--addr" => {
                 let v = it.next().context("--addr 需要 IP:PORT")?;
-                out.addrs.push(v.parse().with_context(|| format!("解析 {v}"))?);
+                out.addrs
+                    .push(v.parse().with_context(|| format!("解析 {v}"))?);
             }
             "--relay" => {
                 let v = it.next().context("--relay 需要 URL")?;
@@ -170,13 +168,19 @@ fn spawn_path_event_logger(tag: &'static str, conn: &Connection) -> tokio::task:
     tokio::spawn(async move {
         while let Some(ev) = events.next().await {
             match ev {
-                iroh::endpoint::PathEvent::Opened { id, remote_addr, .. } => {
+                iroh::endpoint::PathEvent::Opened {
+                    id, remote_addr, ..
+                } => {
                     println!("[{tag}-event] Opened   id={id:?} remote={remote_addr}")
                 }
-                iroh::endpoint::PathEvent::Selected { id, remote_addr, .. } => {
+                iroh::endpoint::PathEvent::Selected {
+                    id, remote_addr, ..
+                } => {
                     println!("[{tag}-event] Selected id={id:?} remote={remote_addr}");
                 }
-                iroh::endpoint::PathEvent::Closed { id, remote_addr, .. } => {
+                iroh::endpoint::PathEvent::Closed {
+                    id, remote_addr, ..
+                } => {
                     println!("[{tag}-event] Closed   id={id:?} remote={remote_addr}");
                 }
                 iroh::endpoint::PathEvent::Lagged { missed, .. } => {
@@ -302,9 +306,14 @@ async fn cmd_relay(rest: &[String]) -> Result<()> {
     println!("健康检查: curl http://{http_addr}/healthz");
 
     // 内部做一次 GET /healthz 验证（不引 HTTP 客户端依赖，手写 HTTP/1.1）
-    let mut stream = tokio::net::TcpStream::connect(http_addr).await.context("连接 relay")?;
+    let mut stream = tokio::net::TcpStream::connect(http_addr)
+        .await
+        .context("连接 relay")?;
     stream
-        .write_all(format!("GET /healthz HTTP/1.1\r\nHost: {http_addr}\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET /healthz HTTP/1.1\r\nHost: {http_addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .await?;
     let mut body = String::new();
     stream.read_to_string(&mut body).await.ok();
@@ -344,7 +353,10 @@ async fn cmd_relay_selftest() -> Result<()> {
 
     // 等 server 端连上 home relay，EndpointAddr 里才有 relay url
     server_ep.online().await;
-    println!("[relay-selftest] server online，addr.addrs = {:?}", server_ep.addr().addrs);
+    println!(
+        "[relay-selftest] server online，addr.addrs = {:?}",
+        server_ep.addr().addrs
+    );
 
     let server_task = tokio::spawn(accept_loop(server_ep.clone()));
 
@@ -356,14 +368,20 @@ async fn cmd_relay_selftest() -> Result<()> {
         .context("connect 超时")?
         .context("connect")?;
     println!("[relay-selftest] connect 成功，耗时 {:?}", t0.elapsed());
-    println!("[relay-selftest] 对端 remote_id = {}", conn.remote_id().to_z32());
+    println!(
+        "[relay-selftest] 对端 remote_id = {}",
+        conn.remote_id().to_z32()
+    );
 
     let ev_logger = spawn_path_event_logger("client", &conn);
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
     send.write_all(b"relay-only-ping").await?;
     send.finish()?;
     let reply = recv.read_to_end(MSG_LIMIT).await.context("read_to_end")?;
-    println!("[relay-selftest] echo 回复: {:?}", String::from_utf8_lossy(&reply));
+    println!(
+        "[relay-selftest] echo 回复: {:?}",
+        String::from_utf8_lossy(&reply)
+    );
 
     // 观察 3 秒路径演化（relay 上建立后，若直连可行会迁移到 direct）
     for i in 0..3 {
@@ -400,7 +418,9 @@ async fn cmd_n0_selftest() -> Result<()> {
     // 仅凭 EndpointId 连接（EndpointAddr::new(id)，空 addrs -> 触发 address lookup）
     let target = EndpointAddr::new(server_ep.id());
     let t0 = std::time::Instant::now();
-    let conn = match tokio::time::timeout(Duration::from_secs(40), client_ep.connect(target, ALPN)).await {
+    let conn = match tokio::time::timeout(Duration::from_secs(40), client_ep.connect(target, ALPN))
+        .await
+    {
         Ok(Ok(conn)) => conn,
         Ok(Err(err)) => {
             println!("[n0] 仅凭 EndpointId connect 失败（外网不可达或未发布成功）: {err:#}");
@@ -441,10 +461,7 @@ async fn cmd_listen(rest: &[String]) -> Result<()> {
     }
     // 从 bound_sockets 推导 127.0.0.1 直连候选地址
     if let Some(sock) = ep.bound_sockets().first() {
-        println!(
-            "[listen] 本机直连候选: --addr 127.0.0.1:{}",
-            sock.port()
-        );
+        println!("[listen] 本机直连候选: --addr 127.0.0.1:{}", sock.port());
     }
     accept_loop(ep).await
 }
@@ -469,7 +486,11 @@ async fn cmd_connect(rest: &[String]) -> Result<()> {
     if let Some(relay) = &args.relay {
         target = target.with_relay_url(relay.clone());
     }
-    println!("[connect] target = id {} addrs {:?}", id.to_z32(), target.addrs);
+    println!(
+        "[connect] target = id {} addrs {:?}",
+        id.to_z32(),
+        target.addrs
+    );
 
     let t0 = std::time::Instant::now();
     let conn = tokio::time::timeout(Duration::from_secs(30), ep.connect(target, ALPN))
@@ -502,8 +523,15 @@ async fn cmd_selftest() -> Result<()> {
     let sk = SecretKey::generate();
     let bytes = sk.to_bytes();
     let restored = SecretKey::from_bytes(&bytes);
-    assert_eq!(sk.public(), restored.public(), "32B seed 必须恢复同 EndpointId");
-    println!("OK: to_bytes/from_bytes 恢复同 id = {}", sk.public().to_z32());
+    assert_eq!(
+        sk.public(),
+        restored.public(),
+        "32B seed 必须恢复同 EndpointId"
+    );
+    println!(
+        "OK: to_bytes/from_bytes 恢复同 id = {}",
+        sk.public().to_z32()
+    );
 
     println!("=== [2] 基础互连：同进程两 Endpoint（验证项1） ===");
     // server：持久化密钥恢复 + Minimal（无 relay、无发现）+ alpns
@@ -513,7 +541,11 @@ async fn cmd_selftest() -> Result<()> {
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await?;
-    assert_eq!(server_ep.id(), sk.public(), "Builder::secret_key 决定 EndpointId");
+    assert_eq!(
+        server_ep.id(),
+        sk.public(),
+        "Builder::secret_key 决定 EndpointId"
+    );
     // client：无需 alpns（仅发起侧）
     let client_ep = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)
@@ -525,10 +557,8 @@ async fn cmd_selftest() -> Result<()> {
 
     // 手动注入直连地址（发现机制的"手动"路径）：127.0.0.1 + bound port
     let port = server_ep.bound_sockets()[0].port();
-    let target = EndpointAddr::new(server_ep.id()).with_ip_addr(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-    ));
+    let target = EndpointAddr::new(server_ep.id())
+        .with_ip_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
     let t0 = std::time::Instant::now();
     let conn = client_ep.connect(target, ALPN).await.context("connect")?;
     println!("OK: connect 耗时 {:?}", t0.elapsed());
@@ -536,7 +566,10 @@ async fn cmd_selftest() -> Result<()> {
     // 验证项6：接受侧拿对端身份
     println!("=== [3] 接受侧信息 remote_id/alpn（验证项6） ===");
     println!("client 视角 remote_id = {}", conn.remote_id().to_z32());
-    println!("client 视角 alpn      = {}", String::from_utf8_lossy(conn.alpn()));
+    println!(
+        "client 视角 alpn      = {}",
+        String::from_utf8_lossy(conn.alpn())
+    );
 
     // open_bi / accept_bi 回声
     let ev_logger = spawn_path_event_logger("client", &conn);
@@ -545,7 +578,10 @@ async fn cmd_selftest() -> Result<()> {
     send.finish()?;
     let reply = recv.read_to_end(MSG_LIMIT).await.context("read_to_end")?;
     assert_eq!(reply, b"hello-iroh");
-    println!("OK: open_bi -> write_all -> finish -> read_to_end 回声 = {:?}", String::from_utf8_lossy(&reply));
+    println!(
+        "OK: open_bi -> write_all -> finish -> read_to_end 回声 = {:?}",
+        String::from_utf8_lossy(&reply)
+    );
 
     println!("=== [4] 路径观测（验证项3） ===");
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -589,7 +625,10 @@ async fn cmd_selftest() -> Result<()> {
         })
         .collect();
     for (i, h) in handles.into_iter().enumerate() {
-        let id = h.await.context("join err")?.context(format!("peer-{i} 失败"))?;
+        let id = h
+            .await
+            .context("join err")?
+            .context(format!("peer-{i} 失败"))?;
         println!("OK: peer-{i} 并发回声成功，对端 {id}");
     }
     for ep in &peers {
@@ -605,8 +644,14 @@ async fn cmd_selftest() -> Result<()> {
     )
     .await;
     match r {
-        Err(_) => println!("结论: 空地址 connect 在 35s 内未返回（被外层 timeout 截断），耗时 {:?}", t0.elapsed()),
-        Ok(Err(err)) => println!("结论: 空地址 connect 按预期失败，耗时 {:?}，错误: {err:#}", t0.elapsed()),
+        Err(_) => println!(
+            "结论: 空地址 connect 在 35s 内未返回（被外层 timeout 截断），耗时 {:?}",
+            t0.elapsed()
+        ),
+        Ok(Err(err)) => println!(
+            "结论: 空地址 connect 按预期失败，耗时 {:?}，错误: {err:#}",
+            t0.elapsed()
+        ),
         Ok(Ok(_)) => println!("异常: 竟然连上了（不可能，除非有全局发现）"),
     }
 

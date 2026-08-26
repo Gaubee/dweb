@@ -3,13 +3,13 @@
 //! 规格：openspec/changes/fabric-mvp/specs/server/spec.md
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -91,7 +91,9 @@ pub fn now_ms() -> u64 {
 
 pub fn decode_endpoint_id(s: &str) -> Result<[u8; 32], RendezvousError> {
     let bytes = hex::decode(s).map_err(|_| RendezvousError::InvalidEndpointId)?;
-    bytes.try_into().map_err(|_| RendezvousError::InvalidEndpointId)
+    bytes
+        .try_into()
+        .map_err(|_| RendezvousError::InvalidEndpointId)
 }
 
 /// 规范签名载荷：
@@ -164,18 +166,20 @@ fn handle_announce(
     let verifying = ed25519_dalek::VerifyingKey::from_bytes(&id_bytes)
         .map_err(|_| RendezvousError::InvalidEndpointId)?;
     verifying
-        .verify(&canonical, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+        .verify(
+            &canonical,
+            &ed25519_dalek::Signature::from_bytes(&sig_bytes),
+        )
         .map_err(|_| RendezvousError::InvalidSignature)?;
 
     let expires_at_ms = now + req.ttl_secs * 1000;
-    registry
-        .entries
-        .lock()
-        .unwrap()
-        .insert(id_bytes, Entry {
+    registry.entries.lock().unwrap().insert(
+        id_bytes,
+        Entry {
             addrs: req.addrs,
             expires_at_ms,
-        });
+        },
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -183,8 +187,7 @@ async fn resolve(
     State(registry): State<SharedRegistry>,
     Path(id): Path<String>,
 ) -> Result<Json<ResolveResponse>, (StatusCode, String)> {
-    let id_bytes = decode_endpoint_id(&id)
-        .map_err(|e| (e.status(), e.to_string()))?;
+    let id_bytes = decode_endpoint_id(&id).map_err(|e| (e.status(), e.to_string()))?;
     let now = now_ms();
     let entries = registry.entries.lock().unwrap();
     match entries.get(&id_bytes) {
@@ -208,8 +211,7 @@ mod tests {
     fn signed_request(key: &SigningKey, addrs: Vec<&str>, ttl: u64, ts: u64) -> AnnounceRequest {
         let id_bytes = key.verifying_key().to_bytes();
         let addrs: Vec<String> = addrs.into_iter().map(String::from).collect();
-        let canonical =
-            announce_canonical_bytes(&id_bytes, ts, &addrs, ttl as u32);
+        let canonical = announce_canonical_bytes(&id_bytes, ts, &addrs, ttl as u32);
         let sig = key.sign(&canonical);
         AnnounceRequest {
             endpoint_id: hex::encode(id_bytes),
@@ -240,7 +242,11 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
         let res = app
-            .oneshot(Request::get(format!("/rendezvous/{id}")).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(format!("/rendezvous/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
