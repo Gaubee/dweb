@@ -19,8 +19,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo chef cook --release --recipe-path recipe.json -p dweb-server
 
+# 不给最终构建挂 target 缓存卷：cook 的 dummy 产物会同指纹串扰真实构建
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
     cargo build --release -p dweb-server --offline && \
     cp target/release/dweb-server /usr/local/bin/dweb-server
 
