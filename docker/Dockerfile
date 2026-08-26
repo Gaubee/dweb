@@ -9,13 +9,16 @@ RUN cargo install cargo-chef --locked
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
 COPY .cargo .cargo
+# workspace 成员清单必须齐备（client-sdk 是成员；仅构建 server 不编译它）
+COPY packages/client-sdk/Cargo.toml packages/client-sdk/Cargo.toml
+COPY packages/client-sdk/build.rs packages/client-sdk/build.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p dweb-server
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p dweb-server && \
+    cargo build --release -p dweb-server --offline && \
     cp target/release/dweb-server /usr/local/bin/dweb-server
 
 # ---- run stage ----
