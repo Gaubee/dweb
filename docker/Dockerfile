@@ -13,7 +13,9 @@ COPY .cargo .cargo
 COPY packages/client-sdk packages/client-sdk
 
 RUN cargo chef prepare --recipe-path recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p dweb-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo chef cook --release --recipe-path recipe.json -p dweb-server
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
