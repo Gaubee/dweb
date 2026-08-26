@@ -83,9 +83,9 @@ export interface FabricOptions {
 
 /**
  * 导入 `dwebkey1.` 身份导出串：口令派生解密，返回受保护的种子句柄。
- * （不落盘；注入 Fabric 用 `FabricOptions.secret`。）
+ * （不落盘；注入 Fabric 用工厂的 secret 参数。Argon2 在阻塞线程池执行。）
  */
-export declare function importSecret(token: string, passphrase: string): SecretSeedHandle
+export declare function importSecret(token: string, passphrase: string): Promise<SecretSeedHandle>
 
 /** 成员信息 */
 export interface Member {

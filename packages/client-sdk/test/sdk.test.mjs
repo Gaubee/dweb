@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import sdkModule from "../index.js";
-const { Fabric, nativeVersion } = /** @type {any} */ (sdkModule);
+const { Fabric, nativeVersion, importSecret } = /** @type {any} */ (sdkModule);
 
 /** @typedef {import("../index.js").FabricEventJs} FabricEventJs */
 
@@ -84,14 +84,12 @@ test("secret injection + identity export/import lifecycle", async () => {
   const dirB = tmpdir("dweb-sec-b-");
 
   // Seed 注入：零存储副作用 + 确定性身份
-  const seedMod = await import("../index.js").then((m) => m.default ?? m);
-  const { importSecret } = seedMod;
   const a = await Fabric.createRoot(opts(dirA));
   const token = await a.exportSecretPassphrase("my-passphrase");
   assert.ok(token.startsWith("dwebkey1."), "export token prefix");
 
   // 导入 → 注入新环境：恢复同 EndpointId；期间不写任何 identity.key
-  const handle = importSecret(token, "my-passphrase");
+  const handle = await importSecret(token, "my-passphrase");
   assert.ok(handle.endpointId.length === 52, "handle derives endpointId");  // getter 属性
   const b = await Fabric.createRoot(opts(dirB), handle);
   assert.equal(b.endpointId, a.endpointId);  // getter 属性
@@ -105,8 +103,29 @@ test("secret injection + identity export/import lifecycle", async () => {
   await assert.rejects(again);
 
   // 错误口令导入失败
-  assert.throws(() => importSecret(token, "wrong-pass"));
+  await assert.rejects(() => importSecret(token, "wrong-pass"));
 
   await a.shutdown();
   await b.shutdown();
+});
+
+test("secret handle: concurrent construction, one wins without panic", async () => {
+  const a = await Fabric.createRoot(opts(tmpdir("dweb-conc-a-")));
+  const token = await a.exportSecretPassphrase("pp");
+  const handle = await importSecret(token, "pp");
+
+  // 同一句柄并发两次构造：恰一成功（或双双失败于目录冲突），绝不 panic
+  const dirB = tmpdir("dweb-conc-b-");
+  const [r1, r2] = await Promise.allSettled([
+    Fabric.createRoot({ dataDir: dirB }, handle),
+    Fabric.createRoot({ dataDir: dirB }, handle),
+  ]);
+  const states = [r1.status, r2.status].sort().join(",");
+  assert.ok(
+    states === "fulfilled,rejected" || states === "rejected,rejected",
+    `expected one-win or both-rejected, got ${states}`,
+  );
+  // 双 rejected 场景（roster AlreadyExists 竞态）下也不能有进程级异常——
+  // allSettled 本身已证明无 panic。
+  await a.shutdown();
 });

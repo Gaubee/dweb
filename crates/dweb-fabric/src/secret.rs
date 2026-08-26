@@ -32,7 +32,7 @@
 //!   密码存储下限（跨端兼容档），**不是** RFC 9106 首选档；产品层应另行基准与
 //!   口令策略。导入**只接受精确已知参数**（防参数头部 DoS），参数升级走新版本号。
 //! - AEAD：ChaCha20-Poly1305（RFC 8439），nonce 每次随机、同 key 不复用；
-//!   AAD = `b"dweb/key/aad\0" || header`（全部 metadata 显式认证）。
+//!   AAD = `b"dweb/key/aad\0" || header || salt || nonce`（全部 metadata 显式认证）。
 //! - 本 token 是**身份导出**（identity export）：只含 seed，不含 roster/facts/
 //!   invites。完整 fabric 快照是另一个待立 change，不得混称"恢复 fabric"。
 //! - 口令按 UTF-8 原样（无 Unicode 规范化）；空口令拒绝，上限 1024 字节。
@@ -211,12 +211,17 @@ impl SecretStore for FileSecretStore {
                 path: dir.to_path_buf(),
                 source,
             })?;
-            // 唯一临时名：多进程并发 create 不得共用固定 .tmp
-            let tmp = dir.join(format!("{}.{}.tmp", KEY_FILE_NAME, std::process::id()));
+            // 唯一临时名（pid + 原子计数器）+ create_new：同进程多线程也绝不互踩
+            static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tmp = dir.join(format!(
+                "{}.{}.{}.tmp",
+                KEY_FILE_NAME,
+                std::process::id(),
+                TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .open(&tmp)
                 .map_err(|source| SecretStoreError::Write {
                     path: tmp.clone(),
@@ -303,20 +308,23 @@ pub fn export_secret(
     header.extend_from_slice(&V1_T.to_be_bytes());
     header.extend_from_slice(&V1_P.to_be_bytes());
 
-    // AAD 覆盖全部 metadata（域常量 + header）
+    // AAD 覆盖全部 metadata（域常量 + header + salt + nonce）
     let mut aad = AAD_DOMAIN.to_vec();
     aad.extend_from_slice(&header);
+    aad.extend_from_slice(&salt);
+    aad.extend_from_slice(&nonce_bytes);
 
+    let mut seed_bytes = identity.seed();
     let ciphertext = cipher
         .encrypt(
             nonce,
             Payload {
-                msg: &identity.seed(),
+                msg: &seed_bytes,
                 aad: &aad,
             },
         )
         .map_err(|_| SecretExportError::Kdf("aead encrypt failed".into()));
-
+    seed_bytes.zeroize();
     key.zeroize();
     let ciphertext = ciphertext?;
     let mut blob = header;
@@ -382,6 +390,8 @@ pub fn import_secret(s: &str, passphrase: &str) -> Result<SecretSeed, SecretExpo
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let mut aad = AAD_DOMAIN.to_vec();
     aad.extend_from_slice(&blob[..HEADER_LEN]);
+    aad.extend_from_slice(&salt);
+    aad.extend_from_slice(&nonce);
     let plaintext = cipher.decrypt(
         Nonce::from_slice(&nonce),
         Payload {
@@ -390,11 +400,12 @@ pub fn import_secret(s: &str, passphrase: &str) -> Result<SecretSeed, SecretExpo
         },
     );
     key.zeroize();
-    let plaintext = plaintext.map_err(|_| SecretExportError::Auth)?;
+    let mut plaintext = plaintext.map_err(|_| SecretExportError::Auth)?;
     let seed: [u8; SEED_LEN] = plaintext
         .as_slice()
         .try_into()
         .map_err(|_| SecretExportError::Format("plaintext length".into()))?;
+    plaintext.zeroize();
     Ok(SecretSeed::from_bytes(seed))
 }
 
@@ -500,9 +511,20 @@ mod tests {
             (h1.join().unwrap(), h2.join().unwrap())
         });
         assert!(r1.is_ok() || r2.is_ok());
-        assert!(r1.is_err() || r2.is_err(), "exactly one create wins");
+        // 失败方必须是 Conflict（原子 insert-if-absent），且恰一胜
+        let (wins, conflicts): (usize, usize) = [&r1, &r2]
+            .iter()
+            .map(|r| match r {
+                Ok(()) => (1, 0),
+                Err(SecretStoreError::Conflict { .. }) => (0, 1),
+                Err(e) => panic!("unexpected non-conflict error: {e:?}"),
+            })
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!((wins, conflicts), (1, 1), "exactly one win, one conflict");
+        // 胜者 seed 与最终落盘内容完全一致（身份不分叉）
         let winner = FileSecretStore::new(dir.path()).load().unwrap().unwrap();
-        assert!(winner.as_bytes() == &[2u8; 32] || winner.as_bytes() == &[3u8; 32]);
+        let expected = if r1.is_ok() { [2u8; 32] } else { [3u8; 32] };
+        assert_eq!(winner.as_bytes(), &expected);
     }
 
     #[test]

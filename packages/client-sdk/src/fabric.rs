@@ -55,26 +55,26 @@ fn to_relay_config(relay: Option<RelayOptions>) -> RelayConfig {
     }
 }
 
-fn to_options(opts: &FabricOptions, secret: Option<&SecretSeedHandle>) -> Result<RustFabricConfig> {
-    let secret = match secret {
-        None => SecretInjection::Default,
-        // take 语义：句柄一次性，消费后不可复用
-        Some(handle) => {
-            if !handle.available() {
-                return Err(Error::new(
-                    Status::GenericFailure,
-                    "secret handle already consumed by a previous Fabric construction",
-                ));
-            }
-            SecretInjection::Seed(handle.take().expect("checked available"))
-        }
-    };
-    Ok(RustFabricConfig {
+/// 原子 take 配置构造：无 check-then-act 竞态；返回留存副本供失败归还。
+fn take_options(
+    opts: &FabricOptions,
+    secret: Option<&SecretSeedHandle>,
+) -> Result<(RustFabricConfig, Option<SecretSeed>)> {
+    let base = || RustFabricConfig {
         data_dir: opts.data_dir.clone().into(),
         relay: to_relay_config(opts.relay.clone()),
         advertise_addrs: opts.advertise_addrs.clone().unwrap_or_default(),
-        secret,
-    })
+        secret: SecretInjection::Default,
+    };
+    match secret {
+        None => Ok((base(), None)),
+        Some(handle) => {
+            let seed = handle.take()?;
+            let mut cfg = base();
+            cfg.secret = SecretInjection::Seed(seed.clone());
+            Ok((cfg, Some(seed)))
+        }
+    }
 }
 
 fn link_status_str(s: LinkStatus) -> &'static str {
@@ -134,16 +134,29 @@ impl SecretSeedHandle {
             .take()
             .ok_or_else(|| Error::new(Status::GenericFailure, "seed handle already consumed"))
     }
+
+    /// 构造失败时归还种子：句柄可重试（调用方不必重新导入 token）。
+    fn put_back(&self, seed: SecretSeed) {
+        let mut g = self.seed.lock().unwrap();
+        // 只在仍未被他人填充时归还（后到者不覆盖）
+        if g.is_none() {
+            *g = Some(seed);
+        }
+    }
 }
 
 /// 导入 `dwebkey1.` 身份导出串：口令派生解密，返回受保护的种子句柄。
-/// （不落盘；注入 Fabric 用 `FabricOptions.secret`。）
+/// （不落盘；注入 Fabric 用工厂的 secret 参数。Argon2 在阻塞线程池执行。）
 #[napi]
-pub fn import_secret(token: String, passphrase: String) -> Result<SecretSeedHandle> {
-    let seed = dweb_fabric::secret::import_secret(&token, &passphrase)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+pub async fn import_secret(token: String, passphrase: String) -> Result<SecretSeedHandle> {
+    let seed = tokio::task::spawn_blocking(move || {
+        dweb_fabric::secret::import_secret(&token, &passphrase)
+    })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("join: {e}")))?
+    .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
     Ok(SecretSeedHandle {
-        seed: std::sync::Arc::new(std::sync::Mutex::new(Some(seed))),
+        seed: Arc::new(std::sync::Mutex::new(Some(seed))),
     })
 }
 
@@ -164,13 +177,15 @@ impl Fabric {
         opts: FabricOptions,
         secret: Option<&SecretSeedHandle>,
     ) -> Result<Fabric> {
-        Self::build(RustFabric::create_root(to_options(&opts, secret)?).await)
+        let (cfg, seed) = take_options(&opts, secret)?;
+        Self::build_with_handle(RustFabric::create_root(cfg).await, secret, seed)
     }
 
     /// 打开已有 fabric（数据目录已含名册）。
     #[napi(factory)]
     pub async fn open(opts: FabricOptions, secret: Option<&SecretSeedHandle>) -> Result<Fabric> {
-        Self::build(RustFabric::open(to_options(&opts, secret)?).await)
+        let (cfg, seed) = take_options(&opts, secret)?;
+        Self::build_with_handle(RustFabric::open(cfg).await, secret, seed)
     }
 
     /// 以加入者身份起步（空名册；随后调用 join 兑换邀请）。
@@ -180,7 +195,8 @@ impl Fabric {
         fabric_id_hex: String,
         secret: Option<&SecretSeedHandle>,
     ) -> Result<Fabric> {
-        Self::build(RustFabric::attach(to_options(&opts, secret)?, &fabric_id_hex).await)
+        let (cfg, seed) = take_options(&opts, secret)?;
+        Self::build_with_handle(RustFabric::attach(cfg, &fabric_id_hex).await, secret, seed)
     }
 
     /// 一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。
@@ -190,16 +206,28 @@ impl Fabric {
         token: String,
         secret: Option<&SecretSeedHandle>,
     ) -> Result<Fabric> {
-        let opts = to_options(&opts, secret)?;
-        // 先解码令牌取 fabric_id（不网络交互）
+        // token 解码前置：格式错误在消费句柄之前返回
         let decoded = dweb_fabric::protocol::InviteToken::decode(&token)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
         let fabric_id = hex::encode(decoded.invite.fabric_id.as_bytes());
-        let fabric = RustFabric::attach(opts, &fabric_id)
-            .await
-            .map_err(fabric_err)?;
-        fabric.join(&token).await.map_err(fabric_err)?;
-        Self::build(Ok(fabric))
+        let (cfg, seed) = take_options(&opts, secret)?;
+        match RustFabric::attach(cfg, &fabric_id).await {
+            Ok(fabric) => match fabric.join(&token).await {
+                Ok(()) => Self::build_with_handle(Ok(fabric), secret, seed),
+                Err(e) => {
+                    if let (Some(h), Some(s)) = (secret, seed) {
+                        h.put_back(s);
+                    }
+                    Err(fabric_err(e))
+                }
+            },
+            Err(e) => {
+                if let (Some(h), Some(s)) = (secret, seed) {
+                    h.put_back(s);
+                }
+                Err(fabric_err(e))
+            }
+        }
     }
 
     fn build(fabric: std::result::Result<RustFabric, dweb_fabric::FabricError>) -> Result<Fabric> {
@@ -211,6 +239,23 @@ impl Fabric {
         };
         spawn_event_pump(&fabric);
         Ok(fabric)
+    }
+
+    /// build + 失败归还：句柄注入的种子在构造失败时放回句柄，调用方可重试。
+    fn build_with_handle(
+        fabric: std::result::Result<RustFabric, dweb_fabric::FabricError>,
+        handle: Option<&SecretSeedHandle>,
+        seed: Option<SecretSeed>,
+    ) -> Result<Fabric> {
+        match Self::build(fabric) {
+            Ok(f) => Ok(f),
+            Err(e) => {
+                if let (Some(h), Some(s)) = (handle, seed) {
+                    h.put_back(s);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// 本节点 EndpointId（z-base-32，52 字符）
@@ -311,7 +356,13 @@ impl Fabric {
     /// 交由产品自行安全保存（如账号系统加密托管——密文上云、口令在用户）。
     #[napi]
     pub async fn export_secret_passphrase(&self, passphrase: String) -> Result<String> {
-        self.inner.export_secret(&passphrase).map_err(fabric_err)
+        let identity = self.inner.identity().clone();
+        tokio::task::spawn_blocking(move || {
+            dweb_fabric::secret::export_secret(&identity, &passphrase)
+        })
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, format!("join: {e}")))?
+        .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))
     }
 
     /// 注册事件回调（可多次调用，多个回调都会收到全部事件）。

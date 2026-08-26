@@ -199,8 +199,16 @@ impl Fabric {
         }
     }
 
-    /// 创建新 fabric（本节点成为 root）。既有 roster 报错（Roster::create 拒绝覆写）。
+    /// 创建新 fabric（本节点成为 root）。既有 roster 先报 AlreadyExists——
+    /// 在解析/写入身份之前检查，失败路径不留任何 identity 副作用。
     pub async fn create_root(config: FabricConfig) -> Result<Self, FabricError> {
+        if crate::roster::roster_file_path(&config.data_dir).exists() {
+            return Err(FabricError::Roster(
+                crate::roster::RosterError::AlreadyExists {
+                    path: crate::roster::roster_file_path(&config.data_dir),
+                },
+            ));
+        }
         let identity = Self::resolve_identity(&config, true)?;
         let (roster, _fid) = Roster::create(&identity, &config.data_dir, now_ms())?;
         Self::start(identity, roster, config).await
@@ -303,6 +311,11 @@ impl Fabric {
 
     pub fn endpoint_id(&self) -> String {
         endpoint_id_display(&self.inner.identity.endpoint_id())
+    }
+
+    /// 身份引用（供导出等只读用途）。
+    pub fn identity(&self) -> &NodeIdentity {
+        &self.inner.identity
     }
 
     pub async fn fabric_id_hex(&self) -> String {

@@ -56,6 +56,27 @@ await a.send(b.endpointId, Buffer.from("ping"));
 await a.revoke(b.endpointId);                              // 撤销
 ```
 
+## 身份存储与恢复（信任模型中立）
+
+内核不规定 secret 的存放位置——这是产品的信任模型决策：
+
+```text
+纯本地（默认）            加密托管                      产品代管
+identity.key 文件          账号系统存 exportSecret 的     服务方持有明文 key
+（FileSecretStore）        密文，口令派生在用户           （产品自担，内核中立）
+```
+
+```js
+const token = await fabric.exportSecretPassphrase("用户口令"); // dweb1... 密文
+const handle = await importSecret(token, "用户口令");           // opaque 句柄
+const fabric2 = await Fabric.createRoot({ dataDir }, handle);   // 注入恢复同身份
+```
+
+- 导出是 **identity export**（只含身份种子，不含 roster——名册经网络同步重建）
+- 句柄一次性：构造失败自动归还可重试；明文 seed 不经手 JS 字符串
+- 自定义存储（Keychain/托管后端）：Rust 侧实现 `SecretStore` trait（`load`/`create`
+  线性化 insert-if-absent），经 `SecretInjection::Store` 注入
+
 ## 开发
 
 ```bash

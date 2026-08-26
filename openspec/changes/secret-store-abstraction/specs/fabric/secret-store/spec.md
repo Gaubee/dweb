@@ -8,16 +8,21 @@
 
 ### Requirement: SecretStore trait
 
-内核 SHALL 提供 `SecretStore` trait 作为 identity 私钥的存储抽象：`load() -> Option<32B seed>`、`store(seed)`、`exists() -> bool`。实现 MUST 保证 store 的原子性（不产生半写状态）与 load 的完整性校验（长度必须为 32B，否则报错而非返回部分数据）。内核自身的构造路径（create_root/open/attach/join_with_token）MUST 经由 SecretStore 读写私钥，不得绕过抽象直接触碰文件。
+内核 SHALL 提供 `SecretStore` trait 作为 identity 私钥的存储抽象：`load() -> Option<32B seed>`（None 仅表示后端确认不存在；损坏/权限必须是错误）与 `create(seed)`——**线性化 insert-if-absent**：已有身份 MUST 返回 Conflict，绝不静默覆盖；原子性由实现保证（不产生半写状态），load MUST 做完整性校验（长度必须为 32B，否则报错而非返回部分数据）。内核自身的构造路径（create_root/open/attach/join_with_token）MUST 经由 SecretStore 读写私钥，不得绕过抽象直接触碰文件。同步实现不得做未界定的网络阻塞。轮换（`replace`）不在 v1 公共面。
 
 #### Scenario: 自定义存储实现可用
 
 - **WHEN** 产品方提供一个内存/数据库/Keychain 的 SecretStore 实现
 - **THEN** Fabric 以该实现构造后，身份读写全部经过它，文件系统不出现任何 identity 相关写入
 
+#### Scenario: 并发初始化恰一胜
+
+- **WHEN** 两个执行位置并发对同一存储 create 身份
+- **THEN** 恰好一方成功，另一方收到 Conflict 并可回读复用胜者身份（身份不分叉）
+
 #### Scenario: 非原子写入被契约排除
 
-- **WHEN** 实现方在 store 中产生半写状态后进程崩溃
+- **WHEN** 实现方在 create 中产生半写状态后进程崩溃
 - **THEN** 该实现的 load 必须报错（由实现的原子性保证），内核不得把损坏数据当作合法 seed
 
 ### Requirement: FileSecretStore 默认实现
