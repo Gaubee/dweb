@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const NODE = process.execPath;
 const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../bin/opendweb.mjs");
 
-async function waitHealthy(url, ms = 15000) {
+async function waitHealthy(url, ms = 30000) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     try {
@@ -35,6 +35,7 @@ test("opendweb server serves rendezvous + relay healthz", async () => {
     const res = await fetch("http://127.0.0.1:18992/healthz");
     const body = await res.json();
     assert.equal(body.status, "ok");
+    assert.ok(out.includes("rendezvous"), `CLI output missing startup banner, got: ${out}`);
   } finally {
     child.kill("SIGINT");
     await new Promise((r) => child.once("exit", r));

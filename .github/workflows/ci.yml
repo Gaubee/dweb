@@ -17,12 +17,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: rustup target add x86_64-pc-windows-msvc
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      # Windows cfg 静态验证（不链接；ring 等 C 依赖的完整编译在 windows-test job）
-      - run: cargo check --workspace --target x86_64-pc-windows-msvc
 
   windows-test:
     # windows-x64：cargo test + 双产物构建 + node 套件
