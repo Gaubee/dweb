@@ -36,8 +36,8 @@
 
 ## 6. example（packages/example）
 
-- [ ] 6.1 CLI：id / invite / join / members / send / chat 命令（tsx 直跑 + 编译双形态）
-- [ ] 6.2 E2E 脚本：脚本化双进程 invite→join→互发消息→revoke 断言（vitest 或 node 脚本），纳入 `pnpm test:e2e`
+- [x] 6.1 CLI：id / invite / join / members / send / chat 命令（tsx 直跑 + 编译双形态）
+- [x] 6.2 E2E 脚本：脚本化双进程 invite→join→互发消息→revoke 断言（vitest 或 node 脚本），纳入 `pnpm test:e2e`
 
 ## 7. server-binary 包 + docker
 

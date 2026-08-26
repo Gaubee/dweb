@@ -11,6 +11,8 @@ export declare class Fabric {
   static open(opts: FabricOptions): Promise<Fabric>
   /** 以加入者身份起步（空名册；随后调用 join 兑换邀请）。 */
   static attach(opts: FabricOptions, fabricIdHex: string): Promise<Fabric>
+  /** 一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。 */
+  static joinWithToken(opts: FabricOptions, token: string): Promise<Fabric>
   /** 本节点 EndpointId（z-base-32，52 字符） */
   get endpointId(): string
   /** fabric id（hex） */

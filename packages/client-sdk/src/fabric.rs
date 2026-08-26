@@ -102,6 +102,20 @@ impl Fabric {
         Self::build(RustFabric::attach(to_options(opts), &fabric_id_hex).await)
     }
 
+    /// 一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。
+    #[napi(factory)]
+    pub async fn join_with_token(opts: FabricOptions, token: String) -> Result<Fabric> {
+        let opts = to_options(opts);
+        // 先解码令牌取 fabric_id（不网络交互）
+        let decoded = dweb_fabric::protocol::InviteToken::decode(&token)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+        let fabric_id = hex::encode(decoded.invite.fabric_id.as_bytes());
+        let fabric =
+            RustFabric::attach(opts, &fabric_id).await.map_err(fabric_err)?;
+        fabric.join(&token).await.map_err(fabric_err)?;
+        Self::build(Ok(fabric))
+    }
+
     fn build(fabric: std::result::Result<RustFabric, dweb_fabric::FabricError>) -> Result<Fabric> {
         let inner = fabric.map_err(fabric_err)?;
         let fabric = Fabric {

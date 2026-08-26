@@ -9,11 +9,12 @@
   "scripts": {
     "start": "tsx src/cli.ts",
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run",
+    "test": "node --test",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@dweb/client-sdk": "workspace:*"
+    "@dweb/client-sdk": "workspace:*",
+    "@dweb/server-binary": "workspace:*"
   }
 }
