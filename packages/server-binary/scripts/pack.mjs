@@ -17,7 +17,11 @@ if (built.status !== 0) {
   throw new Error("cargo build failed");
 }
 
-const targetDir = process.env.CARGO_TARGET_DIR ?? path.join(process.env.HOME ?? "~", ".cargo-target", "dweb");
+const rawTarget = process.env.CARGO_TARGET_DIR ?? path.join(process.env.HOME ?? "~", ".cargo-target", "dweb");
+// CI env 可能携带未展开的 $HOME/~/ 字面量
+const targetDir = rawTarget
+  .replace(/^\$HOME/, process.env.HOME ?? "")
+  .replace(/^~/, process.env.HOME ?? "");
 const src = path.join(targetDir, "release", "dweb-server");
 if (!existsSync(src)) {
   throw new Error(`binary not found at ${src}`);
