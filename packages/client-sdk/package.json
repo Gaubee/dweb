@@ -15,7 +15,8 @@
     "build": "napi build --platform --release --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs",
     "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js",
     "test": "node --test --test-force-exit",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:win": "PATH=\"$HOME/.cargo/bin:$PATH\" LIBNODE_PATH=\"$HOME/libnode-win\" cargo build --release --target x86_64-pc-windows-gnu -p dweb-client-sdk && cp \"$HOME/.cargo-target/dweb/x86_64-pc-windows-gnu/release/dweb_client_sdk.dll\" dweb.win32-x64.node"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.0",

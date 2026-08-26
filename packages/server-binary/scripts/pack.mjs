@@ -1,7 +1,7 @@
 // 平台感知的 release 二进制打包：从 cargo target 拷贝到包内 bin/。
 // darwin: build host target 产物 dweb-server → bin/dweb-server-aarch64-apple-darwin
 // windows: 优先复用 CI 已构建的 --target x86_64-pc-windows-msvc 产物（.exe）；
-//          staging 已放好 bin/dweb-server-x86_64-pc-windows-msvc.exe 时直接通过。
+//          staging 已放好 bin/dweb-server-x86_64-pc-windows.exe 时直接通过。
 import { spawnSync } from "node:child_process";
 import { cpSync, chmodSync, mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
@@ -27,9 +27,9 @@ function resolveTargetDir() {
 }
 
 if (process.platform === "win32") {
-  const staged = path.join(binDir, "dweb-server-x86_64-pc-windows-msvc.exe");
+  const staged = path.join(binDir, "dweb-server-x86_64-pc-windows.exe");
   if (existsSync(staged)) {
-    console.log("packed(win): bin/dweb-server-x86_64-pc-windows-msvc.exe (staged)");
+    console.log("packed(win): bin/dweb-server-x86_64-pc-windows.exe (staged)");
     process.exit(0);
   }
   // 本地 Windows 开发：构建 target 产物

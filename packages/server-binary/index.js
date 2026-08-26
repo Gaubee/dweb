@@ -8,7 +8,7 @@ import path from "node:path";
 
 const PLATFORM_BINARIES = {
   "darwin-arm64": "dweb-server-aarch64-apple-darwin",
-  "win32-x64": "dweb-server-x86_64-pc-windows-msvc.exe",
+  "win32-x64": "dweb-server-x86_64-pc-windows.exe",
 };
 const SUPPORTED = `${process.platform}-${process.arch}`;
 const BINARY_NAME = PLATFORM_BINARIES[SUPPORTED];

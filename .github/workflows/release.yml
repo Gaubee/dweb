@@ -1,0 +1,47 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # npm OIDC trusted publishing（在 npmjs.com 为包配置 trusted publisher 后免 token）
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      # 产物已入库（本地 mingw/darwin 交叉编译直发模式），包即产物
+      - name: Verify packaged artifacts
+        run: |
+          test -f packages/client-sdk/dweb.darwin-arm64.node
+          test -f packages/client-sdk/dweb.win32-x64.node
+          test -f packages/server-binary/bin/dweb-server-aarch64-apple-darwin
+          test -f packages/server-binary/bin/dweb-server-x86_64-pc-windows.exe
+      - name: Publish opendweb (top-level CLI)
+        run: npm publish --access public --provenance
+        working-directory: packages/opendweb
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish @jixo/opendweb-server-binary
+        run: npm publish --access public --provenance
+        working-directory: packages/server-binary
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_JIXO_TOKEN }}
+      - name: Publish @jixo/opendweb-client-sdk
+        run: npm publish --access public --provenance
+        working-directory: packages/client-sdk
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_JIXO_TOKEN }}

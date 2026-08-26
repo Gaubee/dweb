@@ -32,15 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-      - name: Build artifacts
-        run: |
-          cargo build --release --target x86_64-pc-windows-msvc -p dweb-server
-          cargo build --release --target x86_64-pc-windows-msvc -p dweb-client-sdk
-      - name: Stage package binaries
-        shell: pwsh
-        run: |
-          Copy-Item "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/dweb-server.exe" "packages/server-binary/bin/dweb-server-x86_64-pc-windows-msvc.exe"
-          Copy-Item "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/dweb_client_sdk.dll" "packages/client-sdk/dweb.win32-x64.node"
+      # 包内产物（本地 mingw 交叉编译、git 入库）直接验证：CI 绿 = 本地产物可发
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -50,12 +42,6 @@ jobs:
       - run: pnpm --filter @jixo/opendweb-client-sdk test
       - run: pnpm --filter opendweb test
       - run: pnpm --filter @jixo/opendweb-server-binary test
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-binaries
-          path: |
-            packages/client-sdk/dweb.win32-x64.node
-            packages/server-binary/bin/dweb-server-x86_64-pc-windows-msvc.exe
 
   node-build:
     # napi 原生模块与 example 只在 macos-arm64 上验证

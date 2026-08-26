@@ -5,7 +5,11 @@ target/
 .env.*
 *.log
 .DS_Store
-*.node
+# *.node（产物精确入库，见下例外）
 *.tsbuildinfo
 coverage/
 packages/server-binary/bin/dweb-server-aarch64-apple-darwin
+
+# 双平台产物入库（本地直发模式）
+!packages/client-sdk/dweb.darwin-arm64.node
+!packages/client-sdk/dweb.win32-x64.node
