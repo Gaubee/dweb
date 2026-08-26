@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # 覆盖 .cargo/config.toml 的本机绝对路径（网络盘优化仅限本机）
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+      CARGO_TARGET_DIR: $HOME/.cargo-target-ci
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,7 +25,7 @@ jobs:
     # napi 原生模块与 example 只在 macos-arm64 上验证
     runs-on: macos-14
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+      CARGO_TARGET_DIR: $HOME/.cargo-target-ci
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
