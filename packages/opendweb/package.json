@@ -15,5 +15,9 @@
   },
   "scripts": {
     "test": "node --test --test-force-exit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gaubee/dweb.git"
   }
 }

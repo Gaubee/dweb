@@ -1,7 +1,7 @@
 {
   "name": "@jixo/opendweb-server-binary",
   "version": "0.1.0",
-  "description": "dweb self-hostable server binary packaged for npm (darwin-arm64)",
+  "description": "@jixo/opendweb-server-binary — dweb self-hostable server binary (darwin-arm64 + win32-x64)",
   "license": "MIT OR Apache-2.0",
   "bin": {
     "dweb-server": "./bin/dweb-server.mjs"
@@ -27,5 +27,9 @@
     "scripts/pack.mjs",
     "bin/dweb-server-aarch64-apple-darwin",
     "bin/dweb-server-x86_64-pc-windows-windows.exe"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gaubee/dweb.git"
+  }
 }

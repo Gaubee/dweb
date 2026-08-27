@@ -1,7 +1,7 @@
 {
   "name": "@jixo/opendweb-example",
   "version": "0.1.0",
-  "description": "dweb example app: two-process networking with invite, join, chat",
+  "description": "@jixo/opendweb-example — two-process fabric networking example (invite / join / chat)",
   "license": "MIT OR Apache-2.0",
   "bin": {
     "opendweb-example": "./bin/dweb-example.mjs"
@@ -16,5 +16,9 @@
   },
   "devDependencies": {
     "@jixo/opendweb-server-binary": "workspace:*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gaubee/dweb.git"
   }
 }

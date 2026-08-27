@@ -7,41 +7,41 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm OIDC trusted publishing（在 npmjs.com 为包配置 trusted publisher 后免 token）
+  id-token: write # npm OIDC trusted publishing
 
 jobs:
   publish-npm:
     runs-on: ubuntu-latest
+    environment: npm-publish
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          registry-url: https://registry.npmjs.org
-      - run: pnpm install --frozen-lockfile
-      # 产物已入库（本地 mingw/darwin 交叉编译直发模式），包即产物
+      # npm trusted publishing 需要 npm >= 11.5（OIDC 免 token）
+      - run: npm install -g npm@latest
       - name: Verify packaged artifacts
         run: |
           test -f packages/client-sdk/dweb.darwin-arm64.node
           test -f packages/client-sdk/dweb.win32-x64.node
           test -f packages/server-binary/bin/dweb-server-aarch64-apple-darwin
           test -f packages/server-binary/bin/dweb-server-x86_64-pc-windows.exe
-      - name: Publish opendweb (top-level CLI)
-        run: npm publish --access public --provenance
-        working-directory: packages/opendweb
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # npm 不替换 workspace:* 协议（pnpm 才会），发布前固定为实际版本
+      - name: Pin workspace deps to released version
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          npm pkg set 'dependencies.@jixo/opendweb-client-sdk=^'"$VER" --prefix packages/example
+          npm pkg set 'dependencies.@jixo/opendweb-server-binary=^'"$VER" --prefix packages/opendweb
+          grep -r '"@jixo/opendweb' packages/*/package.json
       - name: Publish @jixo/opendweb-server-binary
         run: npm publish --access public --provenance
         working-directory: packages/server-binary
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_JIXO_TOKEN }}
       - name: Publish @jixo/opendweb-client-sdk
         run: npm publish --access public --provenance
         working-directory: packages/client-sdk
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_JIXO_TOKEN }}
+      - name: Publish @jixo/opendweb-example
+        run: npm publish --access public --provenance
+        working-directory: packages/example
+      - name: Publish opendweb (top-level CLI)
+        run: npm publish --access public --provenance
+        working-directory: packages/opendweb
