@@ -13,7 +13,6 @@
     "pack:binary": "node scripts/pack.mjs",
     "test": "node scripts/pack.mjs && node --test --test-force-exit",
     "typecheck": "tsc --noEmit",
-    "prepack": "node scripts/pack.mjs",
     "build:win": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --release --target x86_64-pc-windows-gnu -p dweb-server && cp \"$HOME/.cargo-target/dweb/x86_64-pc-windows-gnu/release/dweb-server.exe\" bin/dweb-server-x86_64-pc-windows.exe"
   },
   "devDependencies": {
