@@ -1,4 +1,6 @@
-// @dweb/server-binary：以子进程方式启动 dweb-server，提供可等待的停止方式
+// @dweb/server-binary：以子进程方式启动 dweb-server，提供可等待的停止方式。
+// gateway 命名（design D1）：gatewayBind 为 canonical，httpBind 为兼容别名；
+// 透传 DWEB_GATEWAY_BIND / DWEB_TRUST_PROXY 等环境变量。
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -14,21 +16,24 @@ const SUPPORTED = `${process.platform}-${process.arch}`;
 const BINARY_NAME = PLATFORM_BINARIES[SUPPORTED];
 if (!BINARY_NAME) {
   throw new Error(
-    `@jixo/opendweb-server-binary: 当前平台 ${SUPPORTED} 暂不支持。v0.1 提供 ${Object.keys(PLATFORM_BINARIES).join(" / ")}；其它平台请使用 docker 镜像 ghcr.io/gaubee/dweb。`,
+    `@jixo/opendweb-server-binary: platform ${SUPPORTED} is not supported yet. v0.2 ships ${Object.keys(PLATFORM_BINARIES).join(" / ")}; use the docker image ghcr.io/gaubee/dweb for other platforms.`,
   );
 }
 
 /**
  * @typedef {Object} StartServerOptions
- * @property {string} [httpBind]   rendezvous/healthz 监听地址，默认 127.0.0.1:8787
- * @property {string} [relayBind]  relay HTTP 监听地址，默认 127.0.0.1:3340
+ * @property {string} [gatewayBind] gateway（rendezvous/healthz/services.json）监听地址，默认 127.0.0.1:8787
+ * @property {string} [httpBind]    gatewayBind 的兼容别名（同时给出时 gatewayBind 优先）
+ * @property {string} [relayBind]   relay HTTP 监听地址，默认 127.0.0.1:3340
  * @property {boolean} [relayEnabled] 默认 true
+ * @property {boolean} [trustProxy]  true 时向子进程设置 DWEB_TRUST_PROXY=1（采信 X-Forwarded-Proto）；
+ *                                   false 时设为 "0"；缺省时继承父进程环境
  */
 
 /**
  * 启动 dweb-server 子进程。
  * @param {StartServerOptions} [options]
- * @returns {Promise<{ pid: number, httpUrl: string, relayHttpUrl: string, stop: () => Promise<void>, exited: Promise<number> }>}
+ * @returns {Promise<{ pid: number, gatewayUrl: string, httpUrl: string, relayHttpUrl: string, servicesUrl: string, stop: () => Promise<void>, exited: Promise<number> }>}
  */
 export async function startServer(options = {}) {
   const binDir = path.dirname(fileURLToPath(import.meta.url));
@@ -56,14 +61,17 @@ export async function startServer(options = {}) {
     }
   }
 
-  const httpBind = options.httpBind ?? "127.0.0.1:8787";
+  const gatewayBind = options.gatewayBind ?? options.httpBind ?? "127.0.0.1:8787";
   const relayBind = options.relayBind ?? "127.0.0.1:3340";
   const env = {
     ...process.env,
-    DWEB_HTTP_BIND: httpBind,
+    DWEB_GATEWAY_BIND: gatewayBind,
     DWEB_RELAY_HTTP_BIND: relayBind,
     DWEB_RELAY_ENABLED: options.relayEnabled === false ? "false" : "true",
   };
+  if (options.trustProxy !== undefined) {
+    env.DWEB_TRUST_PROXY = options.trustProxy ? "1" : "0";
+  }
 
   const child = spawn(binPath, [], { env, stdio: ["ignore", "pipe", "pipe"] });
   if (typeof child.pid !== "number") {
@@ -85,7 +93,16 @@ export async function startServer(options = {}) {
       }, 5000).unref();
     });
 
-  const httpUrl = `http://${httpBind}`;
+  const gatewayUrl = `http://${gatewayBind}`;
   const relayHttpUrl = `http://${relayBind}`;
-  return { pid: child.pid, httpUrl, relayHttpUrl, stop, exited };
+  // httpUrl 为旧字段名保留（值同 gatewayUrl）
+  return {
+    pid: child.pid,
+    gatewayUrl,
+    httpUrl: gatewayUrl,
+    relayHttpUrl,
+    servicesUrl: `${gatewayUrl}/services.json`,
+    stop,
+    exited,
+  };
 }

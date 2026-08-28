@@ -1,13 +1,17 @@
 //! @dweb/client-sdk 绑定层：fabric kernel 的 Node API 投影。
 //! 生命周期契约：所有异步方法在 shutdown 后返回错误；事件回调在 shutdown 后
 //! 不再触发；重复 shutdown 幂等。
+//!
+//! 错误码约定（connectivity-ux-hardening C0）：napi Error 无自定义 code 通道，
+//! 稳定错误以 `[<kebab-code>]` 消息前缀标识（join 8 码 + invite 1 码 + 豁免 3 码
+//! + bad-advertise-addr/bad-proxy-url），JS 侧以前缀解析派生 err.code。
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dweb_fabric::secret::SecretSeed;
 use dweb_fabric::{
-    Fabric as RustFabric, FabricConfig as RustFabricConfig, FabricEvent, LinkStatus, RelayConfig,
-    SecretInjection,
+    Fabric as RustFabric, FabricConfig as RustFabricConfig, FabricEvent, HttpProxyConfig,
+    LinkStatus, RelayConfig, RelayStatusSnapshot, SecretInjection,
 };
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -15,14 +19,27 @@ use napi_derive::napi;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// relay 配置
+type EventCallbacks = Arc<Mutex<Vec<(u64, ThreadsafeFunction<String>)>>>;
+
+
+/// relay 配置（判别联合的 napi 投影）：
+/// - `{}` / `{ mode: "n0" }`：n0 官方默认（不接受 urls）
+/// - `{ mode: "disabled" }`：禁用（不接受 urls）
+/// - `{ mode: "custom", urls: [..] }`：自托管列表（至少一个；空数组构造 reject）
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
-    /// "disabled" | "custom" | "n0"（默认 "n0"）
+    /// "disabled" | "custom" | "n0"（缺省 "n0"）
     pub mode: Option<String>,
     /// mode = "custom" 时的 relay URL 列表（自托管 docker 或其它 iroh relay）
     pub urls: Option<Vec<String>>,
+}
+
+/// httpProxy 的 `{ url }` 形态（"none" | "from-env" 为字符串形态）。
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct HttpProxyUrl {
+    pub url: String,
 }
 
 /// Fabric 构造配置
@@ -32,8 +49,46 @@ pub struct FabricOptions {
     /// 数据目录（名册持久化位置；secret 默认实现也指向此目录）
     pub data_dir: String,
     pub relay: Option<RelayOptions>,
-    /// 写入邀请令牌的 issuer 直连地址（host:port）
+    /// 写入邀请令牌的 issuer 直连地址（host:port；逐项校验，非法构造 reject）
     pub advertise_addrs: Option<Vec<String>>,
+    /// HTTP 控制面（relay 连接）代理所有权；缺省 "none"。
+    /// iroh endpoint 不读进程环境变量；QUIC 数据面永不经代理。
+    pub http_proxy: Option<Either<String, HttpProxyUrl>>,
+    /// join 总时限（毫秒）；缺省 30000；值域 [1000, 600000]，越界构造 reject
+    pub join_timeout_ms: Option<f64>,
+}
+
+/// invite 逃生阀选项（D3）。
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct InviteOptions {
+    /// 允许签发无 relay 令牌；调用方自担可达性责任（带外路径）。
+    pub allow_relayless: Option<bool>,
+}
+
+/// relay 状态快照（relayStatus() 返回值与 relay-* 事件 payload 同构）。
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RelayStatusJs {
+    /// "disabled" | "custom" | "n0"
+    pub mode: String,
+    /// 配置的 relay URL 列表（disabled 为空数组；n0 恒为官方默认）
+    pub urls: Vec<String>,
+    /// null <=> mode === "disabled"；否则为任一 relay 已连接
+    pub online: Option<bool>,
+    /// 最近一次连接错误（脱敏：仅类别 + host，无 URL 凭证段）
+    pub last_error: Option<String>,
+}
+
+impl From<RelayStatusSnapshot> for RelayStatusJs {
+    fn from(s: RelayStatusSnapshot) -> Self {
+        Self {
+            mode: s.mode.to_owned(),
+            urls: s.urls,
+            online: s.online,
+            last_error: s.last_error,
+        }
+    }
 }
 
 /// 成员信息
@@ -44,14 +99,88 @@ pub struct Member {
     pub since_ms: f64,
 }
 
-fn to_relay_config(relay: Option<RelayOptions>) -> RelayConfig {
+fn to_relay_config(relay: Option<RelayOptions>) -> Result<RelayConfig> {
+    let bad = |msg: String| Err(Error::new(Status::GenericFailure, msg));
     match relay {
-        None => RelayConfig::N0Default,
-        Some(r) => match r.mode.as_deref().unwrap_or("n0") {
-            "disabled" => RelayConfig::Disabled,
-            "custom" => RelayConfig::Custom(r.urls.unwrap_or_default()),
-            _ => RelayConfig::N0Default,
+        None => Ok(RelayConfig::N0Default),
+        Some(r) => {
+            let has_urls = r.urls.as_ref().is_some_and(|u| !u.is_empty());
+            let urls_empty_array = r.urls.as_ref().is_some_and(|u| u.is_empty());
+            match r.mode.as_deref().unwrap_or("n0") {
+                "n0" | "" => {
+                    if has_urls || urls_empty_array {
+                        bad("relay.urls is only valid with mode 'custom'".into())
+                    } else {
+                        Ok(RelayConfig::N0Default)
+                    }
+                }
+                "disabled" => {
+                    if has_urls || urls_empty_array {
+                        bad("relay.urls is not accepted with mode 'disabled'".into())
+                    } else {
+                        Ok(RelayConfig::Disabled)
+                    }
+                }
+                "custom" => match r.urls {
+                    Some(urls) if !urls.is_empty() => Ok(RelayConfig::Custom(urls)),
+                    _ => bad("relay mode 'custom' requires at least one relay URL".into()),
+                },
+                other => bad(format!(
+                    "invalid relay mode '{other}' (expected disabled | custom | n0)"
+                )),
+            }
+        }
+    }
+}
+
+/// httpProxy 判别解析：字符串 "none" | "from-env"，或对象 { url }。
+fn to_http_proxy_config(v: Option<Either<String, HttpProxyUrl>>) -> Result<HttpProxyConfig> {
+    match v {
+        None => Ok(HttpProxyConfig::None),
+        Some(Either::A(s)) => match s.as_str() {
+            "none" => Ok(HttpProxyConfig::None),
+            "from-env" => Ok(HttpProxyConfig::FromEnv),
+            other => Err(Error::new(
+                Status::GenericFailure,
+                format!("invalid httpProxy '{other}' (expected 'none' | 'from-env' | {{ url }})"),
+            )),
         },
+        Some(Either::B(obj)) => {
+            if obj.url.trim().is_empty() {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "[bad-proxy-url] proxy url must not be empty",
+                ));
+            }
+            // URL 语法校验由内核构造期执行（FabricConfig::validate），
+            // 失败经 fabric_err 以 [bad-proxy-url] 前缀透出。
+            Ok(HttpProxyConfig::Url(obj.url))
+        }
+    }
+}
+
+fn to_join_timeout_ms(v: Option<f64>) -> Result<u64> {
+    match v {
+        None => Ok(dweb_fabric::JOIN_TIMEOUT_MS_DEFAULT),
+        Some(ms) => {
+            if ms.fract() != 0.0 || ms < 0.0 {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    format!("joinTimeoutMs must be an integer number of milliseconds, got {ms}"),
+                ));
+            }
+            let ms = ms as u64;
+            if !(dweb_fabric::JOIN_TIMEOUT_MS_MIN..=dweb_fabric::JOIN_TIMEOUT_MS_MAX).contains(&ms)
+            {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "joinTimeoutMs {ms} out of range [1000, 600000]"
+                    ),
+                ));
+            }
+            Ok(ms)
+        }
     }
 }
 
@@ -60,17 +189,25 @@ fn take_options(
     opts: &FabricOptions,
     secret: Option<&SecretSeedHandle>,
 ) -> Result<(RustFabricConfig, Option<SecretSeed>)> {
-    let base = || RustFabricConfig {
-        data_dir: opts.data_dir.clone().into(),
-        relay: to_relay_config(opts.relay.clone()),
-        advertise_addrs: opts.advertise_addrs.clone().unwrap_or_default(),
-        secret: SecretInjection::Default,
+    let base = || -> Result<RustFabricConfig> {
+        Ok(RustFabricConfig {
+            data_dir: opts.data_dir.clone().into(),
+            relay: to_relay_config(opts.relay.clone())?,
+            advertise_addrs: opts.advertise_addrs.clone().unwrap_or_default(),
+            secret: SecretInjection::Default,
+            http_proxy: to_http_proxy_config(opts.http_proxy.clone())?,
+            join_timeout_ms: to_join_timeout_ms(opts.join_timeout_ms)?,
+            bind_addr: None,
+        relay_ca_tls: None,
+        })
     };
+    // P1-2：先完整解析/校验配置，再 take 句柄——校验失败不消费 seed，
+    // 调用方可修正配置后重试同一句柄。
+    let mut cfg = base()?;
     match secret {
-        None => Ok((base(), None)),
+        None => Ok((cfg, None)),
         Some(handle) => {
             let seed = handle.take()?;
-            let mut cfg = base();
             cfg.secret = SecretInjection::Seed(seed.clone());
             Ok((cfg, Some(seed)))
         }
@@ -85,8 +222,23 @@ fn link_status_str(s: LinkStatus) -> &'static str {
     }
 }
 
+/// 稳定错误码前缀映射（error-matrix 冻结集合）。
 fn fabric_err(e: dweb_fabric::FabricError) -> Error {
-    Error::new(Status::GenericFailure, format!("{e}"))
+    use dweb_fabric::FabricError as E;
+    let prefixed = |p: &str| Error::new(Status::GenericFailure, format!("[{p}] {e}"));
+    match &e {
+        E::InviteWithoutRelay => prefixed("invite-without-relay"),
+        E::Join { code, .. } => prefixed(code.kebab()),
+        E::Roster(dweb_fabric::roster::RosterError::DirFabricMismatch { .. }) => {
+            prefixed("wrong-fabric")
+        }
+        E::MissingIdentity(_) => prefixed("missing-identity"),
+        E::Roster(dweb_fabric::roster::RosterError::Corrupted { .. }) => prefixed("corrupted"),
+        E::Roster(dweb_fabric::roster::RosterError::Persistence { .. }) => prefixed("roster-io"),
+        E::BadAdvertiseAddr { .. } => prefixed("bad-advertise-addr"),
+        E::BadProxyUrl(_) => prefixed("bad-proxy-url"),
+        _ => Error::new(Status::GenericFailure, format!("{e}")),
+    }
 }
 
 /// 受保护的身份种子句柄：内部持有 [`SecretSeed`]（zeroize-on-drop），
@@ -165,7 +317,11 @@ pub async fn import_secret(token: String, passphrase: String) -> Result<SecretSe
 #[napi]
 pub struct Fabric {
     inner: RustFabric,
-    event_callbacks: Arc<Mutex<Vec<ThreadsafeFunction<String>>>>,
+    event_callbacks: EventCallbacks,
+    /// 事件泵任务句柄（P1-8：shutdown 时 abort+join，防永久阻塞在 recv）
+    pump_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    next_callback_id: Arc<std::sync::atomic::AtomicU64>,
+    relay_snapshot: Arc<std::sync::Mutex<RelayStatusSnapshot>>,
     shutdown_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -200,28 +356,32 @@ impl Fabric {
     }
 
     /// 一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。
+    /// 令牌前置检查（解码/过期/地址规范化）先于本地数据面加载与身份句柄消费
+    ///（D11 冻结顺序：令牌自身错误优先于目录检查）。
     #[napi(factory)]
     pub async fn join_with_token(
         opts: FabricOptions,
         token: String,
         secret: Option<&SecretSeedHandle>,
     ) -> Result<Fabric> {
-        // token 解码前置：格式错误在消费句柄之前返回
-        let decoded = dweb_fabric::protocol::InviteToken::decode(&token)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+        let decoded = dweb_fabric::precheck_join_token(&token).map_err(fabric_err)?;
         let fabric_id = hex::encode(decoded.invite.fabric_id.as_bytes());
         let (cfg, seed) = take_options(&opts, secret)?;
-        match RustFabric::attach(cfg, &fabric_id).await {
-            Ok(fabric) => match fabric.join(&token).await {
-                Ok(()) => Self::build_with_handle(Ok(fabric), secret, seed),
-                Err(e) => {
-                    if let (Some(h), Some(s)) = (secret, seed) {
-                        h.put_back(s);
-                    }
-                    Err(fabric_err(e))
-                }
-            },
+        let fabric = match RustFabric::attach(cfg, &fabric_id).await {
+            Ok(f) => f,
             Err(e) => {
+                if let (Some(h), Some(s)) = (secret, seed) {
+                    h.put_back(s);
+                }
+                return Err(fabric_err(e));
+            }
+        };
+        match fabric.join(&token).await {
+            Ok(()) => Self::build_with_handle(Ok(fabric), secret, seed),
+            Err(e) => {
+                // 失败也必须释放 endpoint/accept loop/watcher（P1-2：局部丢弃
+                // 不会停掉 Arc<FabricInner> 持有的任务）
+                let _ = fabric.shutdown().await;
                 if let (Some(h), Some(s)) = (secret, seed) {
                     h.put_back(s);
                 }
@@ -232,12 +392,17 @@ impl Fabric {
 
     fn build(fabric: std::result::Result<RustFabric, dweb_fabric::FabricError>) -> Result<Fabric> {
         let inner = fabric.map_err(fabric_err)?;
+        let relay_snapshot = inner.relay_snapshot_handle();
         let fabric = Fabric {
             inner,
             event_callbacks: Arc::new(Mutex::new(Vec::new())),
+            pump_handle: std::sync::Mutex::new(None),
+            next_callback_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            relay_snapshot,
             shutdown_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        spawn_event_pump(&fabric);
+        let pump = spawn_event_pump(&fabric);
+        *fabric.pump_handle.lock().unwrap() = Some(pump);
         Ok(fabric)
     }
 
@@ -291,10 +456,20 @@ impl Fabric {
     }
 
     /// 签发邀请令牌（root-only）。返回 dweb1. 前缀的自包含字符串。
+    /// 第三参 opts 透传签发安全门逃生阀：relay 为空且 advertiseAddrs 为空时，
+    /// 无 opts 或 allowRelayless !== true => reject（[invite-without-relay]）。
     #[napi]
-    pub async fn invite(&self, ttl_ms: f64, recipient: Option<String>) -> Result<String> {
+    pub async fn invite(
+        &self,
+        ttl_ms: f64,
+        recipient: Option<String>,
+        opts: Option<InviteOptions>,
+    ) -> Result<String> {
+        let rust_opts = dweb_fabric::InviteOptions {
+            allow_relayless: opts.as_ref().and_then(|o| o.allow_relayless).unwrap_or(false),
+        };
         self.inner
-            .invite(ttl_ms.max(0.0) as u64, recipient.as_deref())
+            .invite_with(ttl_ms.max(0.0) as u64, recipient.as_deref(), rust_opts)
             .await
             .map_err(fabric_err)
     }
@@ -352,6 +527,13 @@ impl Fabric {
         Ok(link_status_str(status).to_owned())
     }
 
+    /// relay 状态快照（零等待，读内核缓存）。快照优先于事件：初始事实一律先查
+    /// 本方法，事件只承载后续跳变。禁用模式 online 为 null（而非 false）。
+    #[napi]
+    pub fn relay_status(&self) -> RelayStatusJs {
+        self.inner.relay_status().into()
+    }
+
     /// 显式导出身份（identity export，不含 roster）为 `dwebkey1.` 加密串。
     /// 交由产品自行安全保存（如账号系统加密托管——密文上云、口令在用户）。
     #[napi]
@@ -366,11 +548,25 @@ impl Fabric {
     }
 
     /// 注册事件回调（可多次调用，多个回调都会收到全部事件）。
-    /// 事件对象见 FabricEventJs：{ type, endpointId?, from?, data?, status? }
+    /// 返回句柄 id；off(id) 注销（index.js 包装为取消订阅函数）。
     #[napi]
-    pub fn on(&self, callback: ThreadsafeFunction<String>) {
+    pub fn on(&self, callback: ThreadsafeFunction<String>) -> u32 {
+        let id = self
+            .next_callback_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
         let callbacks = self.event_callbacks.clone();
-        callbacks.blocking_lock().push(callback);
+        callbacks.blocking_lock().push((id as u64, callback));
+        id
+    }
+
+    /// 注销事件回调（on 返回的 id）。
+    #[napi]
+    pub fn off(&self, id: u32) {
+        let callbacks = self.event_callbacks.clone();
+        let mut guard = callbacks.blocking_lock();
+        if let Some(pos) = guard.iter().position(|(cid, _)| *cid == id as u64) {
+            guard.remove(pos);
+        }
     }
 
     /// 优雅关闭：断开全部会话并释放网络资源。幂等。
@@ -382,15 +578,25 @@ impl Fabric {
         {
             return Ok(());
         }
-        self.inner.shutdown().await.map_err(fabric_err)
+        let res = self.inner.shutdown().await.map_err(fabric_err);
+        // P1-8：endpoint 关闭后广播 sender 仍可能存活——abort 事件泵
+        // 防止其永久阻塞在 recv（无新事件时不醒来检查标志）
+        let pump = { self.pump_handle.lock().unwrap().take() };
+        if let Some(pump) = pump {
+            pump.abort();
+            let _ = pump.await;
+        }
+        res
     }
 }
 
 /// 事件泵：把 broadcast 接收循环桥接到已注册的 TSFN 回调。
-fn spawn_event_pump(fabric: &Fabric) {
+/// relay-* 事件必携带快照同构 payload（非可选字段）。
+fn spawn_event_pump(fabric: &Fabric) -> tokio::task::JoinHandle<()> {
     let mut rx = fabric.inner.subscribe();
     let callbacks = fabric.event_callbacks.clone();
     let shutdown = fabric.shutdown_done.clone();
+    let relay_snapshot = fabric.relay_snapshot.clone();
     tokio::spawn(async move {
         loop {
             let ev = match rx.recv().await {
@@ -403,6 +609,15 @@ fn spawn_event_pump(fabric: &Fabric) {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
+            let relay_payload = || {
+                let snap = relay_snapshot.lock().unwrap().clone();
+                serde_json::json!({
+                    "mode": snap.mode,
+                    "urls": snap.urls,
+                    "online": snap.online,
+                    "lastError": snap.last_error,
+                })
+            };
             let payload = match &ev {
                 FabricEvent::PeerConnected { endpoint_id } => {
                     let mut o = serde_json::Map::new();
@@ -430,15 +645,27 @@ fn spawn_event_pump(fabric: &Fabric) {
                     "endpointId": endpoint_id,
                     "status": link_status_str(*status),
                 }),
+                FabricEvent::RelayOnline { .. } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("type".into(), "relay-online".into());
+                    o.insert("relay".into(), relay_payload());
+                    serde_json::Value::Object(o)
+                }
+                FabricEvent::RelayOffline => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("type".into(), "relay-offline".into());
+                    o.insert("relay".into(), relay_payload());
+                    serde_json::Value::Object(o)
+                }
             };
             let Ok(payload) = serde_json::to_string(&payload) else {
                 continue;
             };
-            for cb in callbacks.lock().await.iter() {
+            for (_id, cb) in callbacks.lock().await.iter() {
                 cb.call(Ok(payload.clone()), ThreadsafeFunctionCallMode::NonBlocking);
             }
         }
-    });
+    })
 }
 
 /// SDK 原生层版本

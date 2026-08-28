@@ -100,6 +100,20 @@ pub enum RosterError {
     /// A fact did not belong to this roster's fabric.
     #[error("fact belongs to fabric {got}, roster is {expected}")]
     WrongFabric { got: FabricId, expected: FabricId },
+    /// The data directory's persisted roster belongs to a different
+    /// fabric than the current operation targets. This is a directory
+    /// ownership mismatch, not file corruption (connectivity-ux-hardening D5);
+    /// deliberately a separate variant from [`RosterError::WrongFabric`],
+    /// which is the token-vs-roster cross-fabric check in `redeem_verify`.
+    #[error(
+        "data dir {path} belongs to fabric {stored}, but this operation targets fabric \
+         {requested}; use a fresh --data directory"
+    )]
+    DirFabricMismatch {
+        path: PathBuf,
+        stored: FabricId,
+        requested: FabricId,
+    },
     /// The invite token's issuer is not this fabric's root.
     #[error("invite issuer {issuer:?} is not the fabric root {root:?}")]
     InviteNotRoot {
@@ -343,9 +357,12 @@ impl Roster {
                 .expect("slice len 32"),
         );
         if stored_fabric != fabric_id {
-            return Err(RosterError::Corrupted {
+            // 目录归属不匹配（D5）：独立于 Corrupted 的可操作错误——
+            // 数据本身完好，只是属于另一个 fabric。
+            return Err(RosterError::DirFabricMismatch {
                 path: path.to_path_buf(),
-                reason: format!("file is for fabric {stored_fabric}, requested {fabric_id}"),
+                stored: stored_fabric,
+                requested: fabric_id,
             });
         }
         let body_end = bytes.len() - blake3::OUT_LEN;
@@ -946,6 +963,12 @@ impl Roster {
 /// Path of the persisted fact set inside `data_dir`.
 pub fn roster_file_path(data_dir: &Path) -> PathBuf {
     data_dir.join(ROSTER_FILE_NAME)
+}
+
+/// FabricId 的 16 hex 短标识（前 8 字节十六进制）。用户面展示口径，
+/// 冻结于 fabric/roster spec（DirFabricMismatch 等）。
+pub fn fabric_id_short16(id: &FabricId) -> String {
+    hex::encode(&id.as_bytes()[..8])
 }
 
 /// 从已持久化的 roster.facts 头部读出 fabric_id（不加载事实集合）。

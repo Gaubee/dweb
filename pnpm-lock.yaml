@@ -12,7 +12,7 @@ importers:
     devDependencies:
       '@napi-rs/cli':
         specifier: 3.7.0
-        version: 3.7.0(@emnapi/runtime@1.11.2)
+        version: 3.7.0(@emnapi/runtime@1.9.2)
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
@@ -25,6 +25,9 @@ importers:
       '@jixo/opendweb-client-sdk':
         specifier: workspace:*
         version: link:../client-sdk
+      undici:
+        specifier: ^7.29.0
+        version: 7.29.0
     devDependencies:
       '@jixo/opendweb-server-binary':
         specifier: workspace:*
@@ -1149,6 +1152,10 @@ packages:
     engines: {node: '>=14.17'}
     hasBin: true
 
+  undici@7.29.0:
+    resolution: {integrity: sha512-IDxfleLmmbSskfWSUATiN1nfn2rDuvnMOqb5CWR92iIfojA0Ud+ulOAAEQ57LPr9rWmsreUyf5lwyao+7GNNVw==}
+    engines: {node: '>=20.18.1'}
+
   universal-user-agent@7.0.3:
     resolution: {integrity: sha512-TmnEAEAsBJVZM/AADELsK76llnwcf9vMKuPz8JflO1frO8Lchitr0fNaN9d+Ap0BjKtqWqd/J17qeDnXh8CL2A==}
 
@@ -1435,7 +1442,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
-  '@napi-rs/cli@3.7.0(@emnapi/runtime@1.11.2)':
+  '@napi-rs/cli@3.7.0(@emnapi/runtime@1.9.2)':
     dependencies:
       '@inquirer/prompts': 8.6.0
       '@napi-rs/cross-toolchain': 1.0.3
@@ -1450,7 +1457,7 @@ snapshots:
       semver: 7.8.5
       typanion: 3.14.0
     optionalDependencies:
-      '@emnapi/runtime': 1.11.2
+      '@emnapi/runtime': 1.9.2
     transitivePeerDependencies:
       - '@napi-rs/cross-toolchain-arm64-target-aarch64'
       - '@napi-rs/cross-toolchain-arm64-target-armv7'
@@ -2098,6 +2105,8 @@ snapshots:
   typanion@3.14.0: {}
 
   typescript@5.9.3: {}
+
+  undici@7.29.0: {}
 
   universal-user-agent@7.0.3: {}
 

@@ -49,6 +49,201 @@ pub enum SessionError {
     StreamClosed,
 }
 
+// ---- 兑换拒绝的 wire discriminant（connectivity-ux-hardening D11） --------------
+//
+// 权威契约：openspec/changes/connectivity-ux-hardening/contracts/redeem-err.fixtures.json
+//（外层帧 = 既有 write_frame/read_frame，type=REDEEM_ERR(0x14)；记录 = kind(1B)+len(1B,0..255)+payload；
+//  段短读 = 协议违规关连接；多记录 reduction fail-closed；payload 呈现层仅可打印 ASCII）。
+
+pub mod redeem_err {
+    /// 记录 kind 值（wire discriminant）
+    pub mod kind {
+        pub const CONSUMED: u8 = 0x00;
+        pub const NOT_ROOT: u8 = 0x01;
+        pub const BAD_POP: u8 = 0x02;
+        pub const OTHER: u8 = 0x03;
+    }
+
+    /// issuer 侧可结构化发送的拒绝种类（未知值仅存在于解码侧）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RedeemErrorKind {
+        /// invite_id 已被消费（0x00）。
+        Consumed,
+        /// 令牌签发者不是 fabric root（0x01）。
+        NotRoot,
+        /// 拥有权证明验证失败（0x02）。
+        BadPoP,
+        /// 其它结构化原因（0x03；载荷经归一化）。
+        Other(String),
+    }
+
+    impl RedeemErrorKind {
+        pub fn kind_byte(&self) -> u8 {
+            match self {
+                Self::Consumed => kind::CONSUMED,
+                Self::NotRoot => kind::NOT_ROOT,
+                Self::BadPoP => kind::BAD_POP,
+                Self::Other(_) => kind::OTHER,
+            }
+        }
+
+        /// 单条记录编码：`kind(1B) + len(1B) + payload`（len 恒 ≤ 255）。
+        pub fn encode_record(&self) -> Vec<u8> {
+            let payload = match self {
+                Self::Other(reason) => normalize_payload(reason),
+                _ => Vec::new(),
+            };
+            let mut out = Vec::with_capacity(2 + payload.len());
+            out.push(self.kind_byte());
+            out.push(payload.len() as u8);
+            out.extend_from_slice(&payload);
+            out
+        }
+    }
+
+    /// 载荷归一化（契约 _normalization）：UTF-8 → 剥除非可打印 ASCII
+    /// （<0x20 与 >0x7E，删除不替换）→ 截断至 255 字节。
+    pub fn normalize_payload(reason: &str) -> Vec<u8> {
+        reason
+            .as_bytes()
+            .iter()
+            .copied()
+            .filter(|b| (0x20..=0x7E).contains(b))
+            .take(255)
+            .collect()
+    }
+
+    /// 解码侧的一条记录（kind 可为未知值，payload 按 len 原样消费）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RedeemRecord {
+        pub kind: u8,
+        pub payload: Vec<u8>,
+    }
+
+    impl RedeemRecord {
+        /// 呈现层：仅保留可打印 ASCII（非 UTF-8 字节按 lossy 解码后剥除）。
+        pub fn presented(&self) -> String {
+            String::from_utf8_lossy(&self.payload)
+                .chars()
+                .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                .collect()
+        }
+
+        /// 归约视角的 kind：未知值降级为 Other("unknown-kind") 语义。
+        pub fn is_consumed(&self) -> bool {
+            self.kind == kind::CONSUMED
+        }
+    }
+
+    /// 记录段短读（kind/len/payload 任一段不足，含外层 payload 末尾的不完整记录）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RecordShortRead {
+        pub at: usize,
+    }
+
+    impl std::fmt::Display for RecordShortRead {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "redeem error record short read at offset {}", self.at)
+        }
+    }
+    impl std::error::Error for RecordShortRead {}
+
+    /// 解码外层 REDEEM_ERR payload 内的全部记录。
+    /// 额外完整字节按下一记录解析；任何段不足即协议违规。
+    pub fn decode_records(payload: &[u8]) -> Result<Vec<RedeemRecord>, RecordShortRead> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off < payload.len() {
+            if off + 2 > payload.len() {
+                return Err(RecordShortRead { at: off });
+            }
+            let kind = payload[off];
+            let len = payload[off + 1] as usize;
+            if off + 2 + len > payload.len() {
+                return Err(RecordShortRead { at: off });
+            }
+            out.push(RedeemRecord {
+                kind,
+                payload: payload[off + 2..off + 2 + len].to_vec(),
+            });
+            off += 2 + len;
+        }
+        Ok(out)
+    }
+
+    /// 多记录 reduction 后的结构化拒绝结果（join 侧归类输入）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RedeemRejection {
+        /// 恰一条 Consumed → TOKEN_CONSUMED。
+        Consumed,
+        /// 其它一切（恰一条已知 kind / 多条 fail-closed / 未知 kind 按
+        /// Other("unknown-kind") 参与判定）→ TOKEN_INVALID。
+        Invalid { reason: String },
+    }
+
+    impl std::fmt::Display for RedeemRejection {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Consumed => f.write_str("invite already consumed"),
+                Self::Invalid { reason } => write!(f, "invite rejected: {reason}"),
+            }
+        }
+    }
+
+    impl std::error::Error for RedeemRejection {}
+
+    /// fail-closed 归约。空 payload（零记录）按违规处理由调用方先行拒绝。
+    pub fn reduce(records: &[RedeemRecord]) -> RedeemRejection {
+        if records.len() == 1 {
+            let r = &records[0];
+            let rejection_reason = |fallback: &str| {
+                let presented = r.presented();
+                if presented.is_empty() {
+                    fallback.to_owned()
+                } else {
+                    presented
+                }
+            };
+            return match r.kind {
+                kind::CONSUMED => RedeemRejection::Consumed,
+                kind::NOT_ROOT => RedeemRejection::Invalid {
+                    reason: rejection_reason("not root"),
+                },
+                kind::BAD_POP => RedeemRejection::Invalid {
+                    reason: rejection_reason("bad proof-of-possession"),
+                },
+                kind::OTHER => RedeemRejection::Invalid {
+                    reason: rejection_reason("other"),
+                },
+                unknown => RedeemRejection::Invalid {
+                    reason: format!("unknown-kind {unknown:#04x}"),
+                },
+            };
+        }
+        // 多条：fail-closed，完整消费不位移。
+        RedeemRejection::Invalid {
+            reason: format!(
+                "multiple redeem error records ({}) fail-closed",
+                records.len()
+            ),
+        }
+    }
+}
+
+/// joiner 侧兑换结果错误（Fabric::join 据此归类 D11 八码）。
+#[derive(Debug, Error)]
+pub enum RedeemError {
+    /// issuer 的结构化拒绝（RedeemErrorKind reduction）。
+    #[error("redeem rejected: {0:?}")]
+    Rejected(#[source] redeem_err::RedeemRejection),
+    /// 非结构化失败：连接中断/IO/坏帧/事实解码/错误帧段短读 → DIAL_FAILED。
+    #[error("redeem channel failed: {0}")]
+    Unstructured(String),
+    /// 兑换通道内层 5s 超时（REDEEM_DEADLINE）→ DIAL_TIMEOUT（附注 redeem timeout）。
+    #[error("redeem timeout")]
+    Timeout,
+}
+
 /// 控制流帧类型
 pub mod frame_type {
     pub const HELLO: u8 = 0x01;
@@ -94,7 +289,8 @@ pub async fn read_frame(
         .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;
     // len 覆盖 type(1B) + payload；type 已随头消费，故 payload 长 len-1
     let len = u32::from_be_bytes(head[0..4].try_into().unwrap()) as usize;
-    if len == 0 || 5 + len > limit {
+    // 整帧字节数 = 4B 长度域 + len（type+payload）——恰好等于 limit 的帧合法
+    if len == 0 || 4 + len > limit {
         return Err(SessionError::FrameTooLarge { limit });
     }
     let mut payload = vec![0u8; len - 1];
@@ -201,26 +397,38 @@ pub async fn acceptor_hello(
     Ok((incoming, send))
 }
 
+/// 任意错误 → 非结构化失败（DIAL_FAILED 附原因）。
+fn unstructured<E: std::fmt::Display>(e: E) -> RedeemError {
+    RedeemError::Unstructured(e.to_string())
+}
+
 /// 兑换（B 侧）：连 issuer 的 redeem ALPN，challenge-response，返回回执事实列表。
+/// 失败归类（D11）输入：结构化拒绝 / 非结构化失败 / 内层 5s 超时。
 pub async fn redeem_as_joiner(
     conn: &Connection,
     token: &InviteToken,
     secret: &iroh_base::SecretKey,
     redeemer: &EndpointId,
-) -> Result<Vec<SignedFact>, SessionError> {
+) -> Result<Vec<SignedFact>, RedeemError> {
     tokio::time::timeout(REDEEM_DEADLINE, async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        let token_str = token.encode()?;
-        write_frame(&mut send, frame_type::REDEEM_INTENT, token_str.as_bytes()).await?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(unstructured)?;
+        let token_str = token.encode().map_err(unstructured)?;
+        write_frame(&mut send, frame_type::REDEEM_INTENT, token_str.as_bytes())
+            .await
+            .map_err(unstructured)?;
 
-        let (t, challenge) = read_frame(&mut recv, MAX_REDEEM_FRAME).await?;
+        let (t, challenge) = read_frame(&mut recv, MAX_REDEEM_FRAME)
+            .await
+            .map_err(unstructured)?;
         if t != frame_type::REDEEM_CHALLENGE {
-            return Err(SessionError::RedeemRejected("expect challenge".into()));
+            return Err(RedeemError::Unstructured(format!(
+                "expect challenge, got frame {t:#x}"
+            )));
         }
         let challenge: [u8; 32] = challenge
             .as_slice()
             .try_into()
-            .map_err(|_| SessionError::RedeemRejected("bad challenge length".into()))?;
+            .map_err(|_| RedeemError::Unstructured("bad challenge length".into()))?;
         let pop =
             redeem_challenge_bytes(&token.invite.fabric_id, &token.invite.invite_id, &challenge);
         let sig = secret.sign(&pop);
@@ -228,93 +436,205 @@ pub async fn redeem_as_joiner(
         let mut proof = Vec::with_capacity(32 + 64);
         proof.extend_from_slice(redeemer.as_bytes());
         proof.extend_from_slice(&sig.to_bytes());
-        write_frame(&mut send, frame_type::REDEEM_PROOF, &proof).await?;
+        write_frame(&mut send, frame_type::REDEEM_PROOF, &proof)
+            .await
+            .map_err(unstructured)?;
 
-        let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME).await?;
+        let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME)
+            .await
+            .map_err(unstructured)?;
         match t {
-            frame_type::REDEEM_OK => Ok(SignedFact::decode_all(&payload)?),
-            frame_type::REDEEM_ERR => Err(SessionError::RedeemRejected(
-                String::from_utf8_lossy(&payload).into_owned(),
-            )),
-            other => Err(SessionError::RedeemRejected(format!(
+            frame_type::REDEEM_OK => {
+                SignedFact::decode_all(&payload).map_err(|e| {
+                    RedeemError::Unstructured(format!("receipt fact decode failed: {e}"))
+                })
+            }
+            frame_type::REDEEM_ERR => {
+                // 记录段短读（含外层 payload 末尾不完整记录）= 协议违规 → 非结构化
+                let records = redeem_err::decode_records(&payload).map_err(|v| {
+                    RedeemError::Unstructured(format!("redeem error frame violated wire: {v}"))
+                })?;
+                if records.is_empty() {
+                    return Err(RedeemError::Unstructured(
+                        "redeem error frame carries no record".into(),
+                    ));
+                }
+                Err(RedeemError::Rejected(redeem_err::reduce(&records)))
+            }
+            other => Err(RedeemError::Unstructured(format!(
                 "unexpected frame {other:#x}"
             ))),
         }
     })
     .await
-    .map_err(|_| SessionError::RedeemRejected("redeem deadline exceeded".into()))?
+    // 等值边界由外层 join deadline 拥有：joinTimeoutMs <= 5s 时外层先到，
+    // 此处只有内层真正先到（joinTimeoutMs > 5s）才会产生 Timeout。
+    .map_err(|_| RedeemError::Timeout)?
+}
+
+/// issuerMapping（contracts/redeem-err.fixtures.json，17 行）中 redeem_verify
+/// 阶段五行 emit=true 的映射。返回 None 即 emit=false（无结构化帧直接关闭）。
+pub fn redeem_verify_emit(e: &crate::roster::RosterError) -> Option<redeem_err::RedeemErrorKind> {
+    use crate::roster::RosterError;
+    use redeem_err::RedeemErrorKind;
+    match e {
+        // ---- redeem_verify 阶段的 5 个 emit=true 行 ----
+        RosterError::WrongFabric { got, expected } => Some(RedeemErrorKind::Other(format!(
+            "wrong fabric {} vs {}",
+            crate::roster::fabric_id_short16(got),
+            crate::roster::fabric_id_short16(expected)
+        ))),
+        RosterError::InviteNotRoot { .. } => Some(RedeemErrorKind::NotRoot),
+        RosterError::InviteExpired { .. } => {
+            Some(RedeemErrorKind::Other("invite expired".into()))
+        }
+        RosterError::InviteRecipientMismatch { .. } => {
+            Some(RedeemErrorKind::Other("recipient mismatch".into()))
+        }
+        RosterError::BadPoP { .. } => Some(RedeemErrorKind::BadPoP),
+        // ---- verify-protocol 行（emit=false）----
+        RosterError::Protocol(_) => None,
+        // ---- 下列变体不经兑换通道（_out_of_scope）或属 post-consume 阶段；
+        // 显式枚举使新增 RosterError 变体在编译期强制此处裁决（R3 P1-2）。
+        RosterError::NotRoot { .. }
+        | RosterError::InvalidRevokeTarget { .. }
+        | RosterError::Corrupted { .. }
+        | RosterError::NotFound { .. }
+        | RosterError::AlreadyExists { .. }
+        | RosterError::Persistence { .. }
+        | RosterError::DirFabricMismatch { .. } => None,
+    }
 }
 
 /// 兑换（issuer 侧）：单 bidi 流 + 整体时限；成功即已签发 Grant 并回执全量 dump。
+/// 拒绝语义按 issuerMapping：emit=true 行发单记录 REDEEM_ERR 后关闭；
+/// emit=false 行（协议违规/入口解码/内部 IO/post-consume 失败）不发结构化帧直接关闭。
 pub async fn handle_redeem_as_issuer(
     conn: &Connection,
     roster: &Arc<tokio::sync::Mutex<Roster>>,
     identity: &crate::identity::NodeIdentity,
 ) -> Result<(), SessionError> {
-    // PoP 声明的 redeemer 必须等于 TLS 已认证的连接对端
+    /// 兑换失败的两类出口：
+    /// - Silent：emit=false 行与一切 I/O/校验异常——无结构化帧，**立即关闭**
+    ///   （issuerMapping close 语义；joiner 归 DIAL_FAILED）
+    /// - Emitted：emit=true 行——拒绝记录已写完并 finish，连接交由 accept loop
+    ///   有界等待对端读取后关闭
+    enum InnerErr {
+        Silent(String),
+        Emitted(String),
+    }
+    let silent = |r: String| InnerErr::Silent(r);
     let expected_remote = conn.remote_id();
-    tokio::time::timeout(REDEEM_DEADLINE, async {
-        let (mut send, mut recv) = conn.accept_bi().await?;
-        let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME).await?;
+    let res = tokio::time::timeout(REDEEM_DEADLINE, async {
+        // ---- session_entry：违规/坏令牌/IO 异常均无结构化帧（entry-* 行）----
+        let (mut send, mut recv) = conn
+            .accept_bi()
+            .await
+            .map_err(|e| silent(format!("{e}")))?;
+        let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME)
+            .await
+            .map_err(|e| silent(format!("{e}")))?;
         if t != frame_type::REDEEM_INTENT {
-            let _ = write_frame(
-                &mut send,
-                frame_type::REDEEM_ERR,
-                b"first frame must be redeem intent",
-            )
-            .await;
-            return Err(SessionError::RedeemRejected("bad first frame".into()));
+            return Err(silent("first frame must be redeem intent".into()));
         }
         let token_str = String::from_utf8_lossy(&payload).into_owned();
-        let token = match InviteToken::decode(&token_str) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ =
-                    write_frame(&mut send, frame_type::REDEEM_ERR, e.to_string().as_bytes()).await;
-                return Err(SessionError::RedeemRejected(e.to_string()));
-            }
-        };
+        let token = InviteToken::decode(&token_str).map_err(|e| silent(e.to_string()))?;
 
         let challenge = random_bytes::<32>();
-        write_frame(&mut send, frame_type::REDEEM_CHALLENGE, &challenge).await?;
+        write_frame(&mut send, frame_type::REDEEM_CHALLENGE, &challenge)
+            .await
+            .map_err(|e| silent(format!("{e}")))?;
 
-        let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME).await?;
+        // ---- proof_frame：帧类型/长度/键/对端不符均无结构化帧（proof-* 行）----
+        let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME)
+            .await
+            .map_err(|e| silent(format!("{e}")))?;
         if t != frame_type::REDEEM_PROOF {
-            return Err(SessionError::RedeemRejected("expect proof".into()));
+            return Err(silent("expect proof".into()));
         }
         if payload.len() != 32 + 64 {
-            return Err(SessionError::RedeemRejected("bad proof length".into()));
+            return Err(silent("bad proof length".into()));
         }
         let redeemer = EndpointId::from_bytes(payload[0..32].try_into().unwrap())
-            .map_err(|_| SessionError::RedeemRejected("bad redeemer key".into()))?;
+            .map_err(|e| silent(e.to_string()))?;
         let sig = iroh_base::Signature::from_bytes(payload[32..96].try_into().unwrap());
         if redeemer != expected_remote {
-            return Err(SessionError::RedeemRejected(
-                "redeemer key does not match TLS peer".into(),
-            ));
+            return Err(silent("redeemer key does not match TLS peer".into()));
         }
 
-        let mut r = roster.lock().await;
-        // 过期判断取当前时间，而非任务开始时的快照
-        if let Err(e) = r.redeem_verify(&token, &redeemer, &challenge, &sig, now_ms()) {
-            let _ = write_frame(&mut send, frame_type::REDEEM_ERR, e.to_string().as_bytes()).await;
-            return Err(SessionError::RedeemRejected(e.to_string()));
+        // ---- 状态事务（锁内零网络 I/O）：verify/consume/grant/编码 ----
+        enum Flow {
+            Emit(redeem_err::RedeemErrorKind, String),
+            Receipt(Vec<u8>),
         }
-        if !r.consume_invite(&token.invite.invite_id, now_ms())? {
-            return Err(SessionError::RedeemRejected(
-                "invite already consumed".into(),
-            ));
+        let flow = {
+            let mut r = roster.lock().await;
+            // 过期判断取当前时间，而非任务开始时的快照
+            if let Err(e) = r.redeem_verify(&token, &redeemer, &challenge, &sig, now_ms()) {
+                match redeem_verify_emit(&e) {
+                    Some(kind) => Flow::Emit(kind, e.to_string()),
+                    // verify-protocol 防御分支：emit=false
+                    None => return Err(silent(e.to_string())),
+                }
+            } else {
+                match r.consume_invite(&token.invite.invite_id, now_ms()) {
+                    Ok(true) => {
+                        // post_consume：grant/编码失败显式冻结（emit=false）
+                        if let Err(e) = r.grant(identity, redeemer, None, None, now_ms()) {
+                            return Err(silent(format!("post-consume grant failed: {e}")));
+                        }
+                        match SignedFact::encode_all(r.facts()) {
+                            Ok(buf) => Flow::Receipt(buf),
+                            Err(e) => {
+                                return Err(silent(format!(
+                                    "post-consume receipt encode failed: {e}"
+                                )))
+                            }
+                        }
+                    }
+                    Ok(false) => Flow::Emit(
+                        redeem_err::RedeemErrorKind::Consumed,
+                        "invite already consumed".into(),
+                    ),
+                    Err(e) => return Err(silent(e.to_string())),
+                }
+            }
+        };
+        // ---- 锁外 I/O ----
+        match flow {
+            Flow::Emit(kind, reason) => {
+                write_frame(&mut send, frame_type::REDEEM_ERR, &kind.encode_record())
+                    .await
+                    .map_err(|e| silent(format!("{e}")))?;
+                // R4 P1-3：finish 是发送流收尾 I/O——失败同样走 silent 立即关闭
+                send.finish().map_err(|e| silent(format!("finish failed: {e}")))?;
+                Err(InnerErr::Emitted(reason))
+            }
+            Flow::Receipt(receipt) => {
+                write_frame(&mut send, frame_type::REDEEM_OK, &receipt)
+                    .await
+                    .map_err(|e| silent(format!("post-consume receipt write failed: {e}")))?;
+                // 半关闭发送侧，让回执在连接关闭前可靠送达；失败立即关闭
+                send.finish()
+                    .map_err(|e| silent(format!("receipt finish failed: {e}")))?;
+                Ok(())
+            }
         }
-        r.grant(identity, redeemer, None, None, now_ms())?;
-        // grant 已入库，回执 = 全量事实 dump（joiner 首次获得名册）
-        let receipt = SignedFact::encode_all(r.facts())?;
-        write_frame(&mut send, frame_type::REDEEM_OK, &receipt).await?;
-        // 半关闭发送侧，让回执在连接关闭前可靠送达
-        let _ = send.finish();
-        Ok(())
     })
-    .await
-    .map_err(|_| SessionError::RedeemRejected("redeem deadline exceeded".into()))?
+    .await;
+    match res {
+        // deadline：同样立即关闭
+        Err(_) => {
+            conn.close(1u32.into(), b"redeem-deadline");
+            Err(SessionError::RedeemRejected("redeem deadline exceeded".into()))
+        }
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(InnerErr::Silent(reason))) => {
+            conn.close(1u32.into(), b"redeem-rejected");
+            Err(SessionError::RedeemRejected(reason))
+        }
+        Ok(Err(InnerErr::Emitted(reason))) => Err(SessionError::RedeemRejected(reason)),
+    }
 }
 
 /// 由邀请令牌构造对 issuer 的 EndpointAddr（relay + 直连地址）。
@@ -334,4 +654,248 @@ pub fn endpoint_addr_from_invite(token: &InviteToken) -> Result<EndpointAddr, Se
         ));
     }
     Ok(addr)
+}
+
+#[cfg(test)]
+mod redeem_err_tests {
+    use super::redeem_err::*;
+
+    fn rec(kind: u8, payload: &[u8]) -> RedeemRecord {
+        RedeemRecord {
+            kind,
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn encode_record_matches_contract_layout() {
+        // canonical：kind=0x00 空载荷 → [00 00]
+        assert_eq!(
+            RedeemErrorKind::Consumed.encode_record(),
+            vec![0x00, 0x00],
+            "must equal fixture 'canonical' payload 0000"
+        );
+        // other 带原因 → [03 len ..]
+        let e = RedeemErrorKind::Other("not-root".into());
+        assert_eq!(e.encode_record(), vec![0x03, 0x08, b'n', b'o', b't', 0x2d, b'r', b'o', b'o', b't']);
+        // not-root / bad-pop：无载荷
+        assert_eq!(RedeemErrorKind::NotRoot.encode_record(), vec![0x01, 0x00]);
+        assert_eq!(RedeemErrorKind::BadPoP.encode_record(), vec![0x02, 0x00]);
+    }
+
+    #[test]
+    fn normalize_strips_non_printable_and_truncates_255() {
+        // 非 ASCII（UTF-8 中）剥除
+        assert_eq!(normalize_payload("中"), Vec::<u8>::new());
+        // 控制字符剥除、可打印保留
+        assert_eq!(
+            normalize_payload("a\x01b\x7fc d"),
+            b"abc d".to_vec()
+        );
+        // >255 截断
+        let long = "x".repeat(300);
+        assert_eq!(normalize_payload(&long).len(), 255);
+        // 255 边界整保留
+        let exact = "y".repeat(255);
+        assert_eq!(normalize_payload(&exact).len(), 255);
+    }
+
+    #[test]
+    fn decode_records_extra_bytes_are_next_record() {
+        // two-records fixture payload：0000 03086e6f742d726f6f74
+        let payload = [
+            0x00u8, 0x00, 0x03, 0x08, b'n', b'o', b't', 0x2d, b'r', b'o', b'o', b't',
+        ];
+        let rs = decode_records(&payload).unwrap();
+        assert_eq!(rs.len(), 2);
+        assert!(rs[0].is_consumed());
+        assert_eq!(rs[1].kind, 0x03);
+        assert_eq!(rs[1].presented(), "not-root");
+    }
+
+    #[test]
+    fn decode_records_segment_short_reads() {
+        // inner-truncated fixture：声明 4B 只有 2B
+        assert_eq!(
+            decode_records(&[0x03, 0x04, 0x6e, 0x6f]),
+            Err(RecordShortRead { at: 0 })
+        );
+        // 末尾孤立 kind 字节
+        assert_eq!(
+            decode_records(&[0x03, 0x00, 0x01]),
+            Err(RecordShortRead { at: 2 })
+        );
+        // len 越过外层 payload 边界
+        assert_eq!(
+            decode_records(&[0x03, 0x0a, 0x01]),
+            Err(RecordShortRead { at: 0 })
+        );
+    }
+
+    #[test]
+    fn zero_len_other_is_legal() {
+        let rs = decode_records(&[0x03, 0x00]).unwrap();
+        assert_eq!(rs, vec![rec(0x03, b"")]);
+        assert_eq!(rs[0].presented(), "");
+    }
+
+    #[test]
+    fn unknown_kind_consumed_by_len_and_reduces_to_other() {
+        // unknown-kind fixture：7f 04 61626364
+        let rs = decode_records(&[0x7f, 0x04, b'a', b'b', b'c', b'd']).unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].presented(), "abcd");
+        assert_eq!(
+            reduce(&rs),
+            RedeemRejection::Invalid {
+                reason: "unknown-kind 0x7f".into()
+            }
+        );
+    }
+
+    #[test]
+    fn reduce_is_fail_closed() {
+        // 恰一条 Consumed
+        assert_eq!(reduce(&[rec(0x00, b"")]), RedeemRejection::Consumed);
+        // 恰一条已知其它 kind
+        assert_eq!(
+            reduce(&[rec(0x01, b"")]),
+            RedeemRejection::Invalid {
+                reason: "not root".into()
+            }
+        );
+        // 带载荷时呈现层优先
+        assert_eq!(
+            reduce(&[rec(0x01, b"not-root")]),
+            RedeemRejection::Invalid {
+                reason: "not-root".into()
+            }
+        );
+        assert_eq!(
+            reduce(&[rec(0x03, b"")]),
+            RedeemRejection::Invalid {
+                reason: "other".into()
+            }
+        );
+        // 多条（含 Consumed）：fail-closed → Invalid
+        assert!(matches!(
+            reduce(&[rec(0x00, b""), rec(0x03, b"not-root")]),
+            RedeemRejection::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn presented_strips_non_ascii_bytes() {
+        // non-ascii-payload fixture：e4b8ad → presented ""
+        assert_eq!(rec(0x03, &[0xe4, 0xb8, 0xad]).presented(), "");
+        assert_eq!(rec(0x03, b"plain").presented(), "plain");
+    }
+
+    // ---- issuerMapping rows（17 行 variantId 的映射层逐行断言） ---------------
+
+    use crate::roster::RosterError;
+
+    fn ids(seed: u8) -> (crate::protocol::FabricId, crate::protocol::FabricId) {
+        let a = crate::protocol::FabricId([seed; 32]);
+        let b = crate::protocol::FabricId([seed ^ 0xFF; 32]);
+        (a, b)
+    }
+
+    fn id16(id: &crate::protocol::FabricId) -> String {
+        crate::roster::fabric_id_short16(id)
+    }
+
+    #[test]
+    fn issuer_mapping_verify_rows_emit() {
+        // verify-wrong-fabric：kind=3，payload = "wrong fabric {got16} vs {expected16}"
+        let (got, expected) = ids(1);
+        let e = RosterError::WrongFabric { got, expected };
+        match super::redeem_verify_emit(&e) {
+            Some(RedeemErrorKind::Other(reason)) => {
+                assert_eq!(reason, format!("wrong fabric {} vs {}", id16(&got), id16(&expected)));
+            }
+            other => panic!("wrong-fabric must emit Other, got {other:?}"),
+        }
+        // verify-invite-not-root：kind=1，无 payload
+        assert_eq!(super::redeem_verify_emit(&e), super::redeem_verify_emit(&e)); // 稳定
+        let not_root = RosterError::InviteNotRoot {
+            issuer: iroh_base::SecretKey::from_bytes(&[2u8; 32]).public(),
+            root: None,
+        };
+        assert_eq!(
+            super::redeem_verify_emit(&not_root),
+            Some(RedeemErrorKind::NotRoot)
+        );
+        // verify-invite-expired：kind=3 "invite expired"
+        let expired = RosterError::InviteExpired {
+            expires_at_ms: 1,
+            now_ms: 2,
+        };
+        assert_eq!(
+            super::redeem_verify_emit(&expired),
+            Some(RedeemErrorKind::Other("invite expired".into()))
+        );
+        // verify-recipient-mismatch：kind=3 "recipient mismatch"
+        let mismatch = RosterError::InviteRecipientMismatch {
+            expected: iroh_base::SecretKey::from_bytes(&[3u8; 32]).public(),
+            redeemer: iroh_base::SecretKey::from_bytes(&[4u8; 32]).public(),
+        };
+        assert_eq!(
+            super::redeem_verify_emit(&mismatch),
+            Some(RedeemErrorKind::Other("recipient mismatch".into()))
+        );
+        // verify-bad-pop：kind=2
+        let bad_pop = RosterError::BadPoP {
+            redeemer: iroh_base::SecretKey::from_bytes(&[5u8; 32]).public(),
+        };
+        assert_eq!(
+            super::redeem_verify_emit(&bad_pop),
+            Some(RedeemErrorKind::BadPoP)
+        );
+    }
+
+    #[test]
+    fn issuer_mapping_verify_protocol_row_is_emit_false() {
+        // verify-protocol（token.verify() 内部 Protocol）：无结构化帧
+        let e = RosterError::Protocol(crate::protocol::ProtocolError::Quarantine {
+            reason: "invite token failed verification".into(),
+        });
+        assert_eq!(super::redeem_verify_emit(&e), None);
+    }
+
+    #[test]
+    fn issuer_mapping_out_of_scope_variants_are_emit_false() {
+        // _out_of_scope：NotRoot（名册 root 缺失形态）/Corrupted/NotFound/
+        // AlreadyExists/DirFabricMismatch/Persistence/InvalidRevokeTarget 不发帧
+        let cases = vec![
+            RosterError::NotRoot {
+                caller: iroh_base::SecretKey::from_bytes(&[6u8; 32]).public(),
+                root: None,
+            },
+            RosterError::Corrupted {
+                path: "x".into(),
+                reason: "r".into(),
+            },
+            RosterError::NotFound { path: "x".into() },
+            RosterError::AlreadyExists { path: "x".into() },
+            RosterError::Persistence {
+                path: "x".into(),
+                source: std::io::Error::other("io"),
+            },
+            RosterError::InvalidRevokeTarget { fact_id: [0u8; 32] },
+        ];
+        for e in cases {
+            assert_eq!(super::redeem_verify_emit(&e), None, "{e}");
+        }
+        let (a, b) = ids(9);
+        assert_eq!(
+            super::redeem_verify_emit(&RosterError::DirFabricMismatch {
+                path: "x".into(),
+                stored: a,
+                requested: b,
+            }),
+            None,
+            "DirFabricMismatch must never be sent on the redeem channel"
+        );
+    }
 }

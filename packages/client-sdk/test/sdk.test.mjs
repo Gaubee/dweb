@@ -1,4 +1,8 @@
 // @dweb/client-sdk 生命周期测试（node --test，原生模块与 vitest worker 池不兼容）
+// connectivity-ux-hardening 后 invite 有 D3 签发安全门：relay 禁用时无 advertiseAddrs
+// 的令牌不再签发（旧 direct_addr_hints 回退已删除），relay-less full lifecycle
+// （invite→join→message→revoke）需要真实 relay，移至 ZCode 4.1 整合期联测；
+// 新 API 行为（invite 门/错误码前缀/relayStatus/事件取消订阅）见 new-api.test.mjs。
 import test from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -20,52 +24,8 @@ function opts(dir) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 test("nativeVersion returns crate version", () => {
-  assert.match(nativeVersion(), /^0\.1\./);
+  assert.match(nativeVersion(), /^0\.2\./);
 });
-
-test(
-  "full lifecycle: invite -> join -> connect -> messages -> revoke",
-  async () => {
-    const a = await Fabric.createRoot(opts(tmpdir("dweb-sdk-a-")));
-    assert.match(a.endpointId, /^[a-z0-9]{52}$/);
-
-    const b = await Fabric.attach(opts(tmpdir("dweb-sdk-b-")), await a.fabricIdHex());
-
-    /** @type {any[]} */
-    const eventsB = [];
-    b.on((e) => eventsB.push(e));
-
-    const token = await a.invite(300_000, null);
-    assert.ok(token.startsWith("dweb1."));
-
-    await b.join(token);
-    assert.equal((await b.members()).length, 2);
-
-    // 同一令牌二次兑换被拒
-    await assert.rejects(() => b.join(token));
-
-    await b.connect(a.endpointId);
-    await sleep(800);
-
-    await a.send(b.endpointId, Buffer.from("ping"));
-    await sleep(800);
-
-    const msg = eventsB.find((e) => e.type === "message");
-    assert.ok(msg, "message event received");
-    assert.equal(msg.data.toString(), "ping");
-    assert.equal(msg.from, a.endpointId);
-
-    await a.revoke(b.endpointId);
-    await sleep(800);
-    assert.equal((await a.members()).length, 1);
-
-    await assert.rejects(() => b.connect(a.endpointId));
-
-    await b.shutdown();
-    await a.shutdown();
-    await a.shutdown(); // 幂等
-  },
-);
 
 test("identity persists across restart", async () => {
   const dir = tmpdir("dweb-sdk-restart-");

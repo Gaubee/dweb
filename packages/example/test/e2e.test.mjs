@@ -1,26 +1,65 @@
-// 双进程 E2E：init → invite → join → chat 互发消息 → revoke 拒绝
+// Two-process E2E: init -> invite -> join -> chat exchange -> revoke.
+//
+// Transition notes (connectivity-ux-hardening, Batch E):
+//  - Every CLI invocation now runs the bootstrap state machine: the relay URL
+//    gets one GET /services.json probe. Against the 0.1.0 server binary the
+//    iroh relay answers 404 on unknown paths, so the URL is classified as a
+//    legacy bare relay and networking behavior is unchanged.
+//  - The local 0.1.0 SDK binary lacks relayStatus()/relay-* events and the
+//    invite() options argument; cli.mjs feature-detects them, so this e2e
+//    keeps running on the old binary. Real coverage of the new SDK surface
+//    (relay status snapshot, join 8-code paths, invite gate) is ZCode 4.1
+//    integration territory, not this file.
+//  - Spawned CLIs get an isolated HOME so they never touch the developer's
+//    real ~/.opendweb/config.json.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { startServer } from "@jixo/opendweb-server-binary";
 
 const NODE = process.execPath;
-const CLI = path.resolve(new URL("../src/cli.mjs", import.meta.url).pathname);
+const CLI = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
+
+// Isolated HOME for every spawned CLI (config file must not leak between
+// tests or into the developer's real ~/.opendweb).
+const E2E_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dweb-e2e-home-"));
 
 function tmpdir(p) {
   return fs.mkdtempSync(path.join(os.tmpdir(), p));
 }
 
-/** @param {string} dataDir @param {string[]} args @param {{input?: string, timeoutMs?: number}} [opts] */
+/** Grab a random free TCP port (e2e discipline: no fixed ports). */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = /** @type {net.AddressInfo} */ (srv.address());
+      srv.close(() => resolve(port));
+    });
+    srv.on("error", reject);
+  });
+}
+
+function cliEnv() {
+  // keep PATH etc, drop inherited DWEB_*/proxy variables for determinism
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !/^(DWEB_|.*_proxy|.*_PROXY)$/.test(k)),
+  );
+  env.HOME = E2E_HOME;
+  return env;
+}
+
 /** @type {any} */
 let relay = null;
 
 function runCli(dataDir, args, opts = {}) {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env };
+    const env = cliEnv();
     if (relay) {
       env.DWEB_RELAY = "custom";
       env.DWEB_RELAY_URLS = relay.relayHttpUrl;
@@ -34,7 +73,7 @@ function runCli(dataDir, args, opts = {}) {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`timeout: ${args.join(" ")}\nout=${out}\nerr=${err}`));
-    }, opts.timeoutMs ?? 20000);
+    }, opts.timeoutMs ?? 30000);
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
     child.on("close", (code) => {
@@ -51,7 +90,7 @@ function runCli(dataDir, args, opts = {}) {
 
 /** @param {string} dataDir */
 function chatProc(dataDir) {
-  const env = { ...process.env };
+  const env = cliEnv();
   if (relay) {
     env.DWEB_RELAY = "custom";
     env.DWEB_RELAY_URLS = relay.relayHttpUrl;
@@ -103,10 +142,13 @@ function chatProc(dataDir) {
 test(
   "two-process invite/join/chat/revoke",
   async () => {
-    // 自托管 relay：进程重启后地址仍稳定（invite 内嵌 relay URL）
+    // Self-hosted relay on random free ports: address stays stable across
+    // process restarts (invite embeds the relay URL).
+    const httpPort = await freePort();
+    const relayPort = await freePort();
     relay = await startServer({
-      httpBind: "127.0.0.1:18997",
-      relayBind: "127.0.0.1:18998",
+      httpBind: `127.0.0.1:${httpPort}`,
+      relayBind: `127.0.0.1:${relayPort}`,
     });
     const dirA = tmpdir("dweb-ex-a-");
     const dirB = tmpdir("dweb-ex-b-");
@@ -118,10 +160,10 @@ test(
     const token = (await runCli(dirA, ["invite"])).trim();
     assert.ok(token.startsWith("dweb1."));
 
-    // issuer 必须在线：A 先进 chat 常驻，B 再兑换
+    // The issuer must stay online: A enters chat first, then B redeems.
     const chatA = chatProc(dirA);
     await chatA.waitFor("chat ready");
-    await runCli(dirB, ["join", token], { timeoutMs: 30000 });
+    await runCli(dirB, ["join", token], { timeoutMs: 40000 });
     const membersOut = await runCli(dirB, ["members"]);
     assert.match(membersOut, /2 member/);
     assert.match(membersOut, new RegExp(idA.slice(0, 8)));
@@ -140,10 +182,10 @@ test(
     await chatA.kill();
     await chatB.kill();
 
-    // A 撤销 B，随后 B 发送必须失败
+    // A revokes B; B's next send must fail
     await runCli(dirA, ["revoke", idB]);
     await assert.rejects(() => runCli(dirB, ["send", idA, "should-fail"]));
     await relay.stop();
   },
-  120000,
+  180000,
 );

@@ -10,6 +10,7 @@ repository.workspace = true
 tokio = { workspace = true }
 iroh = { workspace = true }
 iroh-base = { workspace = true }
+iroh-relay = { workspace = true }
 # Content addressing (fact_id) and file checksums.
 blake3 = { workspace = true }
 base64 = { workspace = true }
@@ -26,4 +27,7 @@ fs4 = "0.13"
 n0-future = "0.3"
 
 [dev-dependencies]
+serde = { workspace = true }
 tempfile = "3"
+# relay watcher 集成测试起真实 iroh relay server（唯一锁影响：iroh 条目具体化 "axum" 一行）
+iroh = { workspace = true, features = ["test-utils"] }

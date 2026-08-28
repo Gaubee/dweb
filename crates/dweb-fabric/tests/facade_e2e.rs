@@ -1,7 +1,8 @@
 //! Fabric 门面端到端：root 创建 → invite → joiner 兑换 → 双向连接 → 消息 → 撤销。
 //! 全程仅 localhost 直连（relay 禁用），无任何外部设施。
 
-use dweb_fabric::{Fabric, FabricConfig, FabricEvent, RelayConfig};
+use dweb_fabric::fabric::{JOIN_TIMEOUT_MS_DEFAULT, JOIN_TIMEOUT_MS_MIN};
+use dweb_fabric::{Fabric, FabricConfig, FabricEvent, HttpProxyConfig, RelayConfig};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -11,6 +12,30 @@ fn cfg(dir: &TempDir) -> FabricConfig {
         relay: RelayConfig::Disabled,
         advertise_addrs: Vec::new(),
         secret: dweb_fabric::SecretInjection::Default,
+        http_proxy: HttpProxyConfig::None,
+        join_timeout_ms: JOIN_TIMEOUT_MS_DEFAULT,
+        relay_ca_tls: None,
+        bind_addr: None,
+    }
+}
+
+/// 预留一个空闲本地端口（UDP 试探后释放；测试语义下竞态可忽略）。
+fn reserve_loopback_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// relay 禁用 + 固定端口直连配置（advertise_addrs 与实际监听端口一致）。
+fn cfg_fixed_port(dir: &TempDir, port: u16) -> FabricConfig {
+    FabricConfig {
+        advertise_addrs: vec![format!("127.0.0.1:{port}")],
+        bind_addr: Some(format!("127.0.0.1:{port}")),
+        join_timeout_ms: JOIN_TIMEOUT_MS_MIN.max(5_000),
+        relay_ca_tls: None,
+        ..cfg(dir)
     }
 }
 
@@ -39,7 +64,8 @@ async fn full_lifecycle_invite_join_message_revoke() {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
 
-    let a = Fabric::create_root(cfg(&dir_a)).await.unwrap();
+    let port = reserve_loopback_port();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port)).await.unwrap();
     let mut ev_a = a.subscribe();
 
     let fabric_id = a.fabric_id_hex().await;
@@ -48,11 +74,16 @@ async fn full_lifecycle_invite_join_message_revoke() {
     let b = Fabric::attach(cfg(&dir_b), &fabric_id).await.unwrap();
     let mut ev_b = b.subscribe();
 
-    // 邀请（5 分钟有效）
+    // 邀请（5 分钟有效；advertise_addrs 携带固定端口直连地址）
     let token = a
         .invite(Duration::from_secs(300).as_millis() as u64, None)
         .await
         .unwrap();
+    let decoded = dweb_fabric::protocol::InviteToken::decode(&token).unwrap();
+    assert_eq!(
+        decoded.invite.issuer_direct_addrs,
+        vec![format!("127.0.0.1:{port}")]
+    );
 
     // B 兑换：经 redeem ALPN 连 A（invite 含 127.0.0.1 直连提示）
     b.join(&token).await.expect("join redeems invite");
@@ -74,9 +105,14 @@ async fn full_lifecycle_invite_join_message_revoke() {
     .await;
     assert_eq!(a.members().await.len(), 2);
 
-    // 同一令牌二次兑换必须被拒（CAS）
+    // 同一令牌二次兑换必须被拒（CAS）：结构化 Consumed 记录 → TOKEN_CONSUMED
     let again = b.join(&token).await;
-    assert!(again.is_err(), "second redeem of same token must fail");
+    match &again {
+        Err(dweb_fabric::FabricError::Join { code, .. }) => {
+            assert_eq!(*code, dweb_fabric::JoinErrorCode::TokenConsumed);
+        }
+        other => panic!("second redeem must fail with TOKEN_CONSUMED, got {other:?}"),
+    }
 
     // B 连接 A（常规 ALPN，双向 HELLO 同步）
     b.connect(&a.endpoint_id()).await.expect("B connects A");
@@ -159,7 +195,6 @@ async fn non_member_connect_is_gated() {
 
     let a = Fabric::create_root(cfg(&dir_a)).await.unwrap();
     let c = Fabric::create_root(cfg(&dir_c)).await.unwrap();
-
     let err = c.connect(&a.endpoint_id()).await.unwrap_err();
     assert!(
         matches!(
@@ -194,7 +229,10 @@ async fn remote_revoke_kicks_session_via_acceptor_path() {
     let dir_b = TempDir::new().unwrap();
     let dir_c = TempDir::new().unwrap();
 
-    let a = Fabric::create_root(cfg(&dir_a)).await.unwrap();
+    let port = reserve_loopback_port();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port))
+        .await
+        .unwrap();
     let fid = a.fabric_id_hex().await;
 
     let b = Fabric::attach(cfg(&dir_b), &fid).await.unwrap();
@@ -213,14 +251,15 @@ async fn remote_revoke_kicks_session_via_acceptor_path() {
     b.connect(&a.endpoint_id()).await.unwrap();
     c.connect(&a.endpoint_id()).await.unwrap();
 
-    // relay 禁用场景：显式交换地址提示
-    for hint in c.direct_addr_hints_public().await {
+    // relay 禁用场景：显式交换地址提示（仅 loopback：LAN 路径在本机发夹场景下
+    // 与 iroh 路径状态竞争，会造成重拨卡死——见 dial_after_disconnect 复现）
+    for hint in c.direct_addr_hints_public().await.into_iter().filter(|h| h.starts_with("127.0.0.1:")) {
         b.add_known_addr(&c.endpoint_id(), hint.clone())
             .await
             .unwrap();
         a.add_known_addr(&c.endpoint_id(), hint).await.unwrap();
     }
-    for hint in b.direct_addr_hints_public().await {
+    for hint in b.direct_addr_hints_public().await.into_iter().filter(|h| h.starts_with("127.0.0.1:")) {
         c.add_known_addr(&b.endpoint_id(), hint.clone())
             .await
             .unwrap();
@@ -272,10 +311,8 @@ async fn secret_injection_semantics() {
     let seed = SecretSeed::from_bytes([7u8; 32]);
     let expected_id = seed.endpoint_id();
     let f = Fabric::create_root(FabricConfig {
-        data_dir: dir.path().to_owned(),
-        relay: RelayConfig::Disabled,
-        advertise_addrs: Vec::new(),
         secret: SecretInjection::Seed(seed),
+        ..cfg(&dir)
     })
     .await
     .unwrap();
@@ -291,20 +328,16 @@ async fn secret_injection_semantics() {
     // 2) open 缺失身份 => MissingIdentity，不生成
     let dir2 = TempDir::new().unwrap();
     let f2 = Fabric::create_root(FabricConfig {
-        data_dir: dir2.path().to_owned(),
-        relay: RelayConfig::Disabled,
-        advertise_addrs: Vec::new(),
         secret: SecretInjection::Seed(SecretSeed::from_bytes([8u8; 32])),
+        ..cfg(&dir2)
     })
     .await
     .unwrap();
     f2.shutdown().await.unwrap();
     // data_dir 只有 roster（seed 注入没写 identity.key）
     let opened = Fabric::open(FabricConfig {
-        data_dir: dir2.path().to_owned(),
-        relay: RelayConfig::Disabled,
-        advertise_addrs: Vec::new(),
         secret: SecretInjection::Default,
+        ..cfg(&dir2)
     })
     .await;
     assert!(
@@ -314,10 +347,8 @@ async fn secret_injection_semantics() {
 
     // 3) seed 与 roster 不一致 => IdentityRosterMismatch（open）
     let mismatch = Fabric::open(FabricConfig {
-        data_dir: dir2.path().to_owned(),
-        relay: RelayConfig::Disabled,
-        advertise_addrs: Vec::new(),
         secret: SecretInjection::Seed(SecretSeed::from_bytes([9u8; 32])),
+        ..cfg(&dir2)
     })
     .await;
     assert!(

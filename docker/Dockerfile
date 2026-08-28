@@ -21,7 +21,11 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/dweb-server /usr/local/bin/dweb-server
 
-ENV DWEB_HTTP_BIND=0.0.0.0:8787 \
+# gateway 命名（connectivity-ux-hardening）：DWEB_GATEWAY_BIND 为 canonical，
+# DWEB_HTTP_BIND 仍被接受（兼容别名）。gateway 承载 rendezvous + /healthz +
+# /services.json（服务清单）+ /（纯文本摘要）；relay 独立端口。
+# 反向代理终结 TLS 时设 DWEB_TRUST_PROXY=1，services.json 才采信 X-Forwarded-Proto。
+ENV DWEB_GATEWAY_BIND=0.0.0.0:8787 \
     DWEB_RELAY_HTTP_BIND=0.0.0.0:3340 \
     DWEB_RELAY_ENABLED=true
 

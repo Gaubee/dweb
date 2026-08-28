@@ -23,56 +23,67 @@
 ## 快速开始（体验 example）
 
 ```bash
-# 1. 启动自托管 server（relay + rendezvous）—— 顶层 CLI
+# 1. 启动自托管 server（gateway + relay）—— 顶层 CLI
 pnpm --filter opendweb exec node bin/opendweb.mjs server
 #   或发布后: npx opendweb server
 #   也可用 docker: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+#   横幅会列出本机全部 Network 地址——任一地址即客户端唯一配置入口，
+#   gateway 经 /services.json 自动发现 relay。
 
-# 2. 终端 A：初始化并常驻聊天
-export DWEB_RELAY=custom DWEB_RELAY_URLS=http://127.0.0.1:3340
+# 2. 每台客户端机器：一次性配置（持久化于 ~/.opendweb/config.json）
+node packages/example/src/cli.mjs config set relay http://192.168.2.13:8787
+#   裸 0.1.0 relay URL（http://host:3340）同样可用（legacy 兼容模式）。
+
+# 3. 终端 A：初始化并常驻聊天
 node packages/example/src/cli.mjs init --data ~/.dweb-a
-node packages/example/src/cli.mjs invite --data ~/.dweb-a   # 复制输出的 token
+node packages/example/src/cli.mjs invite --data ~/.dweb-a --ttl 30m   # 复制 token
 node packages/example/src/cli.mjs chat --data ~/.dweb-a
 
-# 3. 终端 B（另一目录/设备）：兑换邀请并聊天
-export DWEB_RELAY=custom DWEB_RELAY_URLS=http://<A的IP>:3340
+# 4. 终端 B（另一目录/设备）：兑换邀请并聊天
 node packages/example/src/cli.mjs join --data ~/.dweb-b <token>
 node packages/example/src/cli.mjs chat --data ~/.dweb-b
 ```
 
-注意：本机设置了 `http_proxy` 等代理环境变量时，局域网 relay 需追加
-`export NO_PROXY=<relay主机名或IP>`，否则代理会劫持 relay 的 WS 连接。
+**Invites must be redeemed while the inviter is online**（issuer-online 单次兑换）：
+签发者进程（如 `chat` 会话）必须在兑换期间保持运行；一次性 `invite` 进程签发的
+令牌在 relay 模式下可用，但无 relay 令牌会被直接拒签（`--allow-relayless` 逃生阀除外）。
+
+代理说明：`--proxy auto|on|off`（默认 auto，配置键 `proxy`）控制 HTTP 控制面（relay 连接）
+是否走系统代理；env 读取顺序 `HTTP_PROXY > http_proxy > HTTPS_PROXY > https_proxy`，
+与 iroh 一致。**QUIC 数据面（直连 + NAT 穿透）永不经 HTTP 代理**——auto 模式下局域网
+relay 直连探测可达即自动绕过代理，旧版手动 `NO_PROXY` 的需求消失。
+
+join 失败带稳定错误码（`error[join/<code>]`，如 `no-reachable-path` 秒败并指路、
+`dial-timeout` 附注 issuer 可能离线）；`config list` 可查看各配置项的生效值与来源
+（flag > env > file > default）。
 
 ## 服务器部署（docker）
 
 ```bash
 docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
-
-# 2. 机器 A：初始化 fabric 并常驻聊天
-DWEB_RELAY=custom DWEB_RELAY_URLS=http://<relay-host>:3340 \
-  node packages/example/src/cli.mjs init --data ~/.dweb-a
-DWEB_RELAY=custom DWEB_RELAY_URLS=http://<relay-host>:3340 \
-  node packages/example/src/cli.mjs chat --data ~/.dweb-a
-
-# 3. 机器 B：兑换邀请（issuer 须在线）并聊天
-DWEB_RELAY=custom DWEB_RELAY_URLS=http://<relay-host>:3340 \
-  node packages/example/src/cli.mjs join --data ~/.dweb-b <token>
-DWEB_RELAY=custom DWEB_RELAY_URLS=http://<relay-host>:3340 \
-  node packages/example/src/cli.mjs chat --data ~/.dweb-b
+# 客户端配置单一入口（gateway 自动发现 relay）：
+#   config set relay http://<relay-host>:8787
 ```
 
-注意：`invite` 由常驻进程签发语义最稳（一次性进程的直连端口会随进程退出失效；
-relay 模式不受影响）。本机代理（http_proxy 等）会劫持 relay WS 连接，必要时设置
-`NO_PROXY`。
+### 环境变量（server）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DWEB_GATEWAY_BIND` | `0.0.0.0:8787` | gateway 监听（healthz/rendezvous/services.json） |
+| `DWEB_HTTP_BIND` | （别名） | 0.1.0 兼容别名，与上同效 |
+| `DWEB_RELAY_HTTP_BIND` | `0.0.0.0:3340` | relay 监听 |
+| `DWEB_RELAY_ENABLED` | `true` | `false`/`0`/`off` 关闭 relay |
+| `DWEB_TRUST_PROXY` | 未设 | 反代 TLS 终结时设 `1` 才采信 `X-Forwarded-Proto` |
 
 ## SDK（Node，darwin-arm64）
 
 ```js
 const { Fabric } = require("@jixo/opendweb-client-sdk");
 const a = await Fabric.createRoot({ dataDir: "/path/a", relay: { mode: "disabled" } });
-const token = await a.invite(10 * 60_000, null);          // root 签发
+const token = await a.invite(60 * 60_000, null);          // root 签发（v0.2 默认 60m）
 const b = await Fabric.joinWithToken({ dataDir: "/path/b" }, token); // 在线兑换
-b.on((e) => console.log(e.type, e.data?.toString()));     // 事件
+const off = b.on((e) => console.log(e.type, e.data?.toString())); // 事件（off() 取消订阅）
+console.log(await b.relayStatus());                       // { mode, urls, online, lastError }
 await b.connect(a.endpointId);
 await a.send(b.endpointId, Buffer.from("ping"));
 await a.revoke(b.endpointId);                              // 撤销
@@ -110,4 +121,4 @@ pnpm --filter @jixo/opendweb-example test        # node --test（双进程 relay
 - 仓库位于网络磁盘：Rust 编译走本地 `CARGO_TARGET_DIR`（`.cargo/config.toml` 本机配置，
   CI/容器以 env 覆盖）。
 - 原生二进制经内容寻址临时路径加载（规避 SMB 页缓存与 dyld 坏闭包）。
-- 研发流程：OpenSpec 驱动，见 `openspec/changes/fabric-mvp`。
+- 研发流程：OpenSpec 驱动（当前 change：`openspec/changes/connectivity-ux-hardening`）。

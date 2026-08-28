@@ -46,10 +46,12 @@ function loadViaTmp() {
 
 const Native = loadViaTmp() ?? require(SRC);
 
+// on() → 取消订阅函数：原生层返回回调 id，off(id) 注销（event_callbacks 移除句柄）。
 const nativeOn = Native.Fabric.prototype.on;
+const nativeOff = Native.Fabric.prototype.off;
 Native.Fabric.prototype.on = function onWrapped(callback) {
   // 原生 TSFN 为 error-first 回调：(err, jsonString)
-  return nativeOn.call(this, (err, json) => {
+  const id = nativeOn.call(this, (err, json) => {
     if (err) return;
     const ev = JSON.parse(json);
     if (typeof ev.dataBase64 === "string") {
@@ -58,6 +60,35 @@ Native.Fabric.prototype.on = function onWrapped(callback) {
     }
     callback(ev);
   });
+  return () => nativeOff.call(this, id);
 };
+
+/**
+ * 从 SDK 错误消息的 [<kebab-code>] 前缀派生稳定错误码（SCREAMING_SNAKE）。
+ * napi Error 无自定义 code 通道——前缀约定见 contracts/error-matrix.md。
+ * 无前缀时返回 null（未分类的底层错误）。
+ */
+function deriveErrorCode(message) {
+  if (typeof message !== "string") return null;
+  const m = message.match(/^\[([a-z0-9-]+)\]\s/);
+  if (!m) return null;
+  return m[1].replace(/-/g, "_").toUpperCase();
+}
+Native.deriveErrorCode = deriveErrorCode;
+
+// relayStatus()：napi Option::None 序列化为 undefined，契约（C0 d.ts）要求 null——
+// 包装归一（事件 payload 的 relay 快照经 JSON.parse 天然是 null，无需处理）。
+const nativeRelayStatus = Native.Fabric.prototype.relayStatus;
+if (typeof nativeRelayStatus === "function") {
+  Native.Fabric.prototype.relayStatus = async function relayStatusWrapped() {
+    const r = await nativeRelayStatus.call(this);
+    return {
+      mode: r.mode,
+      urls: r.urls ?? [],
+      online: r.online ?? null,
+      lastError: r.lastError ?? null,
+    };
+  };
+}
 
 module.exports = Native;

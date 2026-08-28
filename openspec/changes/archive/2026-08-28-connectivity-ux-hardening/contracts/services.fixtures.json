@@ -1,0 +1,113 @@
+{
+  "cases": [
+    {
+      "name": "canonical",
+      "note": "标准全启用形态；字段名与结构冻结，host/port/version 为占位",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "http://192.168.2.13:8787",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "http://192.168.2.13:8787/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "http://192.168.2.13:3340"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "http://192.168.2.13:3340"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": []
+    },
+    {
+      "name": "relay-disabled",
+      "note": "--no-relay 启动",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "http://192.168.2.13:8787",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "http://192.168.2.13:8787/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": false,
+            "url": null
+          }
+        ]
+      },
+      "expectedClientRelays": [],
+      "expectedClientWarning": "gateway reports relay disabled",
+      "expectedServerWarnings": []
+    },
+    {
+      "name": "nullable-url",
+      "note": "enabled:true 但无可用回退地址（无非 loopback IPv4）——客户端视同禁用",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": null,
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": null
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": null
+          }
+        ]
+      },
+      "expectedClientRelays": [],
+      "expectedClientWarning": "no reachable url",
+      "expectedServerWarnings": [
+        "no non-loopback IPv4 available; URLs are null"
+      ]
+    },
+    {
+      "name": "unknown-and-duplicate",
+      "note": "前向兼容与重复名规则：未知名静默忽略（无 WARNING）；重复名取首个并输出一条服务端 WARNING",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "http://192.168.2.13:8787",
+        "services": [
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "http://192.168.2.13:3340"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "http://192.168.2.13:9999"
+          },
+          {
+            "name": "future-service",
+            "enabled": true,
+            "url": "http://192.168.2.13:9998"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "http://192.168.2.13:3340"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": [
+        "duplicate service name: relay"
+      ]
+    }
+  ]
+}

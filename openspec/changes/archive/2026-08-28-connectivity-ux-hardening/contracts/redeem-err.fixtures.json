@@ -1,0 +1,359 @@
+{
+  "$schema_note": "Batch C0 权威 wire fixture。外层帧 = u32_be(1+payload_len)+type(1B)+payload（与 session.rs write_frame/read_frame 逐字节一致）；type REDEEM_ERR=0x14。记录 = kind(1B)+len(1B,0..255)+payload。expectedReaderOutcome 为 read_frame 层结果（ok/header-short-read/payload-short-read）；expectedResult 一律为 join 侧最终归类（8 码），读取层短读最终归 DIAL_FAILED。全部向量已按算法字节级模拟验证。 expectedRecords 条目为 {kind:number（未知 kind 用数值如 127）, payloadHex:原始字节 hex, presented:呈现层结果（剥除非可打印 ASCII 后）}。",
+  "reduction": "恰一条 Consumed -> TOKEN_CONSUMED；恰一条其它已知 kind -> TOKEN_INVALID；多条 -> TOKEN_INVALID（完整消费不位移）；未知 kind 按 Other(unknown-kind) 参与判定",
+  "issuerMapping": {
+    "_schema": "每行: {stage, variantId, variant, emit, kind, payloadTemplate, joinerResult, close, note?}。variantId 为稳定 ASCII 标识（F 测试逐行绑定）；variant 为实际 Rust 枚举/条件描述；kind 为 0..3 数值或 null(emit=false)；payloadTemplate 实例化后经 _normalization 作为 Other 载荷；close 恒 true。_normalization 仅适用于 emit=true 行。",
+    "_normalization": "模板实例化 -> UTF-8 -> 剥除非可打印 ASCII（<0x20 与 >0x7E）-> 保留字节 >255 截断至 255；恰一条记录（REDEEM_ERR 单帧单记录）",
+    "rows": [
+      {
+        "stage": "session_entry",
+        "variantId": "entry-wrong-first-frame",
+        "variant": "首帧类型 != REDEEM_INTENT",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true
+      },
+      {
+        "stage": "session_entry",
+        "variantId": "entry-decode-invalid",
+        "variant": "InviteToken::decode 失败",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true,
+        "note": "防御分支：joiner 前置 decode 已拒绝绝大多数坏令牌"
+      },
+      {
+        "stage": "proof_frame",
+        "variantId": "proof-wrong-frame-type",
+        "variant": "帧类型 != REDEEM_PROOF",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true,
+        "note": "协议违规统一关闭"
+      },
+      {
+        "stage": "proof_frame",
+        "variantId": "proof-bad-length",
+        "variant": "PROOF 载荷长度 != 96",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true
+      },
+      {
+        "stage": "proof_frame",
+        "variantId": "proof-bad-redeemer-key",
+        "variant": "redeemer key 32B 解析失败",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true,
+        "note": "defensive-only：PROOF 长度先校验 96B，[0..32] 恒可解析为 ed25519 公钥——不可经公开 API 端到端构造；以代码分支+单测映射层覆盖（F 实现发现）"
+      },
+      {
+        "stage": "proof_frame",
+        "variantId": "proof-peer-mismatch",
+        "variant": "redeemer != TLS peer",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true
+      },
+      {
+        "stage": "redeem_verify",
+        "variantId": "verify-wrong-fabric",
+        "variant": "RosterError::WrongFabric{got,expected}",
+        "emit": true,
+        "kind": 3,
+        "payloadTemplate": "wrong fabric {got16} vs {expected16}",
+        "joinerResult": "TOKEN_INVALID",
+        "close": true
+      },
+      {
+        "stage": "redeem_verify",
+        "variantId": "verify-invite-not-root",
+        "variant": "RosterError::InviteNotRoot",
+        "emit": true,
+        "kind": 1,
+        "payloadTemplate": null,
+        "joinerResult": "TOKEN_INVALID",
+        "close": true
+      },
+      {
+        "stage": "redeem_verify",
+        "variantId": "verify-invite-expired",
+        "variant": "RosterError::InviteExpired",
+        "emit": true,
+        "kind": 3,
+        "payloadTemplate": "invite expired",
+        "joinerResult": "TOKEN_INVALID",
+        "close": true,
+        "note": "issuer 端竞态兜底（joiner 侧已在拨号前拒）"
+      },
+      {
+        "stage": "redeem_verify",
+        "variantId": "verify-recipient-mismatch",
+        "variant": "RosterError::InviteRecipientMismatch",
+        "emit": true,
+        "kind": 3,
+        "payloadTemplate": "recipient mismatch",
+        "joinerResult": "TOKEN_INVALID",
+        "close": true
+      },
+      {
+        "stage": "redeem_verify",
+        "variantId": "verify-bad-pop",
+        "variant": "RosterError::BadPoP",
+        "emit": true,
+        "kind": 2,
+        "payloadTemplate": null,
+        "joinerResult": "TOKEN_INVALID",
+        "close": true
+      },
+      {
+        "stage": "redeem_verify",
+        "variantId": "verify-protocol",
+        "variant": "RosterError::Protocol（token.verify() 内部）",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true,
+        "note": "区别于 entry-decode-invalid"
+      },
+      {
+        "stage": "consume_invite",
+        "variantId": "consume-already-used",
+        "variant": "consume_invite -> Ok(false)",
+        "emit": true,
+        "kind": 0,
+        "payloadTemplate": null,
+        "joinerResult": "TOKEN_CONSUMED",
+        "close": true
+      },
+      {
+        "stage": "consume_invite",
+        "variantId": "consume-persistence",
+        "variant": "consume_invite -> Err(RosterError::Persistence)",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true,
+        "note": "sourceClass=IO（磁盘/文件系统错误为其 source）"
+      },
+      {
+        "stage": "post_consume",
+        "variantId": "post-grant-failed",
+        "variant": "r.grant() 签发失败",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true,
+        "note": "显式冻结（不靠 ? 传播）"
+      },
+      {
+        "stage": "post_consume",
+        "variantId": "post-encode-receipt-failed",
+        "variant": "SignedFact::encode_all 失败",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true,
+        "note": "defensive-only：roster 存储事实全部先过 verify()→canonical_bytes()，回执编码不可能后失败——以代码分支+单测映射层覆盖（F 实现发现）"
+      },
+      {
+        "stage": "post_consume",
+        "variantId": "post-write-redeem-ok-failed",
+        "variant": "REDEEM_OK 回执写入失败",
+        "emit": false,
+        "kind": null,
+        "payloadTemplate": null,
+        "joinerResult": "DIAL_FAILED",
+        "close": true
+      }
+    ],
+    "_out_of_scope": "RosterError 的 NotRoot（名册 root 缺失）/InvalidRevokeTarget/Corrupted/NotFound/AlreadyExists/DirFabricMismatch 为非 redeem 阶段变体，不经兑换通道发送",
+    "_fTestOwner": "F 为 rows 逐行（按 variantId）提供构造测试：consume-already-used 绑定 canonical fixture 断言 TOKEN_CONSUMED；verify-wrong-fabric/not-root/expired/recipient/bad-pop 各一（断言 kind 数值与归一化 payload，外层 0x14 单记录）；全部 emit=false 行各一（断言无结构化帧 + 连接关闭 + joiner DIAL_FAILED）。**旧文本 REDEEM_ERR 发送路径与 Ok(false) 静默返回必须删除**（tasks 3.4）。"
+  },
+  "cases": [
+    {
+      "name": "canonical",
+      "hex": "00000003140000",
+      "expectedRecords": [
+        {
+          "kind": 0,
+          "payloadHex": "",
+          "presented": ""
+        }
+      ],
+      "expectedResult": "TOKEN_CONSUMED",
+      "expectedViolation": null,
+      "note": "恰一条 Consumed 空载荷",
+      "expectedReaderOutcome": "ok"
+    },
+    {
+      "name": "other",
+      "hex": "0000000b1403086e6f742d726f6f74",
+      "expectedRecords": [
+        {
+          "kind": 3,
+          "payloadHex": "6e6f742d726f6f74",
+          "presented": "not-root"
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedViolation": null,
+      "note": "恰一条 Other 带原因",
+      "expectedReaderOutcome": "ok"
+    },
+    {
+      "name": "unknown-kind",
+      "hex": "00000007147f0461626364",
+      "expectedRecords": [
+        {
+          "kind": 127,
+          "payloadHex": "61626364",
+          "presented": "abcd"
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedViolation": null,
+      "note": "未知 kind 按 len 消费，Other(unknown-kind) 参与判定",
+      "expectedReaderOutcome": "ok"
+    },
+    {
+      "name": "two-records",
+      "hex": "0000000d14000003086e6f742d726f6f74",
+      "expectedRecords": [
+        {
+          "kind": 0,
+          "payloadHex": "",
+          "presented": ""
+        },
+        {
+          "kind": 3,
+          "payloadHex": "6e6f742d726f6f74",
+          "presented": "not-root"
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedViolation": null,
+      "note": "多记录 fail-closed；完整消费不位移",
+      "expectedReaderOutcome": "ok"
+    },
+    {
+      "name": "len-255-other",
+      "hex": "000001021403ff787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878",
+      "expectedRecords": [
+        {
+          "kind": 3,
+          "payloadHex": "787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878",
+          "presented": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedViolation": null,
+      "note": "len 上边界 255（整帧 262B）",
+      "expectedReaderOutcome": "ok"
+    },
+    {
+      "name": "inner-truncated",
+      "hex": "000000051403046e6f",
+      "expectedRecords": [],
+      "expectedResult": "DIAL_FAILED",
+      "expectedViolation": "record-short-read",
+      "note": "完整外层内记录短读（声明 4B 只有 2B）",
+      "expectedReaderOutcome": "ok"
+    },
+    {
+      "name": "zero-len-other",
+      "hex": "00000003140300",
+      "expectedRecords": [
+        {
+          "kind": 3,
+          "payloadHex": "",
+          "presented": ""
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedViolation": null,
+      "note": "Other 零长载荷合法",
+      "expectedReaderOutcome": "ok"
+    },
+    {
+      "name": "outer-header-truncated",
+      "hex": "000000",
+      "expectedRecords": [],
+      "expectedResult": "DIAL_FAILED",
+      "expectedViolation": "header-short-read",
+      "note": "外层头 EOF 短读（既有 read_frame 行为）",
+      "expectedReaderOutcome": "header-short-read"
+    },
+    {
+      "name": "outer-payload-truncated",
+      "hex": "0000000b1403046e6f",
+      "expectedRecords": [],
+      "expectedResult": "DIAL_FAILED",
+      "expectedViolation": "payload-short-read",
+      "note": "外层声明 10B payload 实际 4B——read_frame 在 payload 段 EOF",
+      "expectedReaderOutcome": "payload-short-read"
+    },
+    {
+      "name": "not-root",
+      "hex": "0000000b1401086e6f742d726f6f74",
+      "expectedRecords": [
+        {
+          "kind": 1,
+          "payloadHex": "6e6f742d726f6f74",
+          "presented": "not-root"
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedReaderOutcome": "ok",
+      "note": "恰一条 NotRoot(0x01)",
+      "expectedViolation": null
+    },
+    {
+      "name": "bad-pop",
+      "hex": "0000000e14020b6261642d706f702d736967",
+      "expectedRecords": [
+        {
+          "kind": 2,
+          "payloadHex": "6261642d706f702d736967",
+          "presented": "bad-pop-sig"
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedReaderOutcome": "ok",
+      "note": "恰一条 BadPoP(0x02)",
+      "expectedViolation": null
+    },
+    {
+      "name": "non-ascii-payload",
+      "hex": "00000006140303e4b8ad",
+      "expectedRecords": [
+        {
+          "kind": 3,
+          "payloadHex": "e4b8ad",
+          "presented": ""
+        }
+      ],
+      "expectedResult": "TOKEN_INVALID",
+      "expectedReaderOutcome": "ok",
+      "note": "Other 载荷含非 ASCII 字节（UTF-8 中）；呈现层剥非可打印 ASCII 后原因为空，帧按 len 消费",
+      "expectedViolation": null
+    }
+  ]
+}
