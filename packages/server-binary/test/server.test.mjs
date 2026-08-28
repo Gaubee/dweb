@@ -82,24 +82,6 @@ test("server binary serves gateway + relay healthz (random ports)", async () => 
   }
 });
 
-test("httpBind legacy alias behaves like gatewayBind", async () => {
-  const port = await freePort();
-  const relayPort = await freePort();
-  const server = await startServer({
-    httpBind: `127.0.0.1:${port}`,
-    relayBind: `127.0.0.1:${relayPort}`,
-  });
-  try {
-    await waitHealthy(server.gatewayUrl);
-    const res = await rawRequest(port, "/services.json", { Host: `127.0.0.1:${port}` });
-    assert.equal(res.status, 200);
-    const manifest = JSON.parse(res.body);
-    assert.equal(manifest.gateway, `http://127.0.0.1:${port}`);
-  } finally {
-    await server.stop();
-  }
-});
-
 test("services.json manifest matches contract and GET / is an ASCII summary", async () => {
   const port = await freePort();
   const relayPort = await freePort();
@@ -196,4 +178,11 @@ test("DWEB_RELAY_ENABLED=false disables the relay entry", async () => {
   } finally {
     await server.stop();
   }
+});
+
+test("httpBind is ignored (use gatewayBind)", async () => {
+  // httpBind 传入被静默忽略——server 按默认 gatewayBind 127.0.0.1:8787 启动
+  const srv = await startServer({ httpBind: "127.0.0.1:19876", relayEnabled: false });
+  assert.ok(srv.gatewayUrl.includes("8787"), "default gateway port, not 19876");
+  await srv.stop();
 });

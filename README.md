@@ -70,7 +70,6 @@ docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `DWEB_GATEWAY_BIND` | `0.0.0.0:8787` | gateway 监听（healthz/rendezvous/services.json） |
-| `DWEB_HTTP_BIND` | （别名） | 0.1.0 兼容别名，与上同效 |
 | `DWEB_RELAY_HTTP_BIND` | `0.0.0.0:3340` | relay 监听 |
 | `DWEB_RELAY_ENABLED` | `true` | `false`/`0`/`off` 关闭 relay |
 | `DWEB_TRUST_PROXY` | 未设 | 反代 TLS 终结时设 `1` 才采信 `X-Forwarded-Proto` |

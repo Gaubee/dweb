@@ -3,7 +3,7 @@
 // services.json；另起 iroh relay）。用户面输出全 ASCII（design D1/D10）：横幅/帮助/错误均为英文。
 // 用法：
 //   opendweb server [--gateway <bind>] [--relay <bind>] [--no-relay] [--trust-proxy]
-//   --http 为 --gateway 的兼容别名；环境变量 DWEB_GATEWAY_BIND / DWEB_HTTP_BIND 同义。
+//   环境变量 DWEB_GATEWAY_BIND 同义。
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
@@ -68,7 +68,7 @@ export function splitBind(bind) {
 /**
  * 解析 server 子命令参数。--gateway 为 canonical，--http 为兼容别名（完全等价）；
  * 支持 "--opt value" 与 "--opt=value" 双形式；未知选项报错（调用方以退出码 2 处理）。
- * 优先级 flag > env > default（DWEB_GATEWAY_BIND > DWEB_HTTP_BIND 别名）。
+ * 优先级 flag > env > default（DWEB_GATEWAY_BIND）。
  * @param {string[]} argv process.argv.slice(3)（"server" 之后）
  * @param {Record<string, string|undefined>} [env]
  * @returns {{ gatewayBind: string, relayBind: string, relayEnabled: boolean, trustProxy: boolean } | { error: string }}
@@ -76,7 +76,7 @@ export function splitBind(bind) {
 export function resolveServerArgs(argv, env = process.env) {
   /** @type {Record<string, string|boolean|undefined>} */
   const opts = {};
-  const VALUE_OPTS = new Set(["--gateway", "--http", "--relay"]);
+  const VALUE_OPTS = new Set(["--gateway", "--relay"]);
   const FLAG_OPTS = new Set(["--no-relay", "--trust-proxy"]);
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -97,7 +97,7 @@ export function resolveServerArgs(argv, env = process.env) {
     opts[name] = value;
   }
   const gatewayBind =
-    opts["--gateway"] ?? opts["--http"] ?? env.DWEB_GATEWAY_BIND ?? env.DWEB_HTTP_BIND ?? "0.0.0.0:8787";
+    opts["--gateway"] ?? env.DWEB_GATEWAY_BIND ?? "0.0.0.0:8787";
   const relayBind = opts["--relay"] ?? env.DWEB_RELAY_HTTP_BIND ?? "0.0.0.0:3340";
   // 与 server 侧一致：DWEB_RELAY_ENABLED 为 false/0/off 时关闭
   const relayEnvOff = ["false", "0", "off"].includes(env.DWEB_RELAY_ENABLED ?? "true");
@@ -194,7 +194,7 @@ Usage:
       0.0.0.0:3340) runs on its own port. --http is a legacy alias of --gateway.
 
 Environment:
-  DWEB_GATEWAY_BIND    gateway listen address (DWEB_HTTP_BIND is a legacy alias)
+  DWEB_GATEWAY_BIND    gateway listen address
   DWEB_RELAY_HTTP_BIND relay listen address
   DWEB_RELAY_ENABLED   set to false/0/off to disable the relay
   DWEB_TRUST_PROXY     set to 1 to trust X-Forwarded-Proto behind a reverse proxy

@@ -1,6 +1,6 @@
 //! dweb 自托管服务端：gateway（rendezvous + healthz + services.json）+ iroh relay 桥接。
 //! gateway 命名（design D1）：`--gateway` / `DWEB_GATEWAY_BIND` 为 canonical，
-//! `--http` / `DWEB_HTTP_BIND` 为兼容别名；优先级 flag > env > default。
+//! 优先级 flag > env > default。
 
 mod relay;
 mod rendezvous;
@@ -27,7 +27,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             None => (arg.clone(), None),
         };
         match name.as_str() {
-            "--gateway" | "--http" | "--relay" => {
+            "--gateway" | "--relay" => {
                 let value = match inline_value {
                     Some(v) => v,
                     None => it.next().ok_or_else(|| format!("missing value for {name}"))?,
@@ -47,19 +47,15 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 
 const DEFAULT_GATEWAY_BIND: &str = "0.0.0.0:8787";
 
-/// gateway 监听地址解析（纯函数）：--gateway/--http flag > DWEB_GATEWAY_BIND > DWEB_HTTP_BIND（别名）> 默认
-fn resolve_gateway_bind(flag: Option<&str>, env_canonical: Option<&str>, env_alias: Option<&str>) -> String {
-    flag.or(env_canonical)
-        .or(env_alias)
-        .unwrap_or(DEFAULT_GATEWAY_BIND)
-        .to_string()
+/// gateway 监听地址解析（纯函数）：--gateway flag > DWEB_GATEWAY_BIND > 默认
+fn resolve_gateway_bind(flag: Option<&str>, env_canonical: Option<&str>) -> String {
+    flag.or(env_canonical).unwrap_or(DEFAULT_GATEWAY_BIND).to_string()
 }
 
 fn gateway_bind(cli: &Cli) -> String {
     resolve_gateway_bind(
         cli.gateway.as_deref(),
         std::env::var("DWEB_GATEWAY_BIND").ok().as_deref(),
-        std::env::var("DWEB_HTTP_BIND").ok().as_deref(),
     )
 }
 
@@ -171,7 +167,7 @@ mod tests {
     #[test]
     fn cli_http_alias_equals_gateway() {
         let a = parse_cli(["--gateway", "0.0.0.0:9000"].into_iter().map(String::from)).unwrap();
-        let b = parse_cli(["--http", "0.0.0.0:9000"].into_iter().map(String::from)).unwrap();
+        let b = parse_cli(["--gateway=0.0.0.0:9000"].into_iter().map(String::from)).unwrap();
         assert_eq!(a.gateway, b.gateway);
     }
 
@@ -182,11 +178,10 @@ mod tests {
     }
 
     #[test]
-    fn gateway_bind_priority_flag_env_alias_default() {
-        // flag > env canonical > env alias > default
-        assert_eq!(resolve_gateway_bind(Some("A"), Some("G"), Some("H")), "A");
-        assert_eq!(resolve_gateway_bind(None, Some("G"), Some("H")), "G");
-        assert_eq!(resolve_gateway_bind(None, None, Some("H")), "H");
-        assert_eq!(resolve_gateway_bind(None, None, None), DEFAULT_GATEWAY_BIND);
+    fn gateway_bind_priority_flag_env_default() {
+        // flag > env > default
+        assert_eq!(resolve_gateway_bind(Some("A"), Some("G")), "A");
+        assert_eq!(resolve_gateway_bind(None, Some("G")), "G");
+        assert_eq!(resolve_gateway_bind(None, None), DEFAULT_GATEWAY_BIND);
     }
 }

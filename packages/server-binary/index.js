@@ -1,5 +1,5 @@
 // @dweb/server-binary：以子进程方式启动 dweb-server，提供可等待的停止方式。
-// gateway 命名（design D1）：gatewayBind 为 canonical，httpBind 为兼容别名；
+// gateway 命名（design D1）：gatewayBind 为 canonical；
 // 透传 DWEB_GATEWAY_BIND / DWEB_TRUST_PROXY 等环境变量。
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -23,7 +23,6 @@ if (!BINARY_NAME) {
 /**
  * @typedef {Object} StartServerOptions
  * @property {string} [gatewayBind] gateway（rendezvous/healthz/services.json）监听地址，默认 127.0.0.1:8787
- * @property {string} [httpBind]    gatewayBind 的兼容别名（同时给出时 gatewayBind 优先）
  * @property {string} [relayBind]   relay HTTP 监听地址，默认 127.0.0.1:3340
  * @property {boolean} [relayEnabled] 默认 true
  * @property {boolean} [trustProxy]  true 时向子进程设置 DWEB_TRUST_PROXY=1（采信 X-Forwarded-Proto）；
@@ -61,7 +60,7 @@ export async function startServer(options = {}) {
     }
   }
 
-  const gatewayBind = options.gatewayBind ?? options.httpBind ?? "127.0.0.1:8787";
+  const gatewayBind = options.gatewayBind ?? "127.0.0.1:8787";
   const relayBind = options.relayBind ?? "127.0.0.1:3340";
   const env = {
     ...process.env,

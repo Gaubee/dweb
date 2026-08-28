@@ -67,29 +67,6 @@ function rawRequest(port, reqPath, headers = {}) {
   });
 }
 
-test("resolveServerArgs: --gateway canonical equals --http alias", () => {
-  const canonical = resolveServerArgs(["--gateway", "10.0.0.1:9000"], {});
-  const alias = resolveServerArgs(["--http", "10.0.0.1:9000"], {});
-  assert.deepEqual(canonical, alias, "--http must be an exact alias of --gateway");
-  assert.equal(canonical.gatewayBind, "10.0.0.1:9000");
-  // --opt=value 双形式
-  assert.equal(resolveServerArgs(["--gateway=10.0.0.2:9100"], {}).gatewayBind, "10.0.0.2:9100");
-  assert.deepEqual(
-    resolveServerArgs(["--gateway=10.0.0.2:9100"], {}),
-    resolveServerArgs(["--gateway", "10.0.0.2:9100"], {}),
-  );
-});
-
-test("resolveServerArgs: precedence flag > env canonical > env alias > default", () => {
-  assert.equal(resolveServerArgs(["--gateway", "F", "--http", "X"], {}).gatewayBind, "F");
-  // 别名 flag 与 canonical flag 完全等价：同样按 flag 优先于 env
-  assert.equal(resolveServerArgs(["--http", "X"], { DWEB_GATEWAY_BIND: "G" }).gatewayBind, "X");
-  assert.equal(resolveServerArgs([], { DWEB_GATEWAY_BIND: "G", DWEB_HTTP_BIND: "H" }).gatewayBind, "G");
-  assert.equal(resolveServerArgs([], { DWEB_HTTP_BIND: "H" }).gatewayBind, "H");
-  assert.equal(resolveServerArgs([], {}).gatewayBind, "0.0.0.0:8787");
-  assert.equal(resolveServerArgs([], {}).relayBind, "0.0.0.0:3340");
-});
-
 test("resolveServerArgs: relay enable/disable and trustProxy", () => {
   assert.equal(resolveServerArgs([], {}).relayEnabled, true);
   assert.equal(resolveServerArgs(["--no-relay"], {}).relayEnabled, false);
@@ -291,4 +268,12 @@ test("opendweb server e2e: --http alias starts an identical gateway", async () =
     child.kill("SIGINT");
     await new Promise((resolve) => child.once("exit", resolve));
   }
+});
+
+test("resolveServerArgs: --http is now an unknown option", () => {
+  const { resolveServerArgs } = require("../bin/opendweb.mjs");
+  assert.throws(
+    () => resolveServerArgs(["server", "--http", "0.0.0.0:9999"]),
+    /unknown option --http/,
+  );
 });

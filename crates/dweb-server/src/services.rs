@@ -379,7 +379,7 @@ mod tests {
     /// 权威 fixture（Batch C0 冻结）：四组字段快照断言的数据源
     const FIXTURES: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../openspec/changes/connectivity-ux-hardening/contracts/services.fixtures.json"
+        "/../../openspec/changes/archive/2026-08-28-connectivity-ux-hardening/contracts/services.fixtures.json"
     ));
 
     #[derive(Debug, Deserialize)]

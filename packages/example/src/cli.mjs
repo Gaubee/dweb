@@ -501,7 +501,7 @@ async function main() {
 
       fabric.on((ev) => {
         if (ev.type === "message") {
-          console.log(`[${shortId(ev.from)}] ${asciiEscape(ev.data.toString("utf8"))}`);
+          console.log(`[${shortId(ev.from)}] ${ev.data.toString("utf8")}`);
         } else if (ev.type === "peer-connected") {
           console.log(`-- ${shortId(ev.endpointId)} connected (${ev.endpointId})`);
         } else if (ev.type === "peer-disconnected") {
@@ -547,7 +547,7 @@ async function main() {
                 .catch((e) => printErrorLine(`send to ${shortId(p.endpointId)}: ${e.message}`)),
             ),
           );
-          console.log(`[me] ${asciiEscape(text)}`);
+          console.log(`[me] ${text}`);
         })();
       });
       // chat stays in the foreground until Ctrl+C

@@ -2,7 +2,6 @@ export interface StartServerOptions {
   /** gateway（rendezvous/healthz/services.json）监听地址，默认 127.0.0.1:8787 */
   gatewayBind?: string;
   /** gatewayBind 的兼容别名（同时给出时 gatewayBind 优先） */
-  httpBind?: string;
   /** relay HTTP 监听地址，默认 127.0.0.1:3340 */
   relayBind?: string;
   /** 默认 true */
