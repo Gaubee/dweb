@@ -27,6 +27,9 @@ if (!BINARY_NAME) {
  * @property {boolean} [relayEnabled] 默认 true
  * @property {boolean} [trustProxy]  true 时向子进程设置 DWEB_TRUST_PROXY=1（采信 X-Forwarded-Proto）；
  *                                   false 时设为 "0"；缺省时继承父进程环境
+ * @property {string} [publicGatewayUrl] 公网 gateway 入口（反代/隧道后 services.json 的公告值）；
+ *                                   仅显式定义时写 DWEB_PUBLIC_GATEWAY_URL，缺省继承父进程环境
+ * @property {string} [publicRelayUrl]   公网 relay 入口；仅显式定义时写 DWEB_PUBLIC_RELAY_URL
  */
 
 /**
@@ -70,6 +73,13 @@ export async function startServer(options = {}) {
   };
   if (options.trustProxy !== undefined) {
     env.DWEB_TRUST_PROXY = options.trustProxy ? "1" : "0";
+  }
+  // 公网覆盖（public-exposure D5）：仅显式定义时写 env；undefined = 继承父进程环境
+  if (options.publicGatewayUrl !== undefined) {
+    env.DWEB_PUBLIC_GATEWAY_URL = options.publicGatewayUrl;
+  }
+  if (options.publicRelayUrl !== undefined) {
+    env.DWEB_PUBLIC_RELAY_URL = options.publicRelayUrl;
   }
 
   const child = spawn(binPath, [], { env, stdio: ["ignore", "pipe", "pipe"] });

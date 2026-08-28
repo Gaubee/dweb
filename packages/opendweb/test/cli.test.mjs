@@ -33,6 +33,17 @@ function freePort() {
   });
 }
 
+/**
+ * 等待子进程退出（竞态安全）：若 'exit' 事件已在我们挂监听器之前触发
+ * （子进程秒退场景，如 CLI 参数校验失败），exitCode/signalCode 已非 null，
+ * 直接返回而不是永远等待一个不会再来的事件。
+ * @param {import("node:child_process").ChildProcess} child
+ */
+function waitExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once("exit", resolve));
+}
+
 /** @param {string} url @param {number} [ms] */
 async function waitHealthy(url, ms = 30000) {
   const deadline = Date.now() + ms;
@@ -80,6 +91,56 @@ test("resolveServerArgs: relay enable/disable and trustProxy", () => {
 test("resolveServerArgs: unknown option and missing value errors", () => {
   assert.equal(resolveServerArgs(["--foo"], {}).error, "unknown option --foo");
   assert.equal(resolveServerArgs(["--gateway"], {}).error, "missing value for --gateway");
+  assert.equal(resolveServerArgs(["--public-gateway"], {}).error, "missing value for --public-gateway");
+  assert.equal(resolveServerArgs(["--public-relay"], {}).error, "missing value for --public-relay");
+});
+
+test("resolveServerArgs: public URL overrides (flag > env > null, trailing slash normalized)", () => {
+  const none = resolveServerArgs([], {});
+  assert.equal(none.publicGatewayUrl, null);
+  assert.equal(none.publicRelayUrl, null);
+
+  const fromEnv = resolveServerArgs([], {
+    DWEB_PUBLIC_GATEWAY_URL: "https://gw.example.com/",
+    DWEB_PUBLIC_RELAY_URL: "https://relay.example.com",
+  });
+  assert.equal(fromEnv.publicGatewayUrl, "https://gw.example.com");
+  assert.equal(fromEnv.publicRelayUrl, "https://relay.example.com");
+
+  const flag = resolveServerArgs(
+    ["--public-gateway", "https://flag-gw.example.com"],
+    { DWEB_PUBLIC_GATEWAY_URL: "https://env-gw.example.com" },
+  );
+  assert.equal(flag.publicGatewayUrl, "https://flag-gw.example.com");
+
+  const inline = resolveServerArgs(["--public-relay=https://r.example.com:443"], {});
+  assert.equal(inline.publicRelayUrl, "https://r.example.com:443");
+});
+
+test("resolveServerArgs: public URL validation mirrors server rules", () => {
+  // path 前缀（iroh set_path 会丢弃 path，必然错配）、query/fragment、
+  // 非 http(s)、userinfo、端口越界
+  for (const bad of [
+    "https://ex.com/dweb",
+    "https://ex.com/?a=b",
+    "https://ex.com/#frag",
+    "ftp://ex.com",
+    "https://user:pass@ex.com",
+    "https://ex.com:0",
+    "https://ex.com:65536",
+    "not a url",
+  ]) {
+    const r = resolveServerArgs(["--public-gateway", bad], {});
+    assert.ok(r.error, `--public-gateway ${bad} must be rejected`);
+    assert.match(r.error, /invalid public gateway url/, bad);
+  }
+  // 合法形态：括号 IPv6、带端口、尾随 "/"
+  const ok = resolveServerArgs(
+    ["--public-gateway", "http://[fd00::1]:9000", "--public-relay", "https://relay.example.com/"],
+    {},
+  );
+  assert.equal(ok.publicGatewayUrl, "http://[fd00::1]:9000");
+  assert.equal(ok.publicRelayUrl, "https://relay.example.com");
 });
 
 test("banner: all-ASCII, Local/Network enumeration, NAME | PORT service table", () => {
@@ -121,6 +182,36 @@ test("banner: placeholder line when no non-loopback IPv4 found", () => {
   assert.ok(banner.includes("disabled"));
   // 每个地址恰一行：占位行只出现一次
   assert.equal(banner.split("(no non-loopback IPv4 found)").length - 1, 1);
+});
+
+test("banner: Public section only when overrides set, guidance line switches", () => {
+  const base = {
+    version: "0.2.0",
+    gatewayBind: "0.0.0.0:8787",
+    relayBind: "0.0.0.0:3340",
+    relayEnabled: true,
+    ips: ["192.168.2.13"],
+  };
+  // 未设置：无 Public 节，指引仍是 Network 地址
+  const plain = buildBanner(base);
+  assert.ok(!plain.includes("Public"));
+  assert.ok(plain.includes("Use any Network address as the single config entry for clients."));
+
+  // 双覆盖：Public 节逐行列出，指引切换
+  const full = buildBanner({
+    ...base,
+    publicGatewayUrl: "https://gw.example.com",
+    publicRelayUrl: "https://relay.example.com",
+  });
+  assert.match(full, ASCII);
+  assert.ok(full.includes("  > Public:  gateway https://gw.example.com"));
+  assert.ok(full.includes("             relay   https://relay.example.com"));
+  assert.ok(full.includes("Use the Public URLs as the config entry for clients"));
+
+  // 仅 relay 覆盖：gateway 行不出现
+  const relayOnly = buildBanner({ ...base, publicRelayUrl: "https://relay.example.com" });
+  assert.ok(relayOnly.includes("  > Public:  relay   https://relay.example.com"));
+  assert.ok(!relayOnly.includes("gateway https://"));
 });
 
 test("banner: no duplicate Network lines for repeated interface addresses", () => {
@@ -241,11 +332,13 @@ test("opendweb server e2e: ASCII banner + /services.json + GET / (random ports)"
     assert.ok(root.body.includes(`http://127.0.0.1:${relayPort}`));
   } finally {
     child.kill("SIGINT");
-    await new Promise((resolve) => child.once("exit", resolve));
+    await waitExit(child);
   }
 });
 
 test("opendweb server e2e: --http alias starts an identical gateway", async () => {
+  // 154baf3 移除 --http 别名：该入口现在快速失败（退出码 2 + 错误消息），
+  // 而不是启动等价 gateway。断言跟随当前语义。
   const gatewayPort = await freePort();
   const relayPort = await freePort();
   const child = spawn(
@@ -255,25 +348,70 @@ test("opendweb server e2e: --http alias starts an identical gateway", async () =
   );
   let stdout = "";
   child.stdout.on("data", (d) => (stdout += d));
-  try {
-    await waitHealthy(`http://127.0.0.1:${gatewayPort}`);
-    assert.match(stdout, ASCII);
-    assert.ok(stdout.includes(`  > Local:   http://127.0.0.1:${gatewayPort}`));
-    const res = await rawRequest(gatewayPort, "/services.json", {
-      Host: `127.0.0.1:${gatewayPort}`,
-    });
-    const manifest = JSON.parse(res.body);
-    assert.equal(manifest.gateway, `http://127.0.0.1:${gatewayPort}`);
-  } finally {
-    child.kill("SIGINT");
-    await new Promise((resolve) => child.once("exit", resolve));
-  }
+  child.stderr.on("data", (d) => (stdout += d));
+  const code = await new Promise((resolve) => {
+    child.once("exit", (c) => resolve(c));
+  });
+  assert.equal(code, 2);
+  assert.match(stdout, /unknown option --http/);
 });
 
 test("resolveServerArgs: --http is now an unknown option", () => {
-  const { resolveServerArgs } = require("../bin/opendweb.mjs");
-  assert.throws(
-    () => resolveServerArgs(["server", "--http", "0.0.0.0:9999"]),
-    /unknown option --http/,
+  // ESM 直用顶部已导入的 resolveServerArgs（历史版本误用 require 导致
+  // ReferenceError 掩盖真实断言）
+  assert.equal(
+    resolveServerArgs(["--http", "0.0.0.0:9999"], {}).error,
+    "unknown option --http",
   );
+});
+
+test("opendweb server e2e: public URL overrides are advertised in /services.json", async () => {
+  const gatewayPort = await freePort();
+  const relayPort = await freePort();
+  const child = spawn(
+    NODE,
+    [
+      CLI, "server",
+      "--gateway", `127.0.0.1:${gatewayPort}`,
+      "--relay", `127.0.0.1:${relayPort}`,
+      "--public-gateway", "https://gw.example.com",
+      "--public-relay", "https://relay.example.com",
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stdout = "";
+  child.stdout.on("data", (d) => (stdout += d));
+  child.stderr.on("data", (d) => (stdout += d));
+  try {
+    await waitHealthy(`http://127.0.0.1:${gatewayPort}`);
+    // 横幅 Public 节（public-exposure D5）
+    assert.ok(stdout.includes("  > Public:  gateway https://gw.example.com"));
+    assert.ok(stdout.includes("             relay   https://relay.example.com"));
+    // manifest：覆盖值原样公告，Host 派生被跳过（D3）
+    const res = await rawRequest(gatewayPort, "/services.json", { Host: `127.0.0.1:${gatewayPort}` });
+    const manifest = JSON.parse(res.body);
+    assert.equal(manifest.gateway, "https://gw.example.com");
+    const byName = Object.fromEntries(manifest.services.map((s) => [s.name, s]));
+    assert.equal(byName.rendezvous.url, "https://gw.example.com/rendezvous");
+    assert.equal(byName.relay.url, "https://relay.example.com");
+    // GET / 摘要同样公告公网地址
+    const root = await rawRequest(gatewayPort, "/", { Host: `127.0.0.1:${gatewayPort}` });
+    assert.ok(root.body.includes("https://relay.example.com"));
+  } finally {
+    child.kill("SIGINT");
+    await waitExit(child);
+  }
+});
+
+test("opendweb server e2e: invalid public URL fails fast with exit code 2", async () => {
+  // path 前缀在 CLI 层即被拒（与 Rust validate_public_url 同规），子进程不启动
+  const code = await new Promise((resolve) => {
+    const child = spawn(
+      NODE,
+      [CLI, "server", "--public-gateway", "https://ex.com/dweb"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    child.on("exit", (c) => resolve(c));
+  });
+  assert.equal(code, 2);
 });

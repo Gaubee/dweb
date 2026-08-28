@@ -1,12 +1,16 @@
 //! gateway 服务清单：`GET /services.json`（机器可读）与 `GET /`（全 ASCII 人类可读摘要）。
-//! URL 派生规则（design D1）：
-//! - scheme 跟随请求；`X-Forwarded-Proto` 仅当 `DWEB_TRUST_PROXY=1` 时采信，否则一律 http；
+//! URL 派生规则（design D1 + public-exposure D3）：
+//! - 公网覆盖（public_gateway_url / public_relay_url，启动期已校验）按条目完全跳过
+//!   Host/scheme/回退派生——覆盖条目不产生 WARNING、不受 DWEB_TRUST_PROXY 影响；
+//! - 未覆盖条目：scheme 跟随请求；`X-Forwarded-Proto` 仅当 `DWEB_TRUST_PROXY=1` 时采信，
+//!   否则一律 http；
 //! - Host 拒绝集合冻结为：unspecified 地址（0.0.0.0、::、空 host）、含 userinfo 形态、
 //!   host:port 解析失败、端口 0 或 >65535；其余一律放行（含 loopback）；
 //! - 校验失败或无 Host 头时回退本机首个非 loopback IPv4；无回退时 url=null 并 WARNING
 //!   （精确串 `no non-loopback IPv4 available; URLs are null`），绝不产出 0.0.0.0 形态 URL；
+//!   两个条目均被覆盖时连 Host 校验/回退探测都不执行（覆盖独立于回退）；
 //! - 各服务条目使用实际监听端口；未知服务名静默忽略（前向兼容）；重复名取首个并 WARNING；
-//!   relay 条目 scheme 校验 http(s)，否则按禁用处理并 WARNING。
+//!   relay 条目 scheme 校验 http(s)（派生与覆盖同规），否则按禁用处理并 WARNING。
 
 use axum::{
     Json, Router,
@@ -44,6 +48,10 @@ pub struct ServiceInfo {
     pub trust_proxy: bool,
     /// Host 校验失败时的回退地址（本机首个非 loopback IPv4；与横幅同一枚举语义）
     pub fallback_ipv4: Option<Ipv4Addr>,
+    /// 公网 gateway 覆盖（启动期校验并归一化）；设置时 gateway/rendezvous 条目跳过派生
+    pub public_gateway_url: Option<String>,
+    /// 公网 relay 覆盖；设置且 relay 启用时 relay 条目跳过派生
+    pub public_relay_url: Option<String>,
 }
 
 /// manifest 服务条目（wire 字段顺序冻结：name, enabled, url；url 为 string | null）
@@ -108,9 +116,10 @@ fn host_from_header(value: &str) -> Result<String, ()> {
     // 注入形态拒绝（D1 冻结集合 + P1-6）：URL 结构字符、控制字符、空白。
     // 非 ASCII（国际化域名）不在注入向量内、按"其余放行"处理——
     // JSON manifest 为 UTF-8 原样、纯文本摘要层转义（见 summary_text）。
-    if value.bytes().any(|b| {
-        b == b'@' || b == b'/' || b == b'?' || b == b'#' || b <= 0x20 || b == 0x7f
-    }) {
+    if value
+        .bytes()
+        .any(|b| b == b'@' || b == b'/' || b == b'?' || b == b'#' || b <= 0x20 || b == 0x7f)
+    {
         return Err(());
     }
     if let Some(rest) = value.strip_prefix('[') {
@@ -148,11 +157,7 @@ fn validate_bracket_tail(tail: &str) -> Result<(), ()> {
 /// 端口校验：可解析为 u16（>65535 自然失败）且非 0
 fn validate_port(port: &str) -> Result<(), ()> {
     let port: u16 = port.parse().map_err(|_| ())?;
-    if port == 0 {
-        Err(())
-    } else {
-        Ok(())
-    }
+    if port == 0 { Err(()) } else { Ok(()) }
 }
 
 /// host 主机部分 -> URL 形态；unspecified 拒绝，域名放行
@@ -187,9 +192,16 @@ fn host_to_url_form(host: &str) -> Result<String, ()> {
 /// `X-Forwarded-Proto` 仅在 trust_proxy（DWEB_TRUST_PROXY=1）时采信（取首段，http/https 之外忽略）。
 fn request_scheme(info: &ServiceInfo, headers: &HeaderMap) -> String {
     if info.trust_proxy
-        && let Some(raw) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok())
+        && let Some(raw) = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
     {
-        let proto = raw.split(',').next().unwrap_or("").trim().to_ascii_lowercase();
+        let proto = raw
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if proto == "http" || proto == "https" {
             return proto;
         }
@@ -198,6 +210,8 @@ fn request_scheme(info: &ServiceInfo, headers: &HeaderMap) -> String {
 }
 
 /// 构造服务清单。返回 (manifest, 服务端 WARNING 列表)。
+/// 公网覆盖（public-exposure D3）：按条目独立——覆盖条目跳过 Host/scheme/回退派生；
+/// 仅当仍有条目需要派生时才执行 Host 校验与回退探测（覆盖独立于回退）。
 pub fn build_manifest(
     info: &ServiceInfo,
     scheme: &str,
@@ -205,28 +219,44 @@ pub fn build_manifest(
 ) -> (Manifest, Vec<String>) {
     let mut warnings = Vec::new();
 
+    // 是否仍需 Host 派生：gateway 未覆盖，或 relay 启用且未覆盖
+    let relay_needs_derived = info.relay_port.is_some() && info.public_relay_url.is_none();
+    let need_derived = info.public_gateway_url.is_none() || relay_needs_derived;
+
     // Host 派生；校验失败或缺失 -> 回退本机首个非 loopback IPv4 -> 无则全 null + WARNING
-    let base: Option<String> = match host_header.map(host_from_header) {
-        Some(Ok(host)) => Some(host),
-        Some(Err(())) | None => match info.fallback_ipv4 {
-            Some(ip) => Some(ip.to_string()),
-            None => {
-                warnings.push(NO_FALLBACK_WARNING.to_string());
-                None
-            }
-        },
+    let derived_base: Option<String> = if !need_derived {
+        None
+    } else {
+        match host_header.map(host_from_header) {
+            Some(Ok(host)) => Some(host),
+            Some(Err(())) | None => match info.fallback_ipv4 {
+                Some(ip) => Some(ip.to_string()),
+                None => {
+                    warnings.push(NO_FALLBACK_WARNING.to_string());
+                    None
+                }
+            },
+        }
     };
 
-    let gateway = base
-        .as_ref()
-        .map(|h| format!("{scheme}://{h}:{}", info.gateway_port));
+    // gateway / rendezvous：覆盖优先，rendezvous 为基址 + "/rendezvous" 字符串拼接
+    let gateway = match &info.public_gateway_url {
+        Some(url) => Some(url.clone()),
+        None => derived_base
+            .as_ref()
+            .map(|h| format!("{scheme}://{h}:{}", info.gateway_port)),
+    };
+    let rendezvous_url = match &info.public_gateway_url {
+        Some(url) => Some(format!("{url}/rendezvous")),
+        None => derived_base
+            .as_ref()
+            .map(|h| format!("{scheme}://{h}:{}{}", info.gateway_port, "/rendezvous")),
+    };
 
     let mut raw = vec![ServiceEntry {
         name: "rendezvous".into(),
         enabled: true,
-        url: base
-            .as_ref()
-            .map(|h| format!("{scheme}://{h}:{}{}", info.gateway_port, "/rendezvous")),
+        url: rendezvous_url,
     }];
     raw.push(match info.relay_port {
         None => ServiceEntry {
@@ -235,7 +265,25 @@ pub fn build_manifest(
             url: None,
         },
         Some(port) => {
-            if scheme != "http" && scheme != "https" {
+            // 覆盖优先（启动期已校验；前缀断言只是防御性兜底，不信任 ServiceInfo 构造者）
+            if let Some(url) = info.public_relay_url.as_ref() {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    ServiceEntry {
+                        name: "relay".into(),
+                        enabled: true,
+                        url: Some(url.clone()),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "relay url scheme must be http or https, got {url}; relay entry disabled"
+                    ));
+                    ServiceEntry {
+                        name: "relay".into(),
+                        enabled: false,
+                        url: None,
+                    }
+                }
+            } else if scheme != "http" && scheme != "https" {
                 warnings.push(format!(
                     "relay url scheme must be http or https, got {scheme}; relay entry disabled"
                 ));
@@ -245,10 +293,11 @@ pub fn build_manifest(
                     url: None,
                 }
             } else {
+                // 派生路径：enabled 恒 true，url 可为 null（无回退地址的冻结形态）
                 ServiceEntry {
                     name: "relay".into(),
                     enabled: true,
-                    url: base
+                    url: derived_base
                         .as_ref()
                         .map(|h| format!("{scheme}://{h}:{port}")),
                 }
@@ -376,10 +425,10 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    /// 权威 fixture（Batch C0 冻结）：四组字段快照断言的数据源
+    /// 权威 fixture（C0 冻结 + public-exposure 增补）：字段快照断言的数据源
     const FIXTURES: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../openspec/changes/archive/2026-08-28-connectivity-ux-hardening/contracts/services.fixtures.json"
+        "/../../openspec/changes/public-exposure/contracts/services.fixtures.json"
     ));
 
     #[derive(Debug, Deserialize)]
@@ -405,6 +454,8 @@ mod tests {
             relay_port: Some(3340),
             trust_proxy: false,
             fallback_ipv4: Some("192.168.2.13".parse().unwrap()),
+            public_gateway_url: None,
+            public_relay_url: None,
         }
     }
 
@@ -545,7 +596,10 @@ mod tests {
         // enabled 照实
         assert!(m.services.iter().all(|s| s.enabled));
         assert_eq!(w, vec![NO_FALLBACK_WARNING.to_string()]);
-        assert_eq!(w, vec!["no non-loopback IPv4 available; URLs are null".to_string()]);
+        assert_eq!(
+            w,
+            vec!["no non-loopback IPv4 available; URLs are null".to_string()]
+        );
     }
 
     #[test]
@@ -648,13 +702,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
-        assert!(res
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("text/plain"));
+        assert!(
+            res.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
         let body = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -672,7 +727,10 @@ mod tests {
         let relay = &m.services[1];
         assert!(!relay.enabled);
         assert!(relay.url.is_none());
-        assert!(w.iter().any(|x| x.starts_with("relay url scheme must be http or https")));
+        assert!(
+            w.iter()
+                .any(|x| x.starts_with("relay url scheme must be http or https"))
+        );
     }
 
     #[test]
@@ -710,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn fixtures_four_cases_snapshot() {
+    fn fixtures_all_cases_snapshot() {
         let fx = fixtures();
         let find = |name: &str| fx.cases.iter().find(|c| c.name == name).unwrap();
 
@@ -756,6 +814,102 @@ mod tests {
                 .clone()
                 .expect("dup case has server warnings")
         );
+
+        // public-urls：双覆盖，Host 派生完全跳过
+        let (m, w) = build_manifest(
+            &ServiceInfo {
+                public_gateway_url: Some("https://gw.example.com".into()),
+                public_relay_url: Some("https://relay.example.com".into()),
+                ..info_full()
+            },
+            "http",
+            Some("192.168.2.13:8787"),
+        );
+        assert_eq!(w, Vec::<String>::new());
+        assert_matches_fixture(&m, find("public-urls"));
+
+        // public-gateway-only：仅 gateway 覆盖，relay 继续本地派生
+        let (m, w) = build_manifest(
+            &ServiceInfo {
+                public_gateway_url: Some("https://dweb.example.com".into()),
+                ..info_full()
+            },
+            "http",
+            Some("192.168.2.13:8787"),
+        );
+        assert_eq!(w, Vec::<String>::new());
+        assert_matches_fixture(&m, find("public-gateway-only"));
+
+        // public-relay-only：仅 relay 覆盖，gateway/rendezvous 继续本地派生
+        let (m, w) = build_manifest(
+            &ServiceInfo {
+                public_relay_url: Some("https://relay.dweb.example.com".into()),
+                ..info_full()
+            },
+            "http",
+            Some("192.168.2.13:8787"),
+        );
+        assert_eq!(w, Vec::<String>::new());
+        assert_matches_fixture(&m, find("public-relay-only"));
+
+        // public-urls-no-fallback：Host 拒绝 + 无回退 + 双覆盖 -> 零 WARNING、URL 全可用
+        let (m, w) = build_manifest(
+            &ServiceInfo {
+                public_gateway_url: Some("https://gw.example.com".into()),
+                public_relay_url: Some("https://relay.example.com".into()),
+                ..info_no_fallback()
+            },
+            "http",
+            Some("0.0.0.0:8787"),
+        );
+        assert_eq!(w, Vec::<String>::new());
+        assert_matches_fixture(&m, find("public-urls-no-fallback"));
+    }
+
+    #[test]
+    fn public_relay_override_ignored_when_relay_disabled() {
+        // relay 禁用是更强的用户意图：覆盖被忽略且无告警（D3）
+        let info = ServiceInfo {
+            public_relay_url: Some("https://relay.example.com".into()),
+            ..info_no_relay()
+        };
+        let (m, w) = build_manifest(&info, "http", Some("192.168.2.13:8787"));
+        let relay = &m.services[1];
+        assert!(!relay.enabled);
+        assert!(relay.url.is_none());
+        assert_eq!(w, Vec::<String>::new());
+    }
+
+    #[test]
+    fn public_relay_override_defensive_scheme_guard() {
+        // 绕过启动校验直接构造的非法 scheme（防御性兜底）：按禁用处理 + WARNING
+        let info = ServiceInfo {
+            public_relay_url: Some("ftp://relay.example.com".into()),
+            ..info_full()
+        };
+        let (m, w) = build_manifest(&info, "http", Some("192.168.2.13:8787"));
+        let relay = &m.services[1];
+        assert!(!relay.enabled);
+        assert!(relay.url.is_none());
+        assert!(
+            w.iter()
+                .any(|x| x.starts_with("relay url scheme must be http or https"))
+        );
+    }
+
+    #[test]
+    fn public_gateway_override_with_derived_relay_needs_host() {
+        // gateway 覆盖 + relay 派生：Host 校验仍执行（relay 依赖它），且互不污染
+        let info = ServiceInfo {
+            public_gateway_url: Some("https://dweb.example.com".into()),
+            ..info_no_fallback()
+        };
+        let (m, w) = build_manifest(&info, "http", Some("0.0.0.0:8787"));
+        assert_eq!(m.gateway.as_deref(), Some("https://dweb.example.com"));
+        // relay 派生失败：无回退 -> WARNING + url null（enabled 照实）
+        assert_eq!(m.services[1].enabled, true);
+        assert_eq!(m.services[1].url, None);
+        assert_eq!(w, vec![NO_FALLBACK_WARNING.to_string()]);
     }
 
     #[test]

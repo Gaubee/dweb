@@ -116,7 +116,46 @@ DWEB_PUBLIC_RELAY_URL     完整 URL，如 https://relay.dweb.example.com
 
 ---
 
-## 6. 建议的推进顺序
+## 6. 通用性与「垄断」讨论（2026-08-29，与 Owner 的架构对齐）
+
+### 6.1 供应商分类学：三层方案覆盖「纯流量」类，不覆盖 worker 类
+
+```text
+                    供应商提供什么计算？
+                    ┌ 无计算（纯流量入口）────────────┬ 受限计算（worker runtime）─────────┐
+                    │ CF Tunnel / ngrok / frp /       │ CF Workers+DO / Deno Deploy /      │
+                    │ tailscale funnel / SSH -R /     │ Fastly Compute / Vercel Edge       │
+                    │ VPS+Caddy（云 docker 场景标配） │                                     │
+                    ├─────────────────────────────────┼─────────────────────────────────────┤
+  L0/L1/L2 覆盖？   │ ✅ 全覆盖；L1 是通用性支点       │ ❌ 不覆盖——这不是「穿透」，          │
+                    │ （origin 保持原生 HTTP+URL覆盖），│ 是服务端移植（潜在的 L3 层）         │
+                    │ 换供应商 = 换 L0/L2 胶水         │                                     │
+```
+
+- L1（`DWEB_PUBLIC_*_URL`）保持厂商中立：它是「任意反代」的通用修复，云 docker + Caddy/TLS 场景同样必需（F6 与 CF 无关）。
+- worker 类平台的组件可行性：gateway（rendezvous/services.json）可移植但每家需独立 adapter（无可移植标准，WinterCG 未覆盖有状态 WS 路由）；relay 需长连 WS + 跨请求状态 + 服务端推送——Fastly Compute 仅 passthrough 且 WS 试用需联系销售（2024-12 起政策），Vercel/Netlify 不支持 WS server，仅 CF DO 产品化、Deno Deploy 可用 KV `.watch()` 硬做；且任何一家都意味着重写 iroh relay 协议服务端并永久追版本。
+
+### 6.2 垄断判定：机制不垄断，「免费打包」独此一家
+
+- 机制层零垄断：反向隧道是老技术（`ssh -R` 原型），开源实现齐全（frp/rathole/bore），ngrok 商业成熟；dweb 服务端纯 HTTP/WS，无任何 CF 协议依赖。
+- 零价格整套（anycast 边缘 + 免费 TLS + 稳定自定义域名 + 隧道 + WS + 不计流量）目前独此一家——商业策略导流 Zero Trust，非技术护城河。真正的独有原语是 Durable Objects（有状态边缘 WS 协调）。
+- 个人使用不需要全球边缘：一台 VPS + frp + Caddy 功能等价且大陆延迟更优——CF 边缘壁垒对我们是无关变量，故 L0 锁定风险低。
+
+### 6.3 锁定深度分层（Owner 认可专项适配，分界画在 L2/L3 之间）
+
+```text
+L0  Tunnel 流量入口           浅（无状态胶水）      换一个 compose 文件        ✅ 做，CF 专项
+L2  CLI 深度集成 cloudflared   中（UX 代码）         重写 spawn/探测/横幅       ✅ 做，CF 专项
+L3  gateway 移植 Workers       深（runtime adapter） 每家重写 adapter           ⏸ 可选赌注（零主机故事）
+L4  relay 协议重写上 DO        极深（绑死 DO 语义    放弃 iroh 上游、协议分叉   ❌ 不做
+                                +脱离官方实现）
+```
+
+结论：CF 不垄断技术，只垄断「免费打包」；可移植性锚在 origin 原生 HTTP + L1，专项适配留给最浅的胶水层——它送多少拿多少，它变脸换一个文件就走。
+
+---
+
+## 7. 建议的推进顺序
 
 1. **OpenSpec change**：`cf-tunnel-exposure`（或并入更名的 `reverse-proxy-public-urls`）——L1 的 public URL 覆盖 + fixtures 演进；
 2. **L0 部署物**：`docker/compose.yaml`（dweb + cloudflared sidecar）+ README 部署章节（named tunnel 步骤、单/双域名两种拓扑）；

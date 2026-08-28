@@ -3,7 +3,9 @@
 // services.json；另起 iroh relay）。用户面输出全 ASCII（design D1/D10）：横幅/帮助/错误均为英文。
 // 用法：
 //   opendweb server [--gateway <bind>] [--relay <bind>] [--no-relay] [--trust-proxy]
-//   环境变量 DWEB_GATEWAY_BIND 同义。
+//                   [--public-gateway <url>] [--public-relay <url>]
+//   环境变量 DWEB_GATEWAY_BIND 同义；DWEB_PUBLIC_GATEWAY_URL / DWEB_PUBLIC_RELAY_URL
+//   为反代/隧道部署的公网入口公告（public-exposure）。
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
@@ -66,17 +68,41 @@ export function splitBind(bind) {
 }
 
 /**
+ * 公网 URL 轻量校验（public-exposure D2，与 Rust 侧 validate_public_url 同规）：
+ * `http(s)://host[:port]`，拒绝 path（尾随单个 "/" 先归一化剥除）、query、fragment、
+ * userinfo。返回 null = 合法，否则错误消息。
+ * @param {string} value
+ * @param {string} label
+ * @returns {string | null}
+ */
+export function validatePublicUrl(value, label) {
+  const raw = String(value);
+  const v = raw.endsWith("/") ? raw.slice(0, -1) : raw;
+  // host 字符集排除 ':' —— 否则贪婪匹配会吞掉端口段绕过端口校验（如 ex.com:0）
+  const m = /^(https?):\/\/(\[[^\]]+\]|[^/?#@:]+)(?::(\d+))?$/.exec(v);
+  if (!m) {
+    return `invalid ${label}: ${raw} (expected http(s)://host[:port], no path/query/fragment)`;
+  }
+  const port = m[3];
+  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) {
+    return `invalid ${label}: ${raw} (port must be 1-65535)`;
+  }
+  return null;
+}
+
+/**
  * 解析 server 子命令参数。--gateway 为 canonical，--http 为兼容别名（完全等价）；
  * 支持 "--opt value" 与 "--opt=value" 双形式；未知选项报错（调用方以退出码 2 处理）。
- * 优先级 flag > env > default（DWEB_GATEWAY_BIND）。
+ * 优先级 flag > env > default（DWEB_GATEWAY_BIND）；公网 URL 覆盖同规
+ * （--public-gateway/--public-relay > DWEB_PUBLIC_GATEWAY_URL/DWEB_PUBLIC_RELAY_URL）。
  * @param {string[]} argv process.argv.slice(3)（"server" 之后）
  * @param {Record<string, string|undefined>} [env]
- * @returns {{ gatewayBind: string, relayBind: string, relayEnabled: boolean, trustProxy: boolean } | { error: string }}
+ * @returns {{ gatewayBind: string, relayBind: string, relayEnabled: boolean, trustProxy: boolean, publicGatewayUrl: string | null, publicRelayUrl: string | null } | { error: string }}
  */
 export function resolveServerArgs(argv, env = process.env) {
   /** @type {Record<string, string|boolean|undefined>} */
   const opts = {};
-  const VALUE_OPTS = new Set(["--gateway", "--relay"]);
+  const VALUE_OPTS = new Set(["--gateway", "--relay", "--public-gateway", "--public-relay"]);
   const FLAG_OPTS = new Set(["--no-relay", "--trust-proxy"]);
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -103,14 +129,33 @@ export function resolveServerArgs(argv, env = process.env) {
   const relayEnvOff = ["false", "0", "off"].includes(env.DWEB_RELAY_ENABLED ?? "true");
   const relayEnabled = !opts["--no-relay"] && !relayEnvOff;
   const trustProxy = Boolean(opts["--trust-proxy"]) || env.DWEB_TRUST_PROXY === "1";
-  return { gatewayBind, relayBind, relayEnabled, trustProxy };
+  const normalize = (v) => (v.endsWith("/") ? v.slice(0, -1) : v);
+  const rawPublicGateway = opts["--public-gateway"] ?? env.DWEB_PUBLIC_GATEWAY_URL ?? null;
+  const rawPublicRelay = opts["--public-relay"] ?? env.DWEB_PUBLIC_RELAY_URL ?? null;
+  if (rawPublicGateway !== null) {
+    const err = validatePublicUrl(rawPublicGateway, "public gateway url");
+    if (err) return { error: err };
+  }
+  if (rawPublicRelay !== null) {
+    const err = validatePublicUrl(rawPublicRelay, "public relay url");
+    if (err) return { error: err };
+  }
+  return {
+    gatewayBind,
+    relayBind,
+    relayEnabled,
+    trustProxy,
+    publicGatewayUrl: rawPublicGateway === null ? null : normalize(rawPublicGateway),
+    publicRelayUrl: rawPublicRelay === null ? null : normalize(rawPublicRelay),
+  };
 }
 
 /**
- * vite 风格启动横幅（全 ASCII，码位 < 128；design D1）。
- * @param {{ version: string, gatewayBind: string, relayBind: string, relayEnabled: boolean, ips: string[] }} input
+ * vite 风格启动横幅（全 ASCII，码位 < 128；design D1）。设置公网覆盖时
+ * 追加 Public 节（public-exposure D5/D6），并把配置入口指引切换为公网地址。
+ * @param {{ version: string, gatewayBind: string, relayBind: string, relayEnabled: boolean, ips: string[], publicGatewayUrl?: string | null, publicRelayUrl?: string | null }} input
  */
-export function buildBanner({ version, gatewayBind, relayBind, relayEnabled, ips }) {
+export function buildBanner({ version, gatewayBind, relayBind, relayEnabled, ips, publicGatewayUrl = null, publicRelayUrl = null }) {
   const { host, port } = splitBind(gatewayBind);
   const relay = splitBind(relayBind);
   const unspecified = host === "0.0.0.0" || host === "::" || host === "";
@@ -132,8 +177,23 @@ export function buildBanner({ version, gatewayBind, relayBind, relayEnabled, ips
       lines.push(`             http://${asciiEscape(ip)}:${asciiEscape(portText)}`);
     }
   }
+  // Public 节：反代/隧道部署下这才是跨网客户端的配置入口（未设置的条目不出现）
+  if (publicGatewayUrl !== null || publicRelayUrl !== null) {
+    if (publicGatewayUrl !== null) {
+      lines.push(`  > Public:  gateway ${asciiEscape(publicGatewayUrl)}`);
+    }
+    if (publicRelayUrl !== null) {
+      const prefix = publicGatewayUrl === null ? "  > Public:  " : "             ";
+      lines.push(`${prefix}relay   ${asciiEscape(publicRelayUrl)}`);
+    }
+  }
   lines.push("");
-  lines.push("  Use any Network address as the single config entry for clients.");
+  if (publicGatewayUrl !== null || publicRelayUrl !== null) {
+    lines.push("  Use the Public URLs as the config entry for clients (Network");
+    lines.push("  addresses above still work on the local network).");
+  } else {
+    lines.push("  Use any Network address as the single config entry for clients.");
+  }
   lines.push("");
   const rows = [
     ["gateway", portText, "entry point"],
@@ -166,6 +226,8 @@ async function main() {
       relayBind: resolved.relayBind,
       relayEnabled: resolved.relayEnabled,
       trustProxy: resolved.trustProxy,
+      publicGatewayUrl: resolved.publicGatewayUrl ?? undefined,
+      publicRelayUrl: resolved.publicRelayUrl ?? undefined,
     });
     console.log(
       buildBanner({
@@ -174,6 +236,8 @@ async function main() {
         relayBind: resolved.relayBind,
         relayEnabled: resolved.relayEnabled,
         ips: networkIPv4s(),
+        publicGatewayUrl: resolved.publicGatewayUrl,
+        publicRelayUrl: resolved.publicRelayUrl,
       }),
     );
     const shutdown = () => {
@@ -189,15 +253,23 @@ async function main() {
 
 Usage:
   opendweb server [--gateway <bind>] [--relay <bind>] [--no-relay] [--trust-proxy]
+                   [--public-gateway <url>] [--public-relay <url>]
       Start the self-hosted server. The gateway (default 0.0.0.0:8787) serves
       rendezvous + /healthz + /services.json; the iroh relay (default
       0.0.0.0:3340) runs on its own port. --http is a legacy alias of --gateway.
 
+      --public-gateway / --public-relay declare the public entry URLs when
+      running behind a reverse proxy or tunnel (e.g. Cloudflare Tunnel): the
+      service manifest advertises these instead of deriving host/port from
+      the request. Form: http(s)://host[:port], no path.
+
 Environment:
-  DWEB_GATEWAY_BIND    gateway listen address
-  DWEB_RELAY_HTTP_BIND relay listen address
-  DWEB_RELAY_ENABLED   set to false/0/off to disable the relay
-  DWEB_TRUST_PROXY     set to 1 to trust X-Forwarded-Proto behind a reverse proxy
+  DWEB_GATEWAY_BIND         gateway listen address
+  DWEB_RELAY_HTTP_BIND      relay listen address
+  DWEB_RELAY_ENABLED        set to false/0/off to disable the relay
+  DWEB_TRUST_PROXY          set to 1 to trust X-Forwarded-Proto behind a reverse proxy
+  DWEB_PUBLIC_GATEWAY_URL   public gateway URL override (see --public-gateway)
+  DWEB_PUBLIC_RELAY_URL     public relay URL override (see --public-relay)
 
 Clients need a single config entry: pick any Network address from the startup
 banner (e.g. http://192.168.2.13:8787). The gateway exposes the

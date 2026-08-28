@@ -1,0 +1,47 @@
+# public-exposure L0：dweb + cloudflared（Cloudflare Tunnel）sidecar 编排参考。
+# 中立层（public URL 覆盖）对任意反代/隧道通用；本文件是 CF 参考实现。
+#
+# 一次性准备：
+#   1. 域名托管到 Cloudflare（免费版即可）
+#   2. Zero Trust 面板 -> Networks -> Tunnels -> Create a tunnel (cloudflared)，
+#      复制 TUNNEL_TOKEN
+#   3. 在隧道 Public Hostname 页把流量指回 compose 内的 dweb 服务（两种拓扑）：
+#
+# 单域名拓扑（推荐，一个主机名一条证书；iroh 客户端自行拼 /relay 路径）：
+#   dweb.example.com   path: ^/relay.*   -> http://dweb:3340
+#   dweb.example.com   path: ^/ping.*    -> http://dweb:3340
+#   dweb.example.com   其余              -> http://dweb:8787
+#   （此时两个 DWEB_PUBLIC_*_URL 填同一个 https://dweb.example.com）
+#
+# 双主机名拓扑：
+#   gw.dweb.example.com    -> http://dweb:8787
+#   relay.dweb.example.com -> http://dweb:3340
+#
+# 客户端唯一配置入口（任意网络的设备）：
+#   node packages/example/src/cli.mjs config set relay https://dweb.example.com
+#
+# 注意：本编排不向宿主发布任何端口（无 ports:，仅 expose:）——
+# 暴露面完全收敛到隧道；本机 LAN 直连请单独发布 8787/3340。
+
+services:
+  dweb:
+    image: ghcr.io/gaubee/dweb
+    restart: unless-stopped
+    environment:
+      # 反代/隧道后的公网入口公告（services.json 与横幅同源）
+      DWEB_PUBLIC_GATEWAY_URL: ${DWEB_PUBLIC_GATEWAY_URL:?set to your public gateway URL, e.g. https://dweb.example.com}
+      DWEB_PUBLIC_RELAY_URL: ${DWEB_PUBLIC_RELAY_URL:?set to your public relay URL (same host for single-domain topology)}
+      # 派生条目（未覆盖时）采信 X-Forwarded-Proto；覆盖条目不受影响
+      DWEB_TRUST_PROXY: "1"
+    expose:
+      - "8787"
+      - "3340"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?create a cloudflared tunnel in the Cloudflare Zero Trust dashboard}
+    depends_on:
+      - dweb

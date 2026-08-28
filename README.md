@@ -73,6 +73,37 @@ docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
 | `DWEB_RELAY_HTTP_BIND` | `0.0.0.0:3340` | relay 监听 |
 | `DWEB_RELAY_ENABLED` | `true` | `false`/`0`/`off` 关闭 relay |
 | `DWEB_TRUST_PROXY` | 未设 | 反代 TLS 终结时设 `1` 才采信 `X-Forwarded-Proto` |
+| `DWEB_PUBLIC_GATEWAY_URL` | 未设 | 反代/隧道后的公网 gateway 入口（如 `https://dweb.example.com`）；设置后 services.json/横幅按条目公告该值 |
+| `DWEB_PUBLIC_RELAY_URL` | 未设 | 公网 relay 入口；与 gateway 覆盖相互独立（flag `--public-gateway`/`--public-relay` 同义） |
+
+## 无公网 IP 部署：反向代理 / 隧道（厂商中立，以 Cloudflare Tunnel 为参考）
+
+家用主机无公网 IP 时，任意「终结 TLS、回源 HTTP/WS」的 front-end 都可用
+（Cloudflare Tunnel、ngrok、frp、Caddy on VPS……）。要点只有两条：
+
+1. **公网入口公告**：设置 `DWEB_PUBLIC_GATEWAY_URL` / `DWEB_PUBLIC_RELAY_URL`
+   （URL 形态 `http(s)://host[:port]`，不允许 path——iroh 客户端会丢弃 relay
+   URL 的 path），gateway 与 relay 条目按需独立覆盖；
+2. **回源保持 HTTP/WS**：服务端明文监听即可，TLS 由 front-end 终结
+   （`DWEB_TRUST_PROXY=1` 时派生条目采信 `X-Forwarded-Proto`）。
+
+Cloudflare Tunnel 参考（免费版即可；域名需托管在 CF）：
+
+```bash
+# Zero Trust 面板 -> Networks -> Tunnels 建隧道拿 TUNNEL_TOKEN，
+# Public Hostname 按单域名路径分流：/relay*、/ping* -> http://dweb:3340，
+# 其余 -> http://dweb:8787（iroh 客户端自行拼 /relay 路径，单域名即可工作）
+cd docker && TUNNEL_TOKEN=... \
+  DWEB_PUBLIC_GATEWAY_URL=https://dweb.example.com \
+  DWEB_PUBLIC_RELAY_URL=https://dweb.example.com \
+  docker compose up -d
+# 不发布任何宿主端口（纯隧道暴露）；客户端（任意网络）：
+#   config set relay https://dweb.example.com
+```
+
+直连打洞不经过隧道（iroh QUIC peer↔peer）；隧道只承载 rendezvous/services.json
+短请求与打洞失败时的 relay 回退流量（WS，iroh 15s ping 保活穿透 CF 100s 空闲超时）。
+调研与风险（大陆延迟实测、ToS 边界）见 `docs/research-cf-tunnel.md`。
 
 ## SDK（Node，darwin-arm64）
 

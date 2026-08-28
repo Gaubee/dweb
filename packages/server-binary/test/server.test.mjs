@@ -186,3 +186,38 @@ test("httpBind is ignored (use gatewayBind)", async () => {
   assert.ok(srv.gatewayUrl.includes("8787"), "default gateway port, not 19876");
   await srv.stop();
 });
+
+test("publicGatewayUrl/publicRelayUrl options advertise overrides in services.json", async () => {
+  const port = await freePort();
+  const relayPort = await freePort();
+  const server = await startServer({
+    gatewayBind: `127.0.0.1:${port}`,
+    relayBind: `127.0.0.1:${relayPort}`,
+    publicGatewayUrl: "https://gw.example.com",
+    publicRelayUrl: "https://relay.example.com",
+  });
+  try {
+    await waitHealthy(server.gatewayUrl);
+    // 覆盖值原样公告：Host 派生被跳过（public-exposure D3）
+    const res = await rawRequest(port, "/services.json", { Host: `127.0.0.1:${port}` });
+    const manifest = JSON.parse(res.body);
+    assert.equal(manifest.gateway, "https://gw.example.com");
+    const byName = Object.fromEntries(manifest.services.map((s) => [s.name, s]));
+    assert.equal(byName.rendezvous.url, "https://gw.example.com/rendezvous");
+    assert.equal(byName.relay.enabled, true);
+    assert.equal(byName.relay.url, "https://relay.example.com");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("invalid public URL makes the child exit non-zero (fail-fast, exit code 2)", async () => {
+  const server = await startServer({
+    gatewayBind: `127.0.0.1:${await freePort()}`,
+    relayBind: `127.0.0.1:${await freePort()}`,
+    // 绕过 CLI 层校验直达二进制：path 前缀必须被启动期拒绝（D2）
+    publicRelayUrl: "https://ex.com/dweb",
+  });
+  const code = await server.exited;
+  assert.equal(code, 2);
+});
