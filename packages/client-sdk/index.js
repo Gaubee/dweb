@@ -60,7 +60,12 @@ Native.Fabric.prototype.on = function onWrapped(callback) {
     }
     callback(ev);
   });
-  return () => nativeOff.call(this, id);
+  // off feature-detect（旧二进制无 off 方法时取消函数为 no-op，不 throw）
+  return () => {
+    if (typeof nativeOff === "function") {
+      nativeOff.call(this, id);
+    }
+  };
 };
 
 /**
