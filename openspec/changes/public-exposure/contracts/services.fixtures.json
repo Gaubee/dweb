@@ -1,0 +1,217 @@
+{
+  "cases": [
+    {
+      "name": "canonical",
+      "note": "标准全启用形态；字段名与结构冻结，host/port/version 为占位（承接 2026-08-28 connectivity-ux-hardening，原样冻结）",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "http://192.168.2.13:8787",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "http://192.168.2.13:8787/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "http://192.168.2.13:3340"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "http://192.168.2.13:3340"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": []
+    },
+    {
+      "name": "relay-disabled",
+      "note": "--no-relay 启动（承接，原样冻结）",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "http://192.168.2.13:8787",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "http://192.168.2.13:8787/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": false,
+            "url": null
+          }
+        ]
+      },
+      "expectedClientRelays": [],
+      "expectedClientWarning": "gateway reports relay disabled",
+      "expectedServerWarnings": []
+    },
+    {
+      "name": "nullable-url",
+      "note": "enabled:true 但无可用回退地址（无非 loopback IPv4）——客户端视同禁用（承接，原样冻结）",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": null,
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": null
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": null
+          }
+        ]
+      },
+      "expectedClientRelays": [],
+      "expectedClientWarning": "no reachable url",
+      "expectedServerWarnings": [
+        "no non-loopback IPv4 available; URLs are null"
+      ]
+    },
+    {
+      "name": "unknown-and-duplicate",
+      "note": "前向兼容与重复名规则：未知名静默忽略（无 WARNING）；重复名取首个并输出一条服务端 WARNING（承接，原样冻结）",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "http://192.168.2.13:8787",
+        "services": [
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "http://192.168.2.13:3340"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "http://192.168.2.13:9999"
+          },
+          {
+            "name": "future-service",
+            "enabled": true,
+            "url": "http://192.168.2.13:9998"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "http://192.168.2.13:3340"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": [
+        "duplicate service name: relay"
+      ]
+    },
+    {
+      "name": "public-urls",
+      "note": "双公网覆盖：全部条目跳过 Host/scheme/回退派生，覆盖值原样生效",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "https://gw.example.com",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "https://gw.example.com/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "https://relay.example.com"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "https://relay.example.com"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": []
+    },
+    {
+      "name": "public-gateway-only",
+      "note": "仅覆盖 gateway：relay 条目继续 Host 派生（本地端口语义不变）",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "https://dweb.example.com",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "https://dweb.example.com/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "http://192.168.2.13:3340"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "http://192.168.2.13:3340"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": []
+    },
+    {
+      "name": "public-relay-only",
+      "note": "仅覆盖 relay：gateway/rendezvous 条目继续 Host 派生",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "http://192.168.2.13:8787",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "http://192.168.2.13:8787/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "https://relay.dweb.example.com"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "https://relay.dweb.example.com"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": []
+    },
+    {
+      "name": "public-urls-no-fallback",
+      "note": "双覆盖 + Host 拒绝 + 无回退地址：覆盖条目不受回退探测影响，零 WARNING",
+      "manifest": {
+        "server": "opendweb",
+        "version": "0.2.0",
+        "gateway": "https://gw.example.com",
+        "services": [
+          {
+            "name": "rendezvous",
+            "enabled": true,
+            "url": "https://gw.example.com/rendezvous"
+          },
+          {
+            "name": "relay",
+            "enabled": true,
+            "url": "https://relay.example.com"
+          }
+        ]
+      },
+      "expectedClientRelays": [
+        "https://relay.example.com"
+      ],
+      "expectedClientWarning": null,
+      "expectedServerWarnings": []
+    }
+  ]
+}
