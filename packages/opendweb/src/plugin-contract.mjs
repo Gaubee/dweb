@@ -88,7 +88,7 @@ export function parseCommandArgs(spec, argv) {
 /**
  * 插件命令执行包装器：错误归一化、ASCII 纪律、退出码映射（design D3）。
  * run 收 { command, args, log, cwd }；返回 { exit?: number } 可指定退出码。
- * @param {{ manifest: { name: string, run: Function, commands: Array<import("zod").infer<typeof CommandSpecSchema>> }, command: string, argv: string[], cwd: string, stdout?: NodeJS.WriteStream, stderr?: NodeJS.WriteStream }} input
+ * @param {{ manifest: { name: string, run: (input: { command: string, args: Record<string, unknown>, log: (line: string) => void, cwd: string }) => Promise<{ exit?: number } | void> }, commands: Array<import("zod").infer<typeof CommandSpecSchema>> }, command: string, argv: string[], cwd: string, stdout?: NodeJS.WriteStream, stderr?: NodeJS.WriteStream }} input
  * @returns {Promise<number>} 进程退出码
  */
 export async function dispatchPluginCommand({ manifest, command, argv, cwd, stdout = process.stdout, stderr = process.stderr }) {

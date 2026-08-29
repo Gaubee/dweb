@@ -87,27 +87,43 @@ export function findPackageRoot(entry) {
 
 /**
  * 安装后读取包真实版本（安装成功的实证，也用于锁定展示；exports 安全）。
- * R2-M1：合法包可以只暴露 `./opendweb-plugin`（无 "." 根导出）——先试包根
- * 入口，不可解析则回退插件的 ./opendweb-plugin 入口，再从入口向上找包根。
- * 同时校验 package.json 的 name 与请求包一致（防解析锚定到别的包）。
+ * - R2-M1：合法包可以只暴露 `./opendweb-plugin`（无 "." 根导出）——先试包根
+ *   入口，不可解析则回退插件的 ./opendweb-plugin 入口，再从入口向上找包根。
+ * - R3：resolver 有同进程负缓存/IO 可见性竞态（安装后立即解析间歇性
+ *   MODULE_NOT_FOUND）——两条入口都解析失败时，fs 直读标准安装布局
+ *   `node_modules/<pkg>/package.json` 兜底（pnpm 符号链接路径同样成立）。
+ * - 包名必须与请求一致（R3-Minor：缺失 name 也拒绝）。
  * @param {string} pkg
  * @param {string} cwd
  * @returns {{ version: string, path: string }}
  */
 export function readInstalledVersion(pkg, cwd) {
   const req = createRequire(path.join(cwd, "package.json"));
-  let entry;
+  let entry = null;
+  let resolveErr = null;
   try {
     entry = req.resolve(pkg); // exports["."]（或无 exports 的 main）
-  } catch {
-    entry = req.resolve(`${pkg}/opendweb-plugin`); // exports-only 包
+  } catch (e) {
+    try {
+      entry = req.resolve(`${pkg}/opendweb-plugin`); // exports-only 包
+    } catch (e2) {
+      resolveErr = e2;
+    }
   }
-  const pkgDir = findPackageRoot(entry);
-  const pkgJsonPath = path.join(pkgDir, "package.json");
+  let pkgJsonPath;
+  if (entry !== null) {
+    pkgJsonPath = path.join(findPackageRoot(entry), "package.json");
+  } else {
+    pkgJsonPath = path.join(cwd, "node_modules", ...pkg.split("/"), "package.json");
+    if (!nodeExistsSync(pkgJsonPath)) {
+      const detail = resolveErr?.code ?? resolveErr?.message ?? String(resolveErr);
+      throw new CliExit(`plugin installed but not resolvable (${pkg}): ${detail}`, 1);
+    }
+  }
   const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
-  if (typeof pkgJson.name === "string" && pkgJson.name !== pkg) {
+  if (pkgJson.name !== pkg) {
     throw new CliExit(
-      `resolved entry for ${pkg} belongs to package ${pkgJson.name} (${pkgJsonPath})`,
+      `resolved package for ${pkg} declares name ${JSON.stringify(pkgJson.name)} (${pkgJsonPath})`,
       1,
     );
   }

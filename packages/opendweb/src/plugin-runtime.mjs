@@ -288,6 +288,13 @@ async function declareLocalPlugin({ file, exec, which }) {
   return { name: declared.name, hooks: declared.hooks, cmd, args };
 }
 
+/** 严格 plain object 判定（Object.prototype 或 null 原型；拒 Date/Map 等） */
+function isPlainObject(v) {
+  if (v === null || typeof v !== "object") return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
 /**
  * 生命周期编排（server 命令内嵌）：
  * - preStart：收集覆写片段并合并（后到者覆盖，值经调用方校验），失败阻断
@@ -309,14 +316,13 @@ export async function fireHook({ plugins, hook, payload, stderr = process.stderr
     }
     const result = r.result;
     if (result === undefined || result === null) continue;
-    // R2-Minor：钩子返回值只接受 object/null——字符串等非法形态按该插件
-    // 失败处理（不静默忽略，否则覆写片段丢失无从发现）
-    if (typeof result !== "object" || Array.isArray(result)) {
-      failures.push({ name: p.name, error: `hook result must be an object or null (got ${Array.isArray(result) ? "array" : typeof result})` });
+    // R3-Minor：严格 plain object——Date/Map 等内建对象同样拒绝（名实相符）
+    if (!isPlainObject(result)) {
+      failures.push({ name: p.name, error: `hook result must be a plain object or null (got ${Array.isArray(result) ? "array" : result.constructor?.name ?? typeof result})` });
       continue;
     }
     if (result.server !== undefined && result.server !== null) {
-      if (typeof result.server !== "object" || Array.isArray(result.server)) {
+      if (!isPlainObject(result.server)) {
         failures.push({ name: p.name, error: "hook result.server must be a plain object of override keys" });
         continue;
       }

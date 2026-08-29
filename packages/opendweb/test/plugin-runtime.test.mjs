@@ -179,6 +179,8 @@ test("fireHook: non-plain-object hook results and result.server become plugin fa
     plugins: [
       mkPlugin("str-result", "oops"),
       mkPlugin("array-result", [1, 2]),
+      mkPlugin("date-result", new Date()), // R3-Minor：内建对象也不是 plain object
+      mkPlugin("map-server", { server: new Map() }),
       mkPlugin("bad-server", { server: "not-an-object" }),
       mkPlugin("good", { server: { trustProxy: true }, bannerLines: ["ok"] }),
     ],
@@ -186,9 +188,11 @@ test("fireHook: non-plain-object hook results and result.server become plugin fa
     payload: {},
     stderr: { write: (s) => captured.push(s) },
   });
-  assert.equal(r.failures.length, 3);
-  assert.match(r.failures.map((f) => f.error).join(" "), /must be an object or null/);
-  assert.match(r.failures.map((f) => f.error).join(" "), /result\.server must be a plain object/);
+  assert.equal(r.failures.length, 5);
+  const errs = r.failures.map((f) => f.error).join(" ");
+  assert.match(errs, /must be a plain object or null/);
+  assert.match(errs, /Date/);
+  assert.match(errs, /result\.server must be a plain object/);
   assert.deepEqual(r.merged, { trustProxy: true }); // good 插件的覆写仍生效
   assert.deepEqual(r.bannerLines, ["ok"]);
 });

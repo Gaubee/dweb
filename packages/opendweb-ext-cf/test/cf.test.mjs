@@ -122,9 +122,15 @@ test("planExposure: hostname must be a DNS name — query-injection and junk rej
     "dweb..example.com",
     "-dweb.example.com",
     "dweb.example.com:8443",
+    `${"a".repeat(64)}.example.com`, // label > 63（R3-Minor 规则化）
   ]) {
     assert.throws(() => planExposure({ hostname: bad }), /invalid hostname/, bad);
   }
+  // R3-Minor 放宽：FQDN 尾点合法（归一去除）；深层次合法域名不再受 10 段限制
+  const fqdn = planExposure({ hostname: "dweb.example.com." });
+  assert.equal(fqdn.gatewayHost, "dweb.example.com");
+  const deep = planExposure({ hostname: "a.b.c.d.e.f.g.h.i.j.k.example.com" });
+  assert.equal(deep.relayHost, "relay.a.b.c.d.e.f.g.h.i.j.k.example.com");
 });
 
 test("verifyExposure: strict deadline — signal-ignoring fetch cannot stall past timeoutMs (R2-M3)", async () => {
@@ -276,7 +282,7 @@ test("runSetup: explicit configPath targets the chosen file, not cwd default (R2
   assert.match(logs.join("\n"), /custom\/dir\/cfg\.toml already exists; merge these values manually/);
 });
 
-test("postReady hook: cloudflared exiting during the startup window is a failure, not a fake success (R2-M4)", async () => {
+test("postReady hook: cloudflared dying at startup is never a silent fake success (R2-M4/R4)", async () => {
   const plugin = (await import("../src/index.js")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const fake = path.join(binDir, "cloudflared");
@@ -288,15 +294,96 @@ test("postReady hook: cloudflared exiting during the startup window is a failure
   const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
   process.env.PATH = binDir;
   process.env.TUNNEL_TOKEN = "placeholder";
+  // exit 事件在 macOS 可滞后数百毫秒（实测 757ms 方差大）——grace 故意短于
+  // 事件延迟，两种合法结局：启动失败拒绝，或过窗后晚退 WARNING
   process.env.DWEB_CF_SPAWN_GRACE_MS = "300";
+  const warnings = [];
+  const origError = console.error;
+  console.error = (s) => warnings.push(String(s));
   try {
-    await assert.rejects(
-      () => plugin.hooks["server.postReady"]({ options: { tunnel: true } }),
-      (e) => /cloudflared exited during startup \(code 7\)/.test(e.message),
-    );
+    let rejected = null;
+    try {
+      await plugin.hooks["server.postReady"]({ options: { tunnel: true } });
+    } catch (e) {
+      rejected = e;
+    }
+    if (rejected !== null) {
+      assert.match(rejected.message, /cloudflared exited during startup/);
+    } else {
+      // 过窗 resolve：晚退必须落 stderr WARNING（无声伪成功 = 失败）
+      const deadline = Date.now() + 5000;
+      while (warnings.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.match(warnings.join("\n"), /WARNING: cloudflared exited \(code 7\); the public tunnel is down/);
+    }
   } finally {
+    console.error = origError;
     process.env.PATH = prevPath;
     process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
+});
+
+test("postReady hook: concurrent tunnel requests share one spawn; preStop reaps it (R3 race hardening)", async () => {
+  const plugin = (await import("../src/index.js")).default;
+  const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
+  const spawnLog = path.join(binDir, "spawns.log");
+  const fake = path.join(binDir, "cloudflared");
+  await fsp.writeFile(fake, "#!/bin/sh\necho $$ >> \"$DWEB_CF_SPAWN_LOG\"\n/bin/sleep 30\nexit 0\n", "utf8");
+  const { chmodSync } = await import("node:fs");
+  chmodSync(fake, 0o755);
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
+  process.env.PATH = binDir;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.DWEB_CF_SPAWN_GRACE_MS = "300";
+  process.env.DWEB_CF_SPAWN_LOG = spawnLog;
+  const { execFileSync } = await import("node:child_process");
+  try {
+    const ctx = { options: { tunnel: true } };
+    const [a, b] = await Promise.all([
+      plugin.hooks["server.postReady"](ctx),
+      plugin.hooks["server.postReady"](ctx),
+    ]);
+    assert.match(a.bannerLines[0], /co-spawned/);
+    assert.match(b.bannerLines[0], /co-spawned/);
+    // 新写可执行文件的首次 exec 可滞后数百毫秒（macOS 扫描）：grace 过窗
+    // 不代表子进程已执行到第一行——有界等待首个 spawn 记录
+    let logged = "";
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      try {
+        logged = await fsp.readFile(spawnLog, "utf8");
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    const spawnCount = logged.trim().split("\n").filter(Boolean).length;
+    assert.equal(spawnCount, 1, `expected exactly one spawn, got: ${logged}`);
+    // preStop 清理存活进程
+    await plugin.hooks["server.preStop"]();
+    let alive = true;
+    const pid = logged.trim().split("\n")[0];
+    try {
+      execFileSync("/bin/sh", ["-c", `kill -0 ${Number(pid)} 2>/dev/null`]);
+    } catch {
+      alive = false;
+    }
+    assert.equal(alive, false, "cloudflared should be reaped by preStop");
+  } finally {
+    // 断言失败也必须回收：泄漏的存活句柄会污染后续测试（PATH="" 的 ENOENT
+    // 用例会被存活句柄短路成 resolve）
+    await plugin.hooks["server.preStop"]().catch(() => {});
+    try {
+      execFileSync("/bin/sh", ["-c", `kill $(cat ${JSON.stringify(spawnLog)} 2>/dev/null) 2>/dev/null || true`]);
+    } catch { /* best effort */ }
+    process.env.PATH = prevPath;
+    process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    delete process.env.DWEB_CF_SPAWN_LOG;
     if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
     else process.env.TUNNEL_TOKEN = prevToken;
   }

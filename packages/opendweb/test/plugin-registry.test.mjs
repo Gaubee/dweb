@@ -59,7 +59,36 @@ test("readInstalledVersion: entry resolving to a differently-named package is re
   await fsp.cp(path.join(FIXTURES, "@jixo", "opendweb-ext-srclayout"), path.join(dir, "node_modules", "@jixo", "opendweb-ext-cf"), { recursive: true });
   assert.throws(
     () => readInstalledVersion("@jixo/opendweb-ext-cf", dir),
-    (e) => e instanceof CliExit && /belongs to package @jixo\/opendweb-ext-srclayout/.test(e.message),
+    (e) => e instanceof CliExit && /declares name "@jixo\/opendweb-ext-srclayout"/.test(e.message),
+  );
+});
+
+test("readInstalledVersion: resolver-unresolvable layouts fall back to fs read (R3 race hardening)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-flat-"));
+  await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");
+  // 无 main 无 exports 无入口文件：两条 req.resolve 都失败——fs 直读兜底
+  await fsp.mkdir(path.join(dir, "node_modules", "opendweb-noflat"), { recursive: true });
+  await fsp.writeFile(
+    path.join(dir, "node_modules", "opendweb-noflat", "package.json"),
+    JSON.stringify({ name: "opendweb-noflat", version: "7.7.7" }),
+    "utf8",
+  );
+  const { version } = readInstalledVersion("opendweb-noflat", dir);
+  assert.equal(version, "7.7.7");
+});
+
+test("readInstalledVersion: missing package name is rejected (R3-Minor)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-noname-"));
+  await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");
+  await fsp.mkdir(path.join(dir, "node_modules", "opendweb-noname"), { recursive: true });
+  await fsp.writeFile(
+    path.join(dir, "node_modules", "opendweb-noname", "package.json"),
+    JSON.stringify({ version: "1.0.0" }), // 无 name 字段
+    "utf8",
+  );
+  assert.throws(
+    () => readInstalledVersion("opendweb-noname", dir),
+    (e) => e instanceof CliExit && /declares name undefined/.test(e.message),
   );
 });
 

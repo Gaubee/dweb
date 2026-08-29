@@ -13,11 +13,13 @@ import { decodeTunnelToken, buildIngress, pushIngress, routeDns } from "./cf-api
  * @param {{ hostname: string, mode?: "dual" | "single" }} input
  */
 export function planExposure({ hostname, mode = "dual" }) {
-  const raw = String(hostname ?? "").trim().toLowerCase();
-  // 每段：字母数字开头/结尾，中间可含 -；至少两段（域名，非裸 TLD/localhost）
-  const LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+  let raw = String(hostname ?? "").trim().toLowerCase();
+  if (raw.endsWith(".")) raw = raw.slice(0, -1); // FQDN 尾点合法（R3-Minor）
+  // 每段：字母数字开头/结尾，中间可含 -，长度 <= 63（DNS label 规则）；
+  // 整体至少两段（可路由域名，非裸 TLD/localhost）、总长 <= 253
+  const LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
   const labels = raw.split(".");
-  if (labels.length < 2 || labels.length > 10 || !labels.every((l) => LABEL.test(l))) {
+  if (labels.length < 2 || raw.length > 253 || !labels.every((l) => LABEL.test(l))) {
     throw new Error(`invalid hostname: ${JSON.stringify(hostname ?? "")} (expected a DNS name like dweb.example.com)`);
   }
   const gatewayHost = raw;
