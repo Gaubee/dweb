@@ -138,26 +138,35 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
   return state.promise;
 }
 
-async function stopCloudflared() {
-  // 启动尚未过窗时，tunnelChild 尚不存在；必须取消并等待已 spawn 的
-  // 子进程结束，不能让随后完成的 startup 变成孤儿进程。
-  const starting = tunnelStart;
-  if (starting !== null) {
-    // Attach the rejection handler before waiting for the child: cancellation
-    // can reject only after its exit event, and that expected rejection must
-    // never become an unhandled rejection in the meantime.
-    const stoppedStartup = starting.promise.catch(() => {});
-    await stopPendingStartup(starting);
-    await stoppedStartup;
-  }
+let tunnelStopAll = null; // 进行中的全程停止 Promise（并发 preStop 共享，R6-Major）
 
-  const active = tunnelChild;
-  if (active === null) return;
-  if (tunnelChild === active) tunnelChild = null;
-  // 主动停止不是异常退出：只摘除此 child 的 watchdog，不影响旧 child
-  // 或之后新 child 的监听器。
-  active.child.removeListener("exit", active.watchdog);
-  await stopChild(active.child);
+function stopCloudflared() {
+  if (tunnelStopAll !== null) return tunnelStopAll;
+  tunnelStopAll = (async () => {
+    // 启动尚未过窗时，tunnelChild 尚不存在；必须取消并等待已 spawn 的
+    // 子进程结束，不能让随后完成的 startup 变成孤儿进程。
+    const starting = tunnelStart;
+    if (starting !== null) {
+      // Attach the rejection handler before waiting for the child: cancellation
+      // can reject only after its exit event, and that expected rejection must
+      // never become an unhandled rejection in the meantime.
+      const stoppedStartup = starting.promise.catch(() => {});
+      await stopPendingStartup(starting);
+      await stoppedStartup;
+    }
+
+    const active = tunnelChild;
+    if (active === null) return;
+    if (tunnelChild === active) tunnelChild = null;
+    // 主动停止不是异常退出：只摘除此 child 的 watchdog，不影响旧 child
+    // 或之后新 child 的监听器。
+    active.child.removeListener("exit", active.watchdog);
+    await stopChild(active.child);
+  })().finally(() => {
+    // 停止流程结束后复位：之后的新启动/再停止不受本次共享影响
+    tunnelStopAll = null;
+  });
+  return tunnelStopAll;
 }
 
 function stopPendingStartup(state) {

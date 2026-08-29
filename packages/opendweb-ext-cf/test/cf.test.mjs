@@ -452,8 +452,7 @@ test("postReady hook: preStop cancels a pending startup and reaps its child (R4)
   }
 });
 
-test("postReady hook: preStop before the spawn event still reaps the child (R5 negative)", { skip: process.platform === "win32" }, async () => {
-  const plugin = (await import("../src/index.js")).default;
+test("postReady hook: preStop before the spawn event still reaps the child (R5 negative)", { skip: process.platform === "win32" }, async () => {  const plugin = (await import("../src/index.js")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const spawnLog = path.join(binDir, "spawns.log");
   const fake = path.join(binDir, "cloudflared");
@@ -490,6 +489,60 @@ test("postReady hook: preStop before the spawn event still reaps the child (R5 n
         () => execFileSync("/bin/sh", ["-c", `kill -0 ${Number(pid)} 2>/dev/null`]),
         "child must be reaped even when preStop preceded its spawn event",
       );
+    }
+  } finally {
+    await plugin.hooks["server.preStop"]().catch(() => {});
+    await stopped?.catch(() => {});
+    try {
+      execFileSync("/bin/sh", ["-c", `kill -9 $(cat ${JSON.stringify(spawnLog)} 2>/dev/null) 2>/dev/null || true`]);
+    } catch { /* best effort */ }
+    process.env.PATH = prevPath;
+    process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    if (prevSpawnLog === undefined) delete process.env.DWEB_CF_SPAWN_LOG;
+    else process.env.DWEB_CF_SPAWN_LOG = prevSpawnLog;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
+});
+
+test("postReady hook: concurrent preStop calls share one full-stop promise and all await the child (R6-Major)", { skip: process.platform === "win32" }, async () => {
+  const plugin = (await import("../src/index.js")).default;
+  const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
+  const spawnLog = path.join(binDir, "spawns.log");
+  const fake = path.join(binDir, "cloudflared");
+  await fsp.writeFile(fake, "#!/bin/sh\ntrap '' INT\necho $$ > \"$DWEB_CF_SPAWN_LOG\"\nexec /bin/sleep 30\n", "utf8");
+  const { chmodSync } = await import("node:fs");
+  const { execFileSync } = await import("node:child_process");
+  chmodSync(fake, 0o755);
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
+  const prevSpawnLog = process.env.DWEB_CF_SPAWN_LOG;
+  process.env.PATH = binDir;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.DWEB_CF_SPAWN_GRACE_MS = "10000";
+  process.env.DWEB_CF_SPAWN_LOG = spawnLog;
+  let stopped = null;
+  try {
+    const postReady = plugin.hooks["server.postReady"]({ options: { tunnel: true } });
+    stopped = assert.rejects(postReady, /startup was stopped before it became healthy/);
+    // 第二个 preStop 不得在第一个仍在等待子进程终态时提前返回（抢跑
+    // server.stop/exit 的根源）——两次调用共享同一全程停止 promise
+    const [, second] = await Promise.all([
+      plugin.hooks["server.preStop"](),
+      plugin.hooks["server.preStop"](),
+    ]);
+    assert.equal(second, null); // 钩子返回 null；两次调用都在子进程终态后完成
+    await stopped;
+    // 停止流程结束后复位：后续 preStop 立即完成（无进程可停）
+    await plugin.hooks["server.preStop"]();
+    let pid = "";
+    try {
+      pid = (await fsp.readFile(spawnLog, "utf8")).trim();
+    } catch { /* child died before echo — equally reaped */ }
+    if (/^\d+$/.test(pid)) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.throws(() => execFileSync("/bin/sh", ["-c", `kill -0 ${Number(pid)} 2>/dev/null`]));
     }
   } finally {
     await plugin.hooks["server.preStop"]().catch(() => {});

@@ -70,51 +70,65 @@ export function resolvePluginRootEntry(pkg, cwd) {
 /**
  * Prefer Node resolution, then bypass its same-process negative directory cache
  * only after every valid requested entry has failed.
+ * R6-B2：containment 以「期望包根」为显式值（expectedPackageRoot），两条
+ * 路径复用同一不变量 isWithinPackage(expectedRoot, realpath(entry))——不再
+ * 由入口祖先的同名 metadata 推断（同名包外 symlink 可骗过推断）。
  * @param {string} pkg
  * @param {string} cwd
  * @param {string[]} exportPaths
  * @returns {string | null}
  */
 function resolvePackageEntry(pkg, cwd, exportPaths) {
+  const expectedRoot = expectedPackageRoot(pkg, cwd);
+  // 期望包根不存在或身份不符（name !== pkg）时 req.resolve 沿同一 node_modules
+  // 链也必然失败——直接判未安装（候选序列语义不变）
+  if (expectedRoot === null) return null;
   const base = path.join(cwd, "package.json");
   const req = createRequire(base);
   for (const exportPath of exportPaths) {
     const specifier = exportPath === "." ? pkg : pkg + exportPath.slice(1);
     try {
-      // R5-B2：解析结果必须过真实路径 containment——req.resolve 默认跟随
-      // 符号链接，入口指向包外（symlink 逃逸）或包名不符一律拒绝，且不再
-      // 尝试该候选的其它入口（包本身不可信）
-      return containedEntry(pkg, req.resolve(specifier));
+      const resolved = req.resolve(specifier);
+      let entryReal;
+      try {
+        entryReal = realpathSync(resolved);
+      } catch {
+        return null;
+      }
+      // 入口真实路径必须落在期望包根内；逃逸（symlink 指向包外）= 拒绝，
+      // 且不再尝试该候选的其它入口（包本身不可信）
+      return isWithinPackage(expectedRoot, entryReal) ? entryReal : null;
     } catch {
       // Try every valid entry for this candidate before falling back to fs.
     }
   }
-  return resolvePackageEntryFromFs(pkg, cwd, exportPaths);
+  return resolvePackageEntryFromFs(expectedRoot, exportPaths);
 }
 
 /**
- * 统一的真实路径 containment（R5-B2）：入口真实路径必须落在「声明了本包名
- * 的真实包根」之内——从 realpath(entry) 向上找到的第一个 name===pkg 的
- * package.json 即包根（向上查找的结构保证包含关系）；走到文件系统根都没
- * 找到 = 入口逃出了该包，拒绝。
+ * 期望包根（R6-B2）：沿 cwd 的 node_modules 向上找到 <pkg> 目录，realpath
+ * 后要求其 package.json 声明 name === pkg（目录名 + 元数据双重身份）。
+ * 身份不符的目录不作为期望根（继续向上找外层副本；都找不到则 null）。
  * @param {string} pkg
- * @param {string} resolved
+ * @param {string} cwd
  * @returns {string | null}
  */
-function containedEntry(pkg, resolved) {
-  let entryReal;
-  try {
-    entryReal = realpathSync(resolved);
-  } catch {
-    return null;
-  }
-  let dir = path.dirname(entryReal);
+function expectedPackageRoot(pkg, cwd) {
+  const packageParts = pkg.split("/");
+  if (packageParts.some((part) => part === "" || part === "." || part === "..")) return null;
+  let searchDir = path.resolve(cwd);
   for (;;) {
-    const meta = readPackageMeta(path.join(dir, "package.json"));
-    if (meta !== null && meta.name === pkg) return entryReal;
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
+    const linked = path.join(searchDir, "node_modules", ...packageParts);
+    try {
+      const root = realpathSync(linked);
+      const meta = readPackageMeta(path.join(root, "package.json"));
+      if (meta !== null && meta.name === pkg) return root;
+    } catch {
+      /* not installed at this level; walk up */
+    }
+    const parent = path.dirname(searchDir);
+    if (parent === searchDir) return null;
+    searchDir = parent;
   }
 }
 
@@ -129,45 +143,28 @@ function readPackageMeta(p) {
 }
 
 /**
- * Follow Node node_modules lookup upward and realpath the package root so pnpm
- * links read the target package metadata rather than a stale resolver cache.
- * @param {string} pkg
- * @param {string} cwd
+ * Post-install fs fallback against Node's same-process negative directory
+ * cache. The expected root is already identity-verified (name === pkg), so the
+ * only remaining job is entry selection + containment.
+ * @param {string} expectedRoot
  * @param {string[]} exportPaths
  * @returns {string | null}
  */
-function resolvePackageEntryFromFs(pkg, cwd, exportPaths) {
-  const packageParts = pkg.split("/");
-  if (packageParts.some((part) => part === "" || part === "." || part === "..")) return null;
-  let searchDir = path.resolve(cwd);
-  for (;;) {
-    const linkedPackageDir = path.join(searchDir, "node_modules", ...packageParts);
-    let packageDir;
-    let packageJson;
-    try {
-      packageDir = realpathSync(linkedPackageDir);
-      packageJson = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
-    } catch {
-      packageDir = null;
-      packageJson = null;
-    }
-    if (packageDir !== null && isRecord(packageJson)) {
-      const hasExports = Object.prototype.hasOwnProperty.call(packageJson, "exports");
-      for (const exportPath of exportPaths) {
-        const entry = resolvePackageFile(packageDir, packageExportTarget(packageJson.exports, exportPath), false);
-        if (entry !== null) return entry;
-      }
-      // Exports is authoritative. main is only a legacy fallback when absent.
-      if (!hasExports) {
-        const main = typeof packageJson.main === "string" ? packageJson.main : "./index.js";
-        const entry = resolvePackageFile(packageDir, main, true);
-        if (entry !== null) return entry;
-      }
-    }
-    const parent = path.dirname(searchDir);
-    if (parent === searchDir) return null;
-    searchDir = parent;
+function resolvePackageEntryFromFs(expectedRoot, exportPaths) {
+  const packageJson = readPackageMeta(path.join(expectedRoot, "package.json"));
+  if (packageJson === null) return null;
+  const hasExports = Object.prototype.hasOwnProperty.call(packageJson, "exports");
+  for (const exportPath of exportPaths) {
+    const entry = resolvePackageFile(expectedRoot, packageExportTarget(packageJson.exports, exportPath), false);
+    if (entry !== null) return entry;
   }
+  // Exports is authoritative. main is only a legacy fallback when absent.
+  if (!hasExports) {
+    const main = typeof packageJson.main === "string" ? packageJson.main : "./index.js";
+    const entry = resolvePackageFile(expectedRoot, main, true);
+    if (entry !== null) return entry;
+  }
+  return null;
 }
 
 /** @param {unknown} exportsField @param {string} exportPath @returns {string | null} */

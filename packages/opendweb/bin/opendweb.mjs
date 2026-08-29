@@ -473,13 +473,19 @@ async function runServer(rest) {
     console.log(`  ${line}`);
   }
 
-  const shutdown = async () => {
-    // preStop：尽力执行（失败仅 WARNING），再停 server
-    const preStop = await fireHook({ plugins, hook: "server.preStop", payload: { server: { ...final } } });
-    for (const f of preStop.failures) {
-      console.error(`WARNING[plugin/${asciiEscape(f.name)}]: preStop failed (${asciiEscape(f.error)})`);
-    }
-    server.stop().finally(() => process.exit(0));
+  // R6-Major：SIGINT/SIGTERM 与重复信号共享同一停止流程——第二次调用不得
+  // 绕过仍在等待的 preStop（如 cloudflared 子进程终态）抢先 server.stop/exit
+  let shuttingDown = null;
+  const shutdown = () => {
+    shuttingDown ??= (async () => {
+      // preStop：尽力执行（失败仅 WARNING），再停 server
+      const preStop = await fireHook({ plugins, hook: "server.preStop", payload: { server: { ...final } } });
+      for (const f of preStop.failures) {
+        console.error(`WARNING[plugin/${asciiEscape(f.name)}]: preStop failed (${asciiEscape(f.error)})`);
+      }
+      server.stop().finally(() => process.exit(0));
+    })();
+    return shuttingDown;
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

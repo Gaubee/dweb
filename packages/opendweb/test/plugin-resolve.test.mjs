@@ -99,6 +99,52 @@ test("resolvePluginEntry: opendweb-plugin symlink escaping the package is reject
   );
 });
 
+test("resolvePluginEntry: symlink to an outside dir claiming the same package name is rejected (R6-B2)", async () => {
+  const dir = await projectWith();
+  const pkgDir = path.join(dir, "node_modules", "opendweb-samename");
+  await fsp.mkdir(pkgDir, { recursive: true });
+  await fsp.writeFile(
+    path.join(pkgDir, "package.json"),
+    JSON.stringify({ name: "opendweb-samename", version: "1.0.0", type: "module", exports: { "./opendweb-plugin": "./link.mjs" } }),
+  );
+  // 包外伪装目录声明了与请求包相同的 name——「入口祖先同名 metadata 推断」
+  // 会被它骗过；期望包根（node_modules/<pkg> 的真实身份）不含包外路径
+  const fakeDir = path.join(dir, "outside-same-name");
+  await fsp.mkdir(fakeDir, { recursive: true });
+  await fsp.writeFile(path.join(fakeDir, "package.json"), JSON.stringify({ name: "opendweb-samename", version: "9.9.9" }));
+  await fsp.writeFile(
+    path.join(fakeDir, "plugin.mjs"),
+    'export default { name: "samename", apiVersion: 1, commands: [], run: async () => ({ exit: 0 }) };',
+  );
+  await fsp.symlink(path.join(fakeDir, "plugin.mjs"), path.join(pkgDir, "link.mjs"));
+  assert.equal(resolvePluginEntry("opendweb-samename", dir), null);
+  await assert.rejects(
+    () => resolveAdaptive({ name: "samename", globs: DEFAULT_GLOBS, cwd: dir }),
+    (e) => e instanceof PluginNotResolved,
+  );
+});
+
+test("resolvePluginEntry: directory-name match with a mismatched package identity is rejected (R6-B2)", async () => {
+  const dir = await projectWith();
+  // 目录名正确但 package.json 声明的是别的包——期望包根的身份校验必须拒绝
+  // （否则错名包的入口会被当作请求包解析/导入）
+  const pkgDir = path.join(dir, "node_modules", "opendweb-wrongname");
+  await fsp.mkdir(pkgDir, { recursive: true });
+  await fsp.writeFile(
+    path.join(pkgDir, "package.json"),
+    JSON.stringify({ name: "evil-other-package", version: "1.0.0", type: "module", exports: { "./opendweb-plugin": "./plugin.mjs" } }),
+  );
+  await fsp.writeFile(
+    path.join(pkgDir, "plugin.mjs"),
+    'export default { name: "wrongname", apiVersion: 1, commands: [], run: async () => ({ exit: 0 }) };',
+  );
+  assert.equal(resolvePluginEntry("opendweb-wrongname", dir), null);
+  await assert.rejects(
+    () => resolveAdaptive({ name: "wrongname", globs: DEFAULT_GLOBS, cwd: dir }),
+    (e) => e instanceof PluginNotResolved,
+  );
+});
+
 test("resolveAdaptive: declaration order wins; unresolvable candidates are skipped", async () => {
   const dir = await projectWith("opendweb-echo");
   // 默认序：@jixo/opendweb-echo（未安装）→ opendweb-echo（已安装）
