@@ -3,7 +3,7 @@
 [English version](EXAMPLE.md)
 
 本手册描述如何用已发布的 npm 包做端到端验证。每次发布新版本后按此流程复测。
-当前适用版本：**v0.2.0**（gateway 单一入口 + join 诊断 + invite 安全门）。
+当前适用版本：**v0.3.0**（gateway 单一入口 + join 诊断 + invite 安全门）。
 
 ## 架构速览
 
@@ -46,7 +46,7 @@ npx opendweb@0.2.0 server
 预期输出（纯 ASCII、vite 风格枚举本机 IP）：
 
 ```
-  * opendweb server v0.2.0
+  * opendweb server v0.3.0
   > Local:   http://localhost:8787
   > Network: http://192.168.x.x:8787
              http://10.x.x.x:8787
@@ -300,6 +300,15 @@ npx opendweb server       config set relay         config set relay
 - [ ] `config set relay <语法错误>` → 不写入 + exit 1
 
 ---
+
+## v0.2.0 → v0.3.0 变更摘要
+
+- `relayStatus()` / `relay-*` 事件新增 **`activeUrl`**（配置序最小已连接 relay；事件携带跳变时刻快照副本）
+- server 新增公网入口覆盖：`--public-gateway` / `--public-relay` 与 `DWEB_PUBLIC_*_URL`（反代/隧道部署，compose.yaml 参考）
+- n0 模式 urls 为 iroh 上游真实默认列表（4 区域节点，与实际拨号一致）
+- Rust API：`relay_ca_tls` 收窄为 `RelayTlsTrust`（PlatformRoot | CustomPem；N0+CustomPem 拒绝）
+- Windows 产物由 CI 交叉编译产出（release workflow 自动替换）；npm tarball 清单门禁
+- 生命周期收敛：shutdown 完成语义（并发/顺序/取消安全、无残留任务、无后续事件）、known_addrs 有界、send 有界
 
 ## v0.1.0 → v0.2.0 变更摘要
 

@@ -2,7 +2,7 @@
 
 This guide walks you through testing dweb's published npm packages end to end. Follow it after every release to verify the full stack.
 
-**Current version: v0.2.0** | [中文版](EXAMPLE-zh.md)
+**Current version: v0.3.0** | [中文版](EXAMPLE-zh.md)
 
 ## What You'll Build
 
@@ -40,7 +40,7 @@ npx opendweb@0.2.0 server
 You'll see:
 
 ```
-  * opendweb server v0.2.0
+  * opendweb server v0.3.0
   > Local:   http://localhost:8787
   > Network: http://192.168.1.100:8787
 
@@ -260,6 +260,15 @@ Run after every npm publish:
 - [ ] Invalid `config set relay` → no write + exit 1
 
 ---
+
+## v0.2 → v0.3 Changes
+
+- `relayStatus()` / `relay-*` events now include **`activeUrl`** (lowest-config-order connected relay; events carry the transition-time snapshot copy)
+- Server public-entry overrides: `--public-gateway` / `--public-relay` and `DWEB_PUBLIC_*_URL` (reverse-proxy/tunnel deployments, see compose.yaml)
+- n0 mode `urls` is now iroh's real default relay list (4 regional nodes, matching actual dialing)
+- Rust API: `relay_ca_tls` narrowed to `RelayTlsTrust` (PlatformRoot | CustomPem; N0+CustomPem rejected)
+- Windows artifacts built by CI cross-compilation (release workflow replaces them automatically); npm tarball manifest gate
+- Lifecycle convergence: shutdown completion semantics (concurrent/sequential/cancellation-safe, no residual tasks, no post-completion events), bounded known_addrs, bounded send
 
 ## v0.1 → v0.2 Changes
 
