@@ -124,7 +124,7 @@ const bothRoutes = (direct, viaProxy) => ({ direct, proxy: viaProxy });
 
 test("row: all candidates reachable directly -> none", async () => {
   const m = mockGet([URL_A, URL_B], bothRoutes({ [svc(URL_A)]: { ok: true }, [svc(URL_B)]: { ok: true } }, {}));
-  const r = await decideProxyPolicy([URL_A, URL_B], { proxySetting: "auto", httpGet: m.doGet });
+  const r = await decideProxyPolicy([URL_A, URL_B], { proxySetting: "auto", httpGet: m.doGet, env: {} });
   assert.equal(r.policy, "none");
   assert.deepEqual(r.warnings, []);
   assert.equal(m.calls.length, 2); // direct probes only
@@ -133,7 +133,7 @@ test("row: all candidates reachable directly -> none", async () => {
 
 test("row: legacy relay 404 counts as reachable (complete HTTP response)", async () => {
   const m = mockGet([URL_A], bothRoutes({ [svc(URL_A)]: { ok: true } }, {}));
-  const r = await decideProxyPolicy([URL_A], { proxySetting: "auto", httpGet: m.doGet });
+  const r = await decideProxyPolicy([URL_A], { proxySetting: "auto", httpGet: m.doGet, env: {} });
   assert.equal(r.policy, "none");
 });
 
@@ -145,7 +145,11 @@ test("row: some direct-fail, proxy retries all fail -> none + per-item both-fail
       { [svc(URL_B)]: { ok: false } },
     ),
   );
-  const r = await decideProxyPolicy([URL_A, URL_B], { proxySetting: "auto", httpGet: m.doGet });
+  const r = await decideProxyPolicy([URL_A, URL_B], {
+    proxySetting: "auto",
+    httpGet: m.doGet,
+    env: { HTTP_PROXY: "http://proxy:3128" },
+  });
   assert.equal(r.policy, "none");
   assert.deepEqual(r.warnings, [`relay unreachable both directly and via proxy: ${URL_B}`]);
 });
@@ -158,7 +162,11 @@ test("row: some direct-fail, any proxy success -> from-env (proxy-override seman
       { [svc(URL_B)]: { ok: true } },
     ),
   );
-  const r = await decideProxyPolicy([URL_A, URL_B], { proxySetting: "auto", httpGet: m.doGet });
+  const r = await decideProxyPolicy([URL_A, URL_B], {
+    proxySetting: "auto",
+    httpGet: m.doGet,
+    env: { HTTP_PROXY: "http://proxy:3128" },
+  });
   assert.equal(r.policy, "from-env");
   assert.deepEqual(r.warnings, []);
 });
@@ -171,7 +179,11 @@ test("row: all direct fail, any proxy success -> from-env", async () => {
       { [svc(URL_A)]: { ok: false }, [svc(URL_B)]: { ok: true } },
     ),
   );
-  const r = await decideProxyPolicy([URL_A, URL_B], { proxySetting: "auto", httpGet: m.doGet });
+  const r = await decideProxyPolicy([URL_A, URL_B], {
+    proxySetting: "auto",
+    httpGet: m.doGet,
+    env: { HTTP_PROXY: "http://proxy:3128" },
+  });
   assert.equal(r.policy, "from-env");
 });
 
@@ -257,13 +269,16 @@ test("mixed arrays decide identically regardless of order", async () => {
     { [svc(directOnly)]: { ok: true }, [svc(proxyOnly)]: { ok: false } },
     { [svc(proxyOnly)]: { ok: true } },
   );
+  const env = { HTTP_PROXY: "http://proxy:3128" };
   const r1 = await decideProxyPolicy([directOnly, proxyOnly], {
     proxySetting: "auto",
     httpGet: mockGet([directOnly, proxyOnly], routes).doGet,
+    env,
   });
   const r2 = await decideProxyPolicy([proxyOnly, directOnly], {
     proxySetting: "auto",
     httpGet: mockGet([proxyOnly, directOnly], routes).doGet,
+    env,
   });
   assert.equal(r1.policy, "from-env");
   assert.equal(r2.policy, "from-env");
@@ -277,7 +292,11 @@ test("proxy retry only targets the direct-unreachable candidates", async () => {
       { [svc(URL_B)]: { ok: true } },
     ),
   );
-  await decideProxyPolicy([URL_A, URL_B], { proxySetting: "auto", httpGet: m.doGet });
+  await decideProxyPolicy([URL_A, URL_B], {
+    proxySetting: "auto",
+    httpGet: m.doGet,
+    env: { HTTP_PROXY: "http://proxy:3128" },
+  });
   const proxyCalls = m.calls.filter((c) => c.policy === "from-env");
   assert.deepEqual(proxyCalls.map((c) => c.url), [svc(URL_B)]);
 });

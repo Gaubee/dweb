@@ -427,7 +427,7 @@ mod tests {
     /// 权威 fixture（C0 冻结 + public-exposure 增补）：字段快照断言的数据源
     const FIXTURES: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../openspec/changes/public-exposure/contracts/services.fixtures.json"
+        "/../../openspec/changes/archive/2026-08-29-public-exposure/contracts/services.fixtures.json"
     ));
 
     #[derive(Debug, Deserialize)]

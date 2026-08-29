@@ -20,7 +20,7 @@ const FIXTURES = JSON.parse(
   readFileSync(
     path.resolve(
       path.dirname(fileURLToPath(import.meta.url)),
-      "../../../openspec/changes/public-exposure/contracts/services.fixtures.json",
+      "../../../openspec/changes/archive/2026-08-29-public-exposure/contracts/services.fixtures.json",
     ),
     "utf8",
   ),
