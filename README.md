@@ -22,10 +22,12 @@ Sync      opaque envelopes, bidirectional send/receive (Automerge
 
 | npm package | Role |
 | --- | --- |
-| [`opendweb`](https://www.npmjs.com/package/opendweb) | Server CLI — `npx opendweb server` starts the self-hosted gateway + relay |
+| [`opendweb`](https://www.npmjs.com/package/opendweb) | Server CLI — `npx opendweb server` starts the self-hosted gateway + relay; plugin marketplace host |
 | [`@jixo/opendweb-server-binary`](https://www.npmjs.com/package/@jixo/opendweb-server-binary) | Server binary wrapper used by the CLI; also exposes a programmatic `startServer()` |
 | [`@jixo/opendweb-example`](https://www.npmjs.com/package/@jixo/opendweb-example) | Reference two-process client CLI (`init` / `invite` / `join` / `chat`) |
 | [`@jixo/opendweb-client-sdk`](https://www.npmjs.com/package/@jixo/opendweb-client-sdk) | Node SDK for embedding fabrics in your own app (napi-rs; darwin-arm64 / win32-x64) |
+| [`@jixo/opendweb-config`](https://www.npmjs.com/package/@jixo/opendweb-config) | `definePlugin` helper for local plugin files (runtime-agnostic: deno / bun / node) |
+| [`@jixo/opendweb-ext-cf`](https://www.npmjs.com/package/@jixo/opendweb-ext-cf) | Cloudflare Tunnel plugin: ingress push via API, DNS routing, end-to-end verification, optional cloudflared co-spawn |
 
 All packages are published at v0.2.1. Server deployments on other platforms can use the docker image `ghcr.io/gaubee/dweb`.
 
@@ -36,6 +38,9 @@ All packages are published at v0.2.1. Server deployments on other platforms can 
 - `packages/client-sdk` — `@jixo/opendweb-client-sdk` (napi-rs)
 - `packages/example` — `@jixo/opendweb-example` two-process fabric CLI
 - `packages/server-binary` — `@jixo/opendweb-server-binary` server npm wrapper
+- `packages/opendweb` — the `opendweb` CLI (server + marketplace/plugin/config commands)
+- `packages/opendweb-config` — `@jixo/opendweb-config` local plugin helper
+- `packages/opendweb-ext-cf` — `@jixo/opendweb-ext-cf` Cloudflare Tunnel plugin
 - `docker/` — image `ghcr.io/gaubee/dweb` (rendezvous 8787 + relay 3340)
 
 ## Quick start
@@ -153,6 +158,59 @@ cd docker && TUNNEL_TOKEN=... \
 ```
 
 Direct hole-punching never goes through the tunnel (iroh QUIC peer-to-peer); the tunnel only carries the short rendezvous/services.json requests and relay fallback traffic (WS — iroh's 15s pings keep it alive through CF's 100s idle timeout). Field research and risks (measured mainland-China latency, ToS boundaries): `docs/research-cf-tunnel.md`.
+
+## Plugins
+
+Vendor and workflow integrations are plugins — the CLI core stays vendor-neutral by construction. Any non-builtin first token dispatches adaptively: `opendweb <name> ...` resolves the marketplace candidate globs (default `npm:@jixo/opendweb-ext-*` then `npm:opendweb-*`) to an installed package's `./opendweb-plugin` export. Nothing is auto-installed: a missing plugin fails with the exact `opendweb plugin add` command.
+
+```bash
+opendweb plugin add cf          # install into the current project (detected pm), lock name@version
+opendweb cf setup --hostname dweb.example.com   # wizard: push ingress via CF API, route DNS,
+                                                # write opendweb.config.toml, verify end-to-end
+opendweb cf plan --hostname dweb.example.com    # zero-side-effect preview (also --dry-run on setup)
+opendweb marketplace add "npm:@your-org/opendweb-ext-*"   # more candidate globs (npm: only)
+```
+
+### Static config + lifecycle (`opendweb.config.toml`)
+
+The orchestration layer is pure data (TOML preferred, JSON accepted — one schema for both). Code lives only in plugin files. Precedence: **flag > env > config > default**; with no plugins declared, `opendweb server` never spawns an interpreter.
+
+```toml
+configVersion = 1
+
+[server]
+publicGatewayUrl = "https://dweb.example.com"
+publicRelayUrl = "https://relay.dweb.example.com"
+
+[[plugins]]
+name = "cf"                      # npm plugin (marketplace-resolved); options are data
+[plugins.options]
+tokenEnv = "TUNNEL_TOKEN"        # secrets by env indirection, never inline
+# tunnel = true                  # optional: co-spawn cloudflared for the server lifetime
+
+[[plugins]]
+file = "opendweb.plugins/backup.ts"   # local plugin file — shebang picks the runtime
+```
+
+Lifecycle hooks (v1: `server.preStart` — validated config overrides, blocking on failure; `server.postReady` — end-to-end verification, degrades to WARNING, may extend the banner; `server.preStop` — cleanup) plus `opendweb setup`, which runs every plugin's `setup` hook in declaration order and exits non-zero if any fails.
+
+### Writing a plugin
+
+Two faces, both plain ESM: the **CLI face** (`exports["./opendweb-plugin"]` — a zod-validated command manifest: name, apiVersion 1, commands with JSON-Schema args; the CLI parses args, renders `--help` without executing anything, and normalizes errors/exit codes) and the **config face** (root export `{name, hooks}` — options arrive as data via `ctx.options`). Local plugin files need no npm package at all:
+
+```js
+#!/usr/bin/env -S deno run
+// opendweb.plugins/notify.ts
+import { definePlugin } from "npm:@jixo/opendweb-config";
+export default definePlugin({
+  name: "notify",
+  hooks: {
+    async "server.postReady"(ctx) { /* ctx.options, ctx.server, ctx.publicGatewayUrl */ },
+  },
+});
+```
+
+Security model: installing is trusting — `plugin add` shows the exact name@version it locks; contract validation is a compatibility gate, not a sandbox (module top-level code runs on import, as with any config-as-code tool). The unscoped `opendweb-*` glob is open by default so the community can self-publish; verify package ownership before installing unfamiliar names.
 
 ## Client SDK (Node, darwin-arm64 / win32-x64)
 

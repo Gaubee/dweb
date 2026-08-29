@@ -20,6 +20,9 @@
 - `packages/client-sdk` — `@jixo/opendweb-client-sdk`（napi-rs，darwin-arm64 / win32-x64）
 - `packages/example` — `@jixo/opendweb-example` 双进程组网 CLI 样板
 - `packages/server-binary` — `@jixo/opendweb-server-binary` 服务端 npm 包装（darwin-arm64 / win32-x64）
+- `packages/opendweb` — `opendweb` CLI（server + marketplace/plugin/config 命令）
+- `packages/opendweb-config` — `@jixo/opendweb-config` 本地插件 helper（definePlugin）
+- `packages/opendweb-ext-cf` — `@jixo/opendweb-ext-cf` Cloudflare Tunnel 插件
 - `docker/` — 镜像 `ghcr.io/gaubee/dweb`（rendezvous 8787 + relay 3340）
 
 ## 快速开始（体验 example）
@@ -131,6 +134,75 @@ cd docker && TUNNEL_TOKEN=... \
 直连打洞不经过隧道（iroh QUIC peer↔peer）；隧道只承载 rendezvous/services.json
 短请求与打洞失败时的 relay 回退流量（WS，iroh 15s ping 保活穿透 CF 100s 空闲超时）。
 调研与风险（大陆延迟实测、ToS 边界）见 `docs/research-cf-tunnel.md`。
+
+## 插件
+
+供应商与工作流集成均为插件——CLI 内核在结构上保持厂商中立。任意非 builtin
+首 token 都走自适应派发：`opendweb <name> ...` 按 marketplace 候选 globs
+（默认 `npm:@jixo/opendweb-ext-*`、`npm:opendweb-*`）解析到已安装包的
+`./opendweb-plugin` 导出。不做隐式安装：插件缺失时报错并打印精确的
+`opendweb plugin add` 命令。
+
+```bash
+opendweb plugin add cf          # 安装进当前项目（探测包管理器），锁定 name@version
+opendweb cf setup --hostname dweb.example.com   # 向导：API 推 ingress、路由 DNS、
+                                                # 写 opendweb.config.toml、端到端自检
+opendweb cf plan --hostname dweb.example.com    # 零副作用预览（setup 亦有 --dry-run）
+opendweb marketplace add "npm:@your-org/opendweb-ext-*"   # 追加候选 globs（仅 npm:）
+```
+
+### 静态配置 + 生命周期（`opendweb.config.toml`）
+
+编排层是纯数据（TOML 优先、JSON 兼容——同一 schema），代码只存在于插件文件。
+优先级 **flag > env > config > default**；未声明插件时 `opendweb server`
+不 spawn 任何解释器。
+
+```toml
+configVersion = 1
+
+[server]
+publicGatewayUrl = "https://dweb.example.com"
+publicRelayUrl = "https://relay.dweb.example.com"
+
+[[plugins]]
+name = "cf"                      # npm 插件（marketplace 解析）；选项是数据
+[plugins.options]
+tokenEnv = "TUNNEL_TOKEN"        # 秘密经 env 间接引用，绝不内联
+# tunnel = true                  # 可选：server 生命周期内共生 spawn cloudflared
+
+[[plugins]]
+file = "opendweb.plugins/backup.ts"   # 本地插件文件——shebang 决定 runtime
+```
+
+生命周期钩子（v1：`server.preStart`——配置覆写需过同规校验，失败阻断；
+`server.postReady`——端到端验证，失败降级 WARNING，可扩展横幅；
+`server.preStop`——清理），另有 `opendweb setup`：按声明序执行全部插件的
+setup 钩子并聚合，任一失败非零退出。
+
+### 编写插件
+
+两张面孔，均为普通 ESM：**CLI 面**（`exports["./opendweb-plugin"]`——经 zod
+校验的命令清单：name、apiVersion 1、带 JSON Schema 参数声明的 commands；
+CLI 统一解析参数、零执行渲染 `--help`、归一化错误与退出码）与 **config 面**
+（包根导出 `{name, hooks}`——选项以数据经 `ctx.options` 传入）。本地插件
+文件无需发包：
+
+```js
+#!/usr/bin/env -S deno run
+// opendweb.plugins/notify.ts
+import { definePlugin } from "npm:@jixo/opendweb-config";
+export default definePlugin({
+  name: "notify",
+  hooks: {
+    async "server.postReady"(ctx) { /* ctx.options、ctx.server、ctx.publicGatewayUrl */ },
+  },
+});
+```
+
+安全模型：安装即信任——`plugin add` 展示并锁定精确 name@version；契约校验
+是兼容门不是沙箱（import 即执行模块顶层代码，与一切 config-as-code 工具
+相同）。无 scope 的 `opendweb-*` glob 默认开放，社区可自发插件；安装陌生
+插件前请核对包的所有权。
 
 ## SDK（Node，darwin-arm64 / win32-x64）
 

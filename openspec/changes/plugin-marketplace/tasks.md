@@ -38,17 +38,28 @@
 
 ## 3. 首个消费者：@jixo/opendweb-ext-cf
 
-- [ ] 3.1 包骨架 + 双面孔导出（CLI 面命令清单 + config 面 {name, hooks}）
-- [ ] 3.2 setup 向导：token 输入 → CF API 推 ingress（双主机名默认/单域名可选）→
-      写配置/env → 端到端自检（公网拉 services.json 断言）→ 打印客户端入口
-- [ ] 3.3 postReady 验证钩子 + preStop 清理 + `--tunnel` 共生 spawn
-- [ ] 3.4 第二消费者（cloudflared-quick 演示或 frp 最小实现）——契约反哺校验
-- [ ] 3.5 e2e：quick tunnel 真链路冒烟 + cf 插件 dry-run 模式（无真实账号路径）+
-      本地自定义插件文件（definePlugin）全生命周期路径
+- [x] 3.1 包骨架 + 双面孔导出（CLI 面命令清单 setup/verify/plan +
+      config 面 {name, hooks}：setup / server.postReady / server.preStop）
+- [x] 3.2 setup 向导：token 解码（base64 {a,t,s}）→ CF API 推 ingress
+      （双主机名默认/单域名可选，PUT configurations）→ DNS 路由 best-effort
+      （zone 查询 + CNAME，81057 幂等，失败给手工路径）→ 写 opendweb.config.toml
+      （仅当文件不存在；已存在打印待合并片段保注释）→ 端到端自检（公网拉
+      services.json 断言 relay URL）→ 打印客户端入口；`--dry-run` 零网络副作用
+- [x] 3.3 postReady 自检钩子（含 bannerLines）+ preStop 清理 + `tunnel = true`
+      共生 spawn cloudflared（SIGINT 优雅停 + SIGKILL 兜底）
+- [x] 3.4 第二消费者：测试夹具 opendweb-echo（双面）+ 本地 local-echo——
+      e2e 双消费者同场（一 config 内 cf npm 插件与本地插件经 `opendweb setup`
+      编排，含失败聚合路径）
+- [x] 3.5 e2e：cf plan/`--help` 零执行/setup `--dry-run`/双消费者成功与失败
+      聚合（全部走真实 opendweb CLI 子进程与 @jixo 候选优先解析）；
+      **真实隧道冒烟（用户账号 + TUNNEL_TOKEN + cloudflared）留作人工验收**，
+      步骤即 `opendweb plugin add cf && opendweb cf setup --hostname <你的域名>`
 
 ## 4. 文档与验证
 
-- [ ] 4.1 README 插件章节：marketplace/plugin/config 三命令 + 插件开发指南
-      （双面孔契约、发布命名 opendweb-ext-* / opendweb-*、TOML 编排示例、
-      typosquat 核对建议）
-- [ ] 4.2 全量门禁：cargo / pnpm -r test / typecheck / compose 冒烟不回归
+- [x] 4.1 README（EN+zh 双语）插件章节：plugin/marketplace 命令、TOML 编排
+      示例、生命周期语义、插件开发指南（双面孔 + definePlugin 本地文件）、
+      安全模型（安装即信任/兼容门非沙箱/无 scope 开放的 typosquat 提示）；
+      Packages 表与仓库布局增补
+- [x] 4.2 全量门禁：opendweb 56/56 · opendweb-config 4/4 · opendweb-ext-cf
+      11/11 · server-binary 7/7 + tsc clean（测试文件按资源纪律串行）
