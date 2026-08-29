@@ -131,6 +131,12 @@ test("planExposure: hostname must be a DNS name — query-injection and junk rej
   assert.equal(fqdn.gatewayHost, "dweb.example.com");
   const deep = planExposure({ hostname: "a.b.c.d.e.f.g.h.i.j.k.example.com" });
   assert.equal(deep.relayHost, "relay.a.b.c.d.e.f.g.h.i.j.k.example.com");
+
+  // 原 hostname 仍在 DNS 253 字符上限内，但实际 dual-host 方案还会
+  // 派生 relay.<hostname>；该派生结果同样必须是合法 DNS 名。
+  const relayTooLong = `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(60)}`;
+  assert.equal(relayTooLong.length, 252);
+  assert.throws(() => planExposure({ hostname: relayTooLong }), /invalid hostname/);
 });
 
 test("verifyExposure: strict deadline — signal-ignoring fetch cannot stall past timeoutMs (R2-M3)", async () => {
@@ -282,7 +288,7 @@ test("runSetup: explicit configPath targets the chosen file, not cwd default (R2
   assert.match(logs.join("\n"), /custom\/dir\/cfg\.toml already exists; merge these values manually/);
 });
 
-test("postReady hook: cloudflared dying at startup is never a silent fake success (R2-M4/R4)", async () => {
+test("postReady hook: cloudflared dying at startup is never a silent fake success (R2-M4/R4)", { skip: process.platform === "win32" }, async () => {
   const plugin = (await import("../src/index.js")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const fake = path.join(binDir, "cloudflared");
@@ -326,12 +332,12 @@ test("postReady hook: cloudflared dying at startup is never a silent fake succes
   }
 });
 
-test("postReady hook: concurrent tunnel requests share one spawn; preStop reaps it (R3 race hardening)", async () => {
+test("postReady hook: concurrent tunnel requests share one spawn; preStop reaps it (R3 race hardening)", { skip: process.platform === "win32" }, async () => {
   const plugin = (await import("../src/index.js")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const spawnLog = path.join(binDir, "spawns.log");
   const fake = path.join(binDir, "cloudflared");
-  await fsp.writeFile(fake, "#!/bin/sh\necho $$ >> \"$DWEB_CF_SPAWN_LOG\"\n/bin/sleep 30\nexit 0\n", "utf8");
+  await fsp.writeFile(fake, "#!/bin/sh\necho $$ >> \"$DWEB_CF_SPAWN_LOG\"\nexec /bin/sleep 30\n", "utf8");
   const { chmodSync } = await import("node:fs");
   chmodSync(fake, 0o755);
   const prevPath = process.env.PATH;
@@ -384,6 +390,63 @@ test("postReady hook: concurrent tunnel requests share one spawn; preStop reaps 
     process.env.PATH = prevPath;
     process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
     delete process.env.DWEB_CF_SPAWN_LOG;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
+});
+
+test("postReady hook: preStop cancels a pending startup and reaps its child (R4)", { skip: process.platform === "win32" }, async () => {
+  const plugin = (await import("../src/index.js")).default;
+  const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
+  const spawnLog = path.join(binDir, "spawns.log");
+  const fake = path.join(binDir, "cloudflared");
+  await fsp.writeFile(fake, "#!/bin/sh\necho $$ > \"$DWEB_CF_SPAWN_LOG\"\nexec /bin/sleep 30\n", "utf8");
+  const { chmodSync } = await import("node:fs");
+  const { execFileSync } = await import("node:child_process");
+  chmodSync(fake, 0o755);
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
+  const prevSpawnLog = process.env.DWEB_CF_SPAWN_LOG;
+  process.env.PATH = binDir;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.DWEB_CF_SPAWN_GRACE_MS = "10000";
+  process.env.DWEB_CF_SPAWN_LOG = spawnLog;
+  let stopped = null;
+  try {
+    const postReady = plugin.hooks["server.postReady"]({ options: { tunnel: true } });
+    // Attach the assertion before preStop rejects startup, avoiding an
+    // expected lifecycle rejection being reported as unhandled by node:test.
+    stopped = assert.rejects(postReady, /startup was stopped before it became healthy/);
+
+    let pid = "";
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      try {
+        pid = (await fsp.readFile(spawnLog, "utf8")).trim();
+        if (pid) break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert.match(pid, /^\d+$/, "fake cloudflared must be spawned before preStop");
+
+    await plugin.hooks["server.preStop"]();
+    await stopped;
+    assert.throws(
+      () => execFileSync("/bin/sh", ["-c", `kill -0 ${Number(pid)} 2>/dev/null`]),
+      "pending cloudflared should be reaped by preStop",
+    );
+  } finally {
+    await plugin.hooks["server.preStop"]().catch(() => {});
+    await stopped?.catch(() => {});
+    try {
+      execFileSync("/bin/sh", ["-c", `kill $(cat ${JSON.stringify(spawnLog)} 2>/dev/null) 2>/dev/null || true`]);
+    } catch { /* best effort */ }
+    process.env.PATH = prevPath;
+    process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    if (prevSpawnLog === undefined) delete process.env.DWEB_CF_SPAWN_LOG;
+    else process.env.DWEB_CF_SPAWN_LOG = prevSpawnLog;
     if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
     else process.env.TUNNEL_TOKEN = prevToken;
   }

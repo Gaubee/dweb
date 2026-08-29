@@ -38,6 +38,22 @@ test("resolvePluginEntry: resolves ./opendweb-plugin from project context (pnpm/
   assert.equal(resolvePluginEntry("opendweb-ext-not-installed", dir), null);
 });
 
+test("resolvePluginEntry: same-process miss followed by install falls back to package metadata", async () => {
+  const dir = await projectWith();
+  const pkg = "@jixo/opendweb-ext-echo";
+  // 首次 req.resolve 缺失后，包管理器在同一进程创建 node_modules；这里
+  // 覆盖 Node 目录负缓存仍存在时的 package.json 直读回退。
+  assert.equal(resolvePluginEntry(pkg, dir), null);
+  const installed = path.join(dir, "node_modules", "@jixo", "opendweb-ext-echo");
+  await fsp.mkdir(path.dirname(installed), { recursive: true });
+  await fsp.cp(path.join(FIXTURES, "@jixo", "opendweb-ext-echo"), installed, { recursive: true });
+
+  const entry = resolvePluginEntry(pkg, dir);
+  assert.ok(entry?.endsWith("plugin.js"), entry ?? "null");
+  const resolved = await resolveAdaptive({ name: "echo", globs: DEFAULT_GLOBS, cwd: dir });
+  assert.equal(resolved.pkg, pkg);
+});
+
 test("resolveAdaptive: declaration order wins; unresolvable candidates are skipped", async () => {
   const dir = await projectWith("opendweb-echo");
   // 默认序：@jixo/opendweb-echo（未安装）→ opendweb-echo（已安装）

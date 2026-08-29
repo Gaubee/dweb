@@ -5,6 +5,7 @@
 // - 解析成功后的任何失败（顶层抛错 / safeParse 不合规）= 硬错误，不静默跳过
 // - 全部不可解析 → 报错 + 打印精确 plugin add 命令（无隐式安装）
 import { createRequire } from "node:module";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { PluginManifestSchema } from "./plugin-contract.mjs";
@@ -50,14 +51,163 @@ export class PluginNotResolved extends Error {
  * @returns {string | null}
  */
 export function resolvePluginEntry(pkg, cwd) {
+  return resolvePackageEntry(pkg, cwd, ["./opendweb-plugin", "."]);
+}
+
+/**
+ * Resolve the config-face root export. It shares the post-install fs fallback
+ * with the CLI face, but never treats the CLI manifest subpath as a root export.
+ * @param {string} pkg
+ * @param {string} cwd
+ * @returns {string | null}
+ */
+export function resolvePluginRootEntry(pkg, cwd) {
+  return resolvePackageEntry(pkg, cwd, ["."]);
+}
+
+/**
+ * Prefer Node resolution, then bypass its same-process negative directory cache
+ * only after every valid requested entry has failed.
+ * @param {string} pkg
+ * @param {string} cwd
+ * @param {string[]} exportPaths
+ * @returns {string | null}
+ */
+function resolvePackageEntry(pkg, cwd, exportPaths) {
   const base = path.join(cwd, "package.json");
   const req = createRequire(base);
+  for (const exportPath of exportPaths) {
+    const specifier = exportPath === "." ? pkg : pkg + exportPath.slice(1);
+    try {
+      return req.resolve(specifier);
+    } catch {
+      // Try every valid entry for this candidate before falling back to fs.
+    }
+  }
+  return resolvePackageEntryFromFs(pkg, cwd, exportPaths);
+}
+
+/**
+ * Follow Node node_modules lookup upward and realpath the package root so pnpm
+ * links read the target package metadata rather than a stale resolver cache.
+ * @param {string} pkg
+ * @param {string} cwd
+ * @param {string[]} exportPaths
+ * @returns {string | null}
+ */
+function resolvePackageEntryFromFs(pkg, cwd, exportPaths) {
+  const packageParts = pkg.split("/");
+  if (packageParts.some((part) => part === "" || part === "." || part === "..")) return null;
+  let searchDir = path.resolve(cwd);
+  for (;;) {
+    const linkedPackageDir = path.join(searchDir, "node_modules", ...packageParts);
+    let packageDir;
+    let packageJson;
+    try {
+      packageDir = realpathSync(linkedPackageDir);
+      packageJson = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
+    } catch {
+      packageDir = null;
+      packageJson = null;
+    }
+    if (packageDir !== null && isRecord(packageJson)) {
+      const hasExports = Object.prototype.hasOwnProperty.call(packageJson, "exports");
+      for (const exportPath of exportPaths) {
+        const entry = resolvePackageFile(packageDir, packageExportTarget(packageJson.exports, exportPath), false);
+        if (entry !== null) return entry;
+      }
+      // Exports is authoritative. main is only a legacy fallback when absent.
+      if (!hasExports) {
+        const main = typeof packageJson.main === "string" ? packageJson.main : "./index.js";
+        const entry = resolvePackageFile(packageDir, main, true);
+        if (entry !== null) return entry;
+      }
+    }
+    const parent = path.dirname(searchDir);
+    if (parent === searchDir) return null;
+    searchDir = parent;
+  }
+}
+
+/** @param {unknown} exportsField @param {string} exportPath @returns {string | null} */
+function packageExportTarget(exportsField, exportPath) {
+  if (typeof exportsField === "string" || Array.isArray(exportsField)) {
+    return exportPath === "." ? selectExportTarget(exportsField) : null;
+  }
+  if (!isRecord(exportsField)) return null;
+  if (Object.keys(exportsField).some((key) => key.startsWith("."))) {
+    return selectExportTarget(exportsField[exportPath]);
+  }
+  return exportPath === "." ? selectExportTarget(exportsField) : null;
+}
+
+/**
+ * 与 createRequire 使用的条件保持一致。解析出的 CommonJS 文件仍可由
+ * resolveAdaptive 使用的 file URL 导入。
+ * @param {unknown} target
+ * @returns {string | null}
+ */
+function selectExportTarget(target) {
+  if (typeof target === "string") return target;
+  if (Array.isArray(target)) {
+    for (const branch of target) {
+      const selected = selectExportTarget(branch);
+      if (selected !== null) return selected;
+    }
+    return null;
+  }
+  if (!isRecord(target)) return null;
+  for (const [condition, branch] of Object.entries(target)) {
+    if (condition === "node" || condition === "require" || condition === "default") {
+      const selected = selectExportTarget(branch);
+      if (selected !== null) return selected;
+    }
+  }
+  return null;
+}
+
+/** @param {unknown} value @returns {value is Record<string, unknown>} */
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Export targets must stay inside the package. Legacy main also gets common
+ * extension and index probing used by packages without an exports map.
+ * @param {string} packageDir
+ * @param {string | null} target
+ * @param {boolean} legacyMain
+ * @returns {string | null}
+ */
+function resolvePackageFile(packageDir, target, legacyMain) {
+  if (typeof target !== "string" || target.length === 0) return null;
+  if (!legacyMain && !target.startsWith("./")) return null;
+  const candidate = path.resolve(packageDir, target);
+  if (!isWithinPackage(packageDir, candidate)) return null;
+  const exact = existingFile(candidate);
+  if (exact !== null || !legacyMain) return exact;
+  for (const suffix of [".js", ".mjs", ".cjs"]) {
+    const withSuffix = existingFile(candidate + suffix);
+    if (withSuffix !== null) return withSuffix;
+  }
+  for (const name of ["index.js", "index.mjs", "index.cjs"]) {
+    const index = existingFile(path.join(candidate, name));
+    if (index !== null) return index;
+  }
+  return null;
+}
+
+/** @param {string} packageDir @param {string} candidate @returns {boolean} */
+function isWithinPackage(packageDir, candidate) {
+  const relative = path.relative(packageDir, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative));
+}
+
+/** @param {string} candidate @returns {string | null} */
+function existingFile(candidate) {
   try {
-    return req.resolve(`${pkg}/opendweb-plugin`);
+    return statSync(candidate).isFile() ? realpathSync(candidate) : null;
   } catch {
-    // 子路径 exports 不存在或包未安装（ERR_PACKAGE_PATH_NOT_EXPORTED /
-    // MODULE_NOT_FOUND）：前者按「入口不合规」处理走候选序列更宽容——
-    // 社区包常见错误形态，硬错误留给「能解析但清单坏」的场景
     return null;
   }
 }

@@ -69,6 +69,24 @@ test("npm plugin adapter (config face): root export {name, hooks}, options via c
   assert.match(r.result.bannerLines[0], /tokenEnv.*X/);
 });
 
+test("npm plugin adapter: same-process miss followed by install resolves the root export", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-npm-late-"));
+  await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");
+  await fsp.mkdir(path.join(dir, "node_modules"), { recursive: true });
+
+  await assert.rejects(
+    () => loadDeclaredPlugins({ plugins: [{ name: "echo" }], globs: DEFAULT_GLOBS, cwd: dir }),
+    /config plugin "echo" is not installed/,
+  );
+  const installed = path.join(dir, "node_modules", "@jixo", "opendweb-ext-echo");
+  await fsp.mkdir(path.dirname(installed), { recursive: true });
+  await fsp.cp(path.join(FIXTURES, "@jixo", "opendweb-ext-echo"), installed, { recursive: true });
+
+  const plugins = await loadDeclaredPlugins({ plugins: [{ name: "echo" }], globs: DEFAULT_GLOBS, cwd: dir });
+  assert.equal(plugins[0].kind, "npm");
+  assert.equal(plugins[0].name, "echo");
+});
+
 test("npm and local plugins coexist with equal rights; duplicate names rejected", async () => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-mix-"));
   await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");

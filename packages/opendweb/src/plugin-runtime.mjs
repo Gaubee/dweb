@@ -5,10 +5,9 @@ import { spawn } from "node:child_process";
 import { accessSync, constants as fsConstants } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
-import { createRequire } from "node:module";
 import { PluginManifestSchema } from "./plugin-contract.mjs";
 import { candidatesFor } from "./marketplace.mjs";
-import { resolvePluginEntry } from "./plugin-resolve.mjs";
+import { resolvePluginRootEntry } from "./plugin-resolve.mjs";
 import { asciiEscape, CliExit } from "./util.mjs";
 
 /** 生命周期与可调用钩子（v1 恰 3+1） */
@@ -156,14 +155,11 @@ export async function loadDeclaredPlugins({
     // （exports 存在时 package.json 不可解析——ERR_PACKAGE_PATH_NOT_EXPORTED）
     let entry = null;
     let pkg = null;
-    const req = createRequire(path.join(cwd, "package.json"));
     for (const candidate of candidatesFor(globs, name)) {
-      try {
-        entry = req.resolve(candidate);
+      entry = resolvePluginRootEntry(candidate, cwd);
+      if (entry !== null) {
         pkg = candidate;
         break;
-      } catch {
-        /* try next candidate */
       }
     }
     if (entry === null) {

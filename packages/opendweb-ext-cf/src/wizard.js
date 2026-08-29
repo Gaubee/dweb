@@ -16,14 +16,15 @@ export function planExposure({ hostname, mode = "dual" }) {
   let raw = String(hostname ?? "").trim().toLowerCase();
   if (raw.endsWith(".")) raw = raw.slice(0, -1); // FQDN 尾点合法（R3-Minor）
   // 每段：字母数字开头/结尾，中间可含 -，长度 <= 63（DNS label 规则）；
-  // 整体至少两段（可路由域名，非裸 TLD/localhost）、总长 <= 253
+  // 整体至少两段（可路由域名，非裸 TLD/localhost）、总长 <= 253；dual
+  // 模式实际使用 relay.<hostname>，派生后的 DNS 名也必须落在同一上限内。
   const LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
   const labels = raw.split(".");
-  if (labels.length < 2 || raw.length > 253 || !labels.every((l) => LABEL.test(l))) {
+  const relayHost = "relay." + raw;
+  if (labels.length < 2 || raw.length > 253 || relayHost.length > 253 || !labels.every((l) => LABEL.test(l))) {
     throw new Error(`invalid hostname: ${JSON.stringify(hostname ?? "")} (expected a DNS name like dweb.example.com)`);
   }
   const gatewayHost = raw;
-  const relayHost = `relay.${gatewayHost}`;
   return {
     mode,
     gatewayHost,
