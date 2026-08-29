@@ -75,3 +75,12 @@
       记录 + 派发成功）、NO_AUTO_INSTALL 语义、get 别名
 - [x] 5.5 文档同步：design D2 / proposal / spec delta（两 Scenario 重写）/
       README EN+zh；opendweb 59/59
+
+## 6. 复审闭环后续项（Codex R7 终审 8.3/10 可合并，2026-08-30 登记）
+
+- [ ] 6.1 expectedPackageRoot 与注释承诺对齐：近层错名目录遮蔽外层合法
+      副本时，受控转向已验证的外层 expectedRoot 走 fs 解析（近层错身份
+      ≠ 包内入口 symlink 逃逸，后者仍硬拒）；补嵌套依赖树回归
+- [ ] 6.2 并发停止回归断言增强：fake child 收到 SIGINT 后延迟退出，先
+      单独断言第二个 preStop 仍 pending；另加真实 CLI 双信号集成回归，
+      验证 server.stop() 仅在唯一 preStop 流程完成后触发
