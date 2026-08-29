@@ -1,6 +1,6 @@
 {
   "name": "@jixo/opendweb-example",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "@jixo/opendweb-example — two-process fabric networking example (invite / join / chat)",
   "license": "MIT OR Apache-2.0",
   "bin": {

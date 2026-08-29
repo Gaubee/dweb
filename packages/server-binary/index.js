@@ -30,6 +30,8 @@ if (!BINARY_NAME) {
  * @property {string} [publicGatewayUrl] 公网 gateway 入口（反代/隧道后 services.json 的公告值）；
  *                                   仅显式定义时写 DWEB_PUBLIC_GATEWAY_URL，缺省继承父进程环境
  * @property {string} [publicRelayUrl]   公网 relay 入口；仅显式定义时写 DWEB_PUBLIC_RELAY_URL
+ * @property {boolean} [forwardStderr]   默认 true：子进程 stderr 实时转发到父进程；
+ *                                   false 时仅留存尾部（stderrTail() 可取）
  */
 
 /**
@@ -87,6 +89,15 @@ export async function startServer(options = {}) {
     throw new Error("failed to spawn dweb-server");
   }
 
+  // R2 P1-2：stderr 实时转发 + 尾部留存（最后 2KB）——子进程异常退出时
+  // 调用方可取诊断输出；server 日志本就该对用户可见（默认转发，可关）。
+  let stderrTail = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (d) => {
+    stderrTail = (stderrTail + d).slice(-2048);
+    if (options.forwardStderr !== false) process.stderr.write(d);
+  });
+
   const exited = new Promise((resolve, reject) => {
     child.once("exit", (code) => resolve(code ?? 0));
     child.once("error", reject);
@@ -111,6 +122,8 @@ export async function startServer(options = {}) {
     httpUrl: gatewayUrl,
     relayHttpUrl,
     servicesUrl: `${gatewayUrl}/services.json`,
+    /** 子进程 stderr 尾部（最后 2KB；异常退出时的诊断输出） */
+    stderrTail: () => stderrTail,
     stop,
     exited,
   };

@@ -71,27 +71,26 @@ pub struct Manifest {
     pub services: Vec<ServiceEntry>,
 }
 
-/// 本机首个非 loopback IPv4：UDP connect 让路由选择出口地址（不发包）。
-/// 与 JS 横幅的 os.networkInterfaces() 枚举同一语义的 rust 侧近似（首地址）。
+/// 数值序最小的非 loopback IPv4（hardening-backlog 9.2 统一语义 D1）：
+/// 与 JS 横幅 networkIPv4s() 的四段数值升序一致——排序后首地址即本函数结果，
+/// 消除"JS 字典序 vs Rust 接口序"的双语言漂移。
+/// 非 unix（Windows exe）保留 UDP 路由试探：无 getifaddrs，接口序不可得，
+/// D1 明确豁免（与 JS 横幅可能不同地址，但均为合法本机入口）。
 pub fn primary_non_loopback_ipv4() -> Option<Ipv4Addr> {
     // 本机接口枚举（与横幅 os.networkInterfaces() 同语义），不依赖默认路由/外网
     // （UDP-connect 试探在离线但有 LAN 网卡时返回 None——实现复审 P1-7）。
     #[cfg(unix)]
     {
         let ifas = nix::ifaddrs::getifaddrs().ok()?;
-        for ifa in ifas {
-            let Some(storage) = ifa.address else { continue };
-            let Some(inet) = storage.as_sockaddr_in() else {
-                continue;
-            };
+        ifas.filter_map(|ifa| {
+            let storage = ifa.address?;
+            let inet = storage.as_sockaddr_in()?;
             let v4 = inet.ip();
             // 与横幅（networkInterfaces 非 loopback IPv4）同语义：不额外排除
             // link-local（169.254）——只有此类网卡时 gateway 仍有单一入口地址
-            if !v4.is_loopback() {
-                return Some(v4);
-            }
-        }
-        None
+            (!v4.is_loopback()).then_some(v4)
+        })
+        .min()
     }
     #[cfg(not(unix))]
     {
@@ -907,7 +906,7 @@ mod tests {
         let (m, w) = build_manifest(&info, "http", Some("0.0.0.0:8787"));
         assert_eq!(m.gateway.as_deref(), Some("https://dweb.example.com"));
         // relay 派生失败：无回退 -> WARNING + url null（enabled 照实）
-        assert_eq!(m.services[1].enabled, true);
+        assert!(m.services[1].enabled);
         assert_eq!(m.services[1].url, None);
         assert_eq!(w, vec![NO_FALLBACK_WARNING.to_string()]);
     }

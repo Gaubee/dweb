@@ -1,154 +1,226 @@
 # dweb
 
-应用级组网平台（dweb-cloud）：让多设备应用组成逻辑网络（类似游戏房间，不是系统级 VPN），支持受控邀请他人加入；P2P 直连优先，回退到可自托管的 Relay。
+[中文版](README-zh.md)
+
+Application-level networking platform (dweb-cloud): lets multi-device applications form logical networks — like game rooms, not a system-level VPN — with controlled, invite-based membership. Peers connect directly over QUIC when possible and fall back to a self-hostable relay.
 
 ```text
-身份层   Ed25519 EndpointId（稳定身份，与网络地址解耦；展示串 z-base-32）
-名册层   Roster = 签名事实（Genesis/Grant/Join/Revoke）内容寻址(BLAKE3) + union-merge 收敛
-         受控邀请 = issuer-online 单次兑换（challenge-response PoP + invite_id CAS 消费）
-会话层   iroh 1.1：QUIC 直连 + NAT 穿透 + 自托管 relay 回退；双 ALPN(常规/redeem)；
-         两侧门控（先门控后数据）；帧资源上限
-同步层   不透明 envelope 双向收发（v0.2 接入 Automerge 适配器）
+Identity  Ed25519 EndpointId (stable identity, decoupled from network
+          addresses; z-base-32 display form)
+Roster    signed facts (Genesis/Grant/Join/Revoke), content-addressed
+          (BLAKE3) + union-merge convergence; controlled invites via
+          issuer-online single redemption (challenge-response PoP +
+          invite_id CAS consumption)
+Session   iroh 1.1: QUIC direct + NAT traversal + self-hosted relay
+          fallback; dual ALPN (regular/redeem); gating on both sides
+          (gate before data); per-frame resource caps
+Sync      opaque envelopes, bidirectional send/receive (Automerge
+          adapter planned as a separate change)
 ```
 
-## 仓库布局
+## Packages
 
-- `crates/dweb-fabric` — 组网 kernel（Rust lib：identity/protocol/roster/session/fabric 门面）
-- `crates/dweb-server` — 自托管服务端：iroh-relay + rendezvous（Rust bin）
-- `packages/client-sdk` — `@jixo/opendweb-client-sdk`（napi-rs，darwin-arm64）
-- `packages/example` — `@jixo/opendweb-example` 双进程组网 CLI 样板
-- `packages/server-binary` — `@jixo/opendweb-server-binary` 服务端 npm 包装（darwin-arm64）
-- `docker/` — 镜像 `ghcr.io/gaubee/dweb`（rendezvous 8787 + relay 3340）
+| npm package | Role |
+| --- | --- |
+| [`opendweb`](https://www.npmjs.com/package/opendweb) | Server CLI — `npx opendweb server` starts the self-hosted gateway + relay |
+| [`@jixo/opendweb-server-binary`](https://www.npmjs.com/package/@jixo/opendweb-server-binary) | Server binary wrapper used by the CLI; also exposes a programmatic `startServer()` |
+| [`@jixo/opendweb-example`](https://www.npmjs.com/package/@jixo/opendweb-example) | Reference two-process client CLI (`init` / `invite` / `join` / `chat`) |
+| [`@jixo/opendweb-client-sdk`](https://www.npmjs.com/package/@jixo/opendweb-client-sdk) | Node SDK for embedding fabrics in your own app (napi-rs; darwin-arm64 / win32-x64) |
 
-## 快速开始（体验 example）
+All packages are published at v0.2.1. Server deployments on other platforms can use the docker image `ghcr.io/gaubee/dweb`.
+
+## Repository layout
+
+- `crates/dweb-fabric` — networking kernel (Rust lib: identity/protocol/roster/session/fabric facade)
+- `crates/dweb-server` — self-hosted server: iroh relay + rendezvous (Rust bin)
+- `packages/client-sdk` — `@jixo/opendweb-client-sdk` (napi-rs)
+- `packages/example` — `@jixo/opendweb-example` two-process fabric CLI
+- `packages/server-binary` — `@jixo/opendweb-server-binary` server npm wrapper
+- `docker/` — image `ghcr.io/gaubee/dweb` (rendezvous 8787 + relay 3340)
+
+## Quick start
 
 ```bash
-# 1. 启动自托管 server（gateway + relay）—— 顶层 CLI
-pnpm --filter opendweb exec node bin/opendweb.mjs server
-#   或发布后: npx opendweb server
-#   也可用 docker: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
-#   横幅会列出本机全部 Network 地址——任一地址即客户端唯一配置入口，
-#   gateway 经 /services.json 自动发现 relay。
+# 1. Start the self-hosted server (gateway + relay) — top-level CLI
+npx opendweb server
+#   or: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+#   The banner lists every Network address. Any of them is the single
+#   config entry for clients — the gateway discovers the relay URL
+#   automatically via /services.json.
 
-# 2. 每台客户端机器：一次性配置（持久化于 ~/.opendweb/config.json）
-node packages/example/src/cli.mjs config set relay http://192.168.2.13:8787
-#   裸 0.1.0 relay URL（http://host:3340）同样可用（legacy 兼容模式）。
+# 2. On each client machine: one-time config (persisted to ~/.opendweb/config.json)
+npx @jixo/opendweb-example config set relay http://192.168.2.13:8787
+#   A bare 0.1.0 relay URL (http://host:3340) also works (legacy mode).
 
-# 3. 终端 A：初始化并常驻聊天
-node packages/example/src/cli.mjs init --data ~/.dweb-a
-node packages/example/src/cli.mjs invite --data ~/.dweb-a --ttl 30m   # 复制 token
-node packages/example/src/cli.mjs chat --data ~/.dweb-a
+# 3. Terminal A: initialize and keep a chat session running
+npx @jixo/opendweb-example init --data ~/.dweb-a
+npx @jixo/opendweb-example invite --data ~/.dweb-a --ttl 30m   # copy the token
+npx @jixo/opendweb-example chat --data ~/.dweb-a
 
-# 4. 终端 B（另一目录/设备）：兑换邀请并聊天
-node packages/example/src/cli.mjs join --data ~/.dweb-b <token>
-node packages/example/src/cli.mjs chat --data ~/.dweb-b
+# 4. Terminal B (another directory/device): redeem the invite and chat
+npx @jixo/opendweb-example join --data ~/.dweb-b <token>
+npx @jixo/opendweb-example chat --data ~/.dweb-b
 ```
 
-**Invites must be redeemed while the inviter is online**（issuer-online 单次兑换）：
-签发者进程（如 `chat` 会话）必须在兑换期间保持运行；一次性 `invite` 进程签发的
-令牌在 relay 模式下可用，但无 relay 令牌会被直接拒签（`--allow-relayless` 逃生阀除外）。
+Expected server banner:
 
-代理说明：`--proxy auto|on|off`（默认 auto，配置键 `proxy`）控制 HTTP 控制面（relay 连接）
-是否走系统代理；env 读取顺序 `HTTP_PROXY > http_proxy > HTTPS_PROXY > https_proxy`，
-与 iroh 一致。**QUIC 数据面（直连 + NAT 穿透）永不经 HTTP 代理**——auto 模式下局域网
-relay 直连探测可达即自动绕过代理，旧版手动 `NO_PROXY` 的需求消失。
+```text
+  * opendweb server v0.2.1
+  > Local:   http://localhost:8787
+  > Network: http://192.168.1.100:8787
 
-join 失败带稳定错误码（`error[join/<code>]`，如 `no-reachable-path` 秒败并指路、
-`dial-timeout` 附注 issuer 可能离线）；`config list` 可查看各配置项的生效值与来源
-（flag > env > file > default）。
+  Use any Network address as the single config entry for clients.
 
-## 服务器部署（docker）
+    NAME         PORT   STATE
+    gateway      8787   entry point
+    rendezvous   8787   merged into gateway
+    relay        3340   enabled
+
+  Press Ctrl+C to stop
+```
+
+**Invites must be redeemed while the inviter is online** (issuer-online single redemption): the inviter's process (e.g. a `chat` session) must stay running during redemption. A one-shot `invite` process produces a usable token in relay mode, but with no relay configured signing is refused outright (unless the `--allow-relayless` escape hatch is passed).
+
+No per-terminal `export DWEB_RELAY=...` is needed — since v0.2 the client config (`config set relay`) is persisted once in `~/.opendweb/config.json` (dir 0700 / file 0600) and applies to every command. Configuration precedence is `flag > env > file > default`; `config list` shows each key's effective value and its source.
+
+Proxy behavior: `--proxy auto|on|off` (default `auto`, config key `proxy`) controls whether the HTTP control plane (relay connections) goes through the system proxy; env read order is `HTTP_PROXY > http_proxy > HTTPS_PROXY > https_proxy`, consistent with iroh. **The QUIC data plane (direct connections + NAT traversal) never goes through an HTTP proxy** — in `auto` mode, a LAN relay that is directly reachable bypasses the proxy automatically, so the old manual `NO_PROXY` dance is gone.
+
+Join failures carry stable error codes (`error[join/<code>]`): e.g. `NO_REACHABLE_PATH` fails instantly with guidance, `DIAL_TIMEOUT` notes the issuer is likely offline.
+
+## Self-hosting the server
 
 ```bash
 docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
-# 客户端配置单一入口（gateway 自动发现 relay）：
+# Clients configure the single entry point (the gateway discovers the relay):
 #   config set relay http://<relay-host>:8787
 ```
 
-### 环境变量（server）
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `DWEB_GATEWAY_BIND` | `0.0.0.0:8787` | gateway 监听（healthz/rendezvous/services.json） |
-| `DWEB_RELAY_HTTP_BIND` | `0.0.0.0:3340` | relay 监听 |
-| `DWEB_RELAY_ENABLED` | `true` | `false`/`0`/`off` 关闭 relay |
-| `DWEB_TRUST_PROXY` | 未设 | 反代 TLS 终结时设 `1` 才采信 `X-Forwarded-Proto` |
-| `DWEB_PUBLIC_GATEWAY_URL` | 未设 | 反代/隧道后的公网 gateway 入口（如 `https://dweb.example.com`）；设置后 services.json/横幅按条目公告该值 |
-| `DWEB_PUBLIC_RELAY_URL` | 未设 | 公网 relay 入口；与 gateway 覆盖相互独立（flag `--public-gateway`/`--public-relay` 同义） |
-
-## 无公网 IP 部署：反向代理 / 隧道（厂商中立，以 Cloudflare Tunnel 为参考）
-
-家用主机无公网 IP 时，任意「终结 TLS、回源 HTTP/WS」的 front-end 都可用
-（Cloudflare Tunnel、ngrok、frp、Caddy on VPS……）。要点只有两条：
-
-1. **公网入口公告**：设置 `DWEB_PUBLIC_GATEWAY_URL` / `DWEB_PUBLIC_RELAY_URL`
-   （URL 形态 `http(s)://host[:port]`，不允许 path——iroh 客户端会丢弃 relay
-   URL 的 path），gateway 与 relay 条目按需独立覆盖；
-2. **回源保持 HTTP/WS**：服务端明文监听即可，TLS 由 front-end 终结
-   （`DWEB_TRUST_PROXY=1` 时派生条目采信 `X-Forwarded-Proto`）。
-
-Cloudflare Tunnel 参考（免费版即可；域名需托管在 CF）：
+Without docker, `npx opendweb server` runs the same binary. Server flags:
 
 ```bash
-# Zero Trust 面板 -> Networks -> Tunnels 建隧道拿 TUNNEL_TOKEN，
-# Public Hostname 按单域名路径分流：/relay*、/ping* -> http://dweb:3340，
-# 其余 -> http://dweb:8787（iroh 客户端自行拼 /relay 路径，单域名即可工作）
+npx opendweb server --gateway 0.0.0.0:9999  # custom gateway port (--opt=value also works)
+npx opendweb server --relay 0.0.0.0:3350    # custom relay port
+npx opendweb server --no-relay              # relay off
+DWEB_TRUST_PROXY=1 npx opendweb server      # behind a TLS-terminating reverse proxy
+npx opendweb server --public-gateway https://dweb.example.com \
+                    --public-relay   https://dweb.example.com   # see below
+```
+
+The gateway (port 8787) serves `/healthz`, `/services.json`, `/rendezvous/{id}` and a plain-text summary at `/`; the relay (port 3340) is a separate listener. Verify a running server with:
+
+```bash
+curl http://localhost:8787/healthz        # -> 200
+curl http://localhost:8787/services.json  # -> machine-readable service manifest
+```
+
+### Environment variables (server)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DWEB_GATEWAY_BIND` | `0.0.0.0:8787` | gateway listen address (healthz/rendezvous/services.json) |
+| `DWEB_RELAY_HTTP_BIND` | `0.0.0.0:3340` | relay listen address |
+| `DWEB_RELAY_ENABLED` | `true` | set to `false`/`0`/`off` to disable the relay |
+| `DWEB_TRUST_PROXY` | unset | set `1` behind a TLS-terminating reverse proxy to honor `X-Forwarded-Proto` |
+| `DWEB_PUBLIC_GATEWAY_URL` | unset | public gateway entry behind a reverse proxy/tunnel (e.g. `https://dweb.example.com`); when set, services.json and the banner advertise this value for the entry |
+| `DWEB_PUBLIC_RELAY_URL` | unset | public relay entry; independent of the gateway override (flags `--public-gateway`/`--public-relay` are equivalent) |
+
+Precedence is `flag > env > default`. Invalid public URLs are hard errors at startup.
+
+## Deployment without a public IP: reverse proxy / tunnel (vendor-neutral, Cloudflare Tunnel as reference)
+
+When the host has no public IP, any front-end that terminates TLS and forwards plain HTTP/WS upstream works (Cloudflare Tunnel, ngrok, frp, Caddy on a VPS...). There are only two requirements:
+
+1. **Announce the public entry**: set `DWEB_PUBLIC_GATEWAY_URL` / `DWEB_PUBLIC_RELAY_URL`
+   (form `http(s)://host[:port]`, no path — iroh clients drop the path of a relay
+   URL); the gateway and relay entries can be overridden independently;
+2. **Keep the upstream plain HTTP/WS**: the server listens in plaintext; TLS is
+   terminated by the front-end (with `DWEB_TRUST_PROXY=1`, derived entries honor
+   `X-Forwarded-Proto`).
+
+Cloudflare Tunnel reference (free tier works; the domain must be hosted on CF):
+
+```bash
+# Zero Trust dashboard -> Networks -> Tunnels: create a tunnel, copy TUNNEL_TOKEN,
+# route Public Hostnames by path on a single domain: /relay*, /ping* -> http://dweb:3340,
+# everything else -> http://dweb:8787 (iroh clients build the /relay path themselves,
+# so a single domain is enough)
 cd docker && TUNNEL_TOKEN=... \
   DWEB_PUBLIC_GATEWAY_URL=https://dweb.example.com \
   DWEB_PUBLIC_RELAY_URL=https://dweb.example.com \
   docker compose up -d
-# 不发布任何宿主端口（纯隧道暴露）；客户端（任意网络）：
+# No host ports are published (tunnel-only exposure). Clients (from any network):
 #   config set relay https://dweb.example.com
 ```
 
-直连打洞不经过隧道（iroh QUIC peer↔peer）；隧道只承载 rendezvous/services.json
-短请求与打洞失败时的 relay 回退流量（WS，iroh 15s ping 保活穿透 CF 100s 空闲超时）。
-调研与风险（大陆延迟实测、ToS 边界）见 `docs/research-cf-tunnel.md`。
+Direct hole-punching never goes through the tunnel (iroh QUIC peer-to-peer); the tunnel only carries the short rendezvous/services.json requests and relay fallback traffic (WS — iroh's 15s pings keep it alive through CF's 100s idle timeout). Field research and risks (measured mainland-China latency, ToS boundaries): `docs/research-cf-tunnel.md`.
 
-## SDK（Node，darwin-arm64）
+## Client SDK (Node, darwin-arm64 / win32-x64)
 
 ```js
 const { Fabric } = require("@jixo/opendweb-client-sdk");
-const a = await Fabric.createRoot({ dataDir: "/path/a", relay: { mode: "disabled" } });
-const token = await a.invite(60 * 60_000, null);          // root 签发（v0.2 默认 60m）
-const b = await Fabric.joinWithToken({ dataDir: "/path/b" }, token); // 在线兑换
-const off = b.on((e) => console.log(e.type, e.data?.toString())); // 事件（off() 取消订阅）
-console.log(await b.relayStatus());                       // { mode, urls, online, lastError }
+
+const relay = { mode: "custom", urls: ["http://192.168.2.13:3340"] }; // relay URL from the server's /services.json
+
+// Machine A: create the fabric (this node becomes root) and sign an invite
+const a = await Fabric.createRoot({ dataDir: "/path/a", relay });
+const token = await a.invite(60 * 60_000, null); // dweb1.-prefixed token, valid 60 min
+const off = a.on((e) => console.log(e.type, e.data?.toString("utf8"))); // events; off() unsubscribes
+console.log(await a.relayStatus()); // { mode, urls, online, lastError, activeUrl }
+
+// Machine B: redeem the token (issuer must be online) and exchange messages
+const b = await Fabric.joinWithToken({ dataDir: "/path/b", relay }, token);
 await b.connect(a.endpointId);
 await a.send(b.endpointId, Buffer.from("ping"));
-await a.revoke(b.endpointId);                              // 撤销
+await a.revoke(b.endpointId); // root-only
+
+await a.shutdown();
+await b.shutdown();
 ```
 
-## 身份存储与恢复（信任模型中立）
+Event types: `peer-connected` / `peer-disconnected` (`endpointId`), `roster-updated`, `message` (`from`, `data: Buffer`), `path-changed` (`endpointId`, `status: "direct" | "relay" | "unknown"`), `relay-online` / `relay-offline` (full `RelayStatus` payload). Always read the initial state from `relayStatus()`; events only carry subsequent transitions.
 
-内核不规定 secret 的存放位置——这是产品的信任模型决策：
+`FabricOptions`: `dataDir` (required), `relay?: { mode: "n0" } | { mode: "disabled" } | { mode: "custom", urls: [...] }`, `httpProxy?: "none" | "from-env" | { url }` (default `"none"`; QUIC data plane never proxied), `advertiseAddrs?: string[]`, `joinTimeoutMs?: number` (default 30000, range 1s..10m).
+
+## Identity storage and recovery (trust-model neutral)
+
+The kernel does not mandate where the secret lives — that is a product trust-model decision:
 
 ```text
-纯本地（默认）            加密托管                      产品代管
-identity.key 文件          账号系统存 exportSecret 的     服务方持有明文 key
-（FileSecretStore）        密文，口令派生在用户           （产品自担，内核中立）
+purely local (default)     encrypted custody                product-managed
+identity.key file          account system stores the        service holds the
+(FileSecretStore)          exportSecret ciphertext; the     plaintext key
+                           passphrase-derived key stays
+                           with the user
 ```
 
 ```js
-const token = await fabric.exportSecretPassphrase("用户口令"); // dwebkey1... 密文
-const handle = await importSecret(token, "用户口令");           // opaque 句柄
-const fabric2 = await Fabric.createRoot({ dataDir }, handle);   // 注入恢复同身份
+const token = await fabric.exportSecretPassphrase("passphrase"); // dwebkey1... ciphertext
+const handle = await importSecret(token, "passphrase"); // opaque handle
+const fabric2 = await Fabric.createRoot({ dataDir }, handle); // restore the same identity
 ```
 
-- 导出是 **identity export**（只含身份种子，不含 roster——名册经网络同步重建）
-- 句柄一次性：构造失败自动归还可重试；明文 seed 不经手 JS 字符串
-- 自定义存储（Keychain/托管后端）：Rust 侧实现 `SecretStore` trait（`load`/`create`
-  线性化 insert-if-absent），经 `SecretInjection::Store` 注入
+- Export is an **identity export** (identity seed only, no roster — the roster is rebuilt via network sync)
+- The handle is one-shot: if construction fails it is returned automatically and can be retried; the plaintext seed never passes through a JS string
+- Custom storage (Keychain / managed backends): implement the `SecretStore` trait on the Rust side (`load`/`create` with linearized insert-if-absent) and inject it via `SecretInjection::Store`
 
-## 开发
+## Documentation and testing
+
+- [EXAMPLE.md](EXAMPLE.md) — end-to-end release regression manual (English)
+- [EXAMPLE-zh.md](EXAMPLE-zh.md) — the same manual in Chinese
+- `docs/research-cf-tunnel.md` — Cloudflare Tunnel field research
+
+## Development
 
 ```bash
-cargo test --workspace        # Rust（fabric 50 测试）
-pnpm --filter @jixo/opendweb-client-sdk test     # node --test（SDK 生命周期）
-pnpm --filter @jixo/opendweb-example test        # node --test（双进程 relay E2E）
+cargo test --workspace                              # Rust (fabric kernel + server)
+pnpm --filter @jixo/opendweb-client-sdk test        # node --test (SDK lifecycle)
+pnpm --filter @jixo/opendweb-example test           # node --test (two-process relay E2E)
 ```
 
-- 仓库位于网络磁盘：Rust 编译走本地 `CARGO_TARGET_DIR`（`.cargo/config.toml` 本机配置，
-  CI/容器以 env 覆盖）。
-- 原生二进制经内容寻址临时路径加载（规避 SMB 页缓存与 dyld 坏闭包）。
-- 研发流程：OpenSpec 驱动（当前 change：`openspec/changes/connectivity-ux-hardening`）。
+- The repository lives on a network disk: Rust builds use a local `CARGO_TARGET_DIR` (`.cargo/config.toml` machine-local config; CI/containers override via env).
+- Native binaries are loaded from a content-addressed temp path (avoids SMB page cache and dyld bad-closure issues).
+- Development is OpenSpec-driven; see `openspec/changes/` for active changes.
+
+## License
+
+MIT OR Apache-2.0. Repository: <https://github.com/Gaubee/dweb>.

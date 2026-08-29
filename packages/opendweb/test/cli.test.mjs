@@ -44,6 +44,22 @@ function waitExit(child) {
   return new Promise((resolve) => child.once("exit", resolve));
 }
 
+/**
+ * 轮询等待条件成立。CLI 的 readiness 门（R2 P1-2）使横幅延迟到子进程
+ * healthz 首次成功（约 200-400ms）之后才打印——e2e 断言必须等横幅真的
+ * 出现，而不是 healthz 一通就断言（两者是竞态，负载高时测试侧先赢）。
+ * @param {() => boolean} cond
+ * @param {number} [timeoutMs]
+ */
+async function waitUntil(cond, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error("condition not met within timeout");
+}
+
 /** @param {string} url @param {number} [ms] */
 async function waitHealthy(url, ms = 30000) {
   const deadline = Date.now() + ms;
@@ -119,15 +135,19 @@ test("resolveServerArgs: public URL overrides (flag > env > null, trailing slash
 
 test("resolveServerArgs: public URL validation mirrors server rules", () => {
   // path 前缀（iroh set_path 会丢弃 path，必然错配）、query/fragment、
-  // 非 http(s)、userinfo、端口越界
+  // 非 http(s)、userinfo、端口越界、空端口
   for (const bad of [
     "https://ex.com/dweb",
     "https://ex.com/?a=b",
     "https://ex.com/#frag",
     "ftp://ex.com",
     "https://user:pass@ex.com",
+    "https://user@ex.com",
+    "https://ex.com@evil.com",
     "https://ex.com:0",
     "https://ex.com:65536",
+    "https://ex.com:",
+    "https://ex.com:abc",
     "not a url",
   ]) {
     const r = resolveServerArgs(["--public-gateway", bad], {});
@@ -141,6 +161,21 @@ test("resolveServerArgs: public URL validation mirrors server rules", () => {
   );
   assert.equal(ok.publicGatewayUrl, "http://[fd00::1]:9000");
   assert.equal(ok.publicRelayUrl, "https://relay.example.com");
+});
+
+test("public URL rules: whitespace/unicode host rejected, scheme case normalized (R2 P1-2/P1-3)", () => {
+  // R2 P1-2：带空格 host 不得被 CLI 放行（旧正则的 host 字符集过宽）
+  assert.ok(resolveServerArgs(["--public-gateway", "https://exa mple.com"], {}).error);
+  assert.ok(resolveServerArgs(["--public-gateway", "https://h\u{4e2d}.com"], {}).error);
+  assert.ok(resolveServerArgs(["--public-gateway", "https://ex.com\n"], {}).error);
+  // R2 P1-3：scheme 大小写不敏感，canonical 归一为小写（与 Rust 侧
+  // http::Uri 的 scheme 归一一致，杜绝「校验通过/公告禁用」分裂）
+  const r = resolveServerArgs(
+    ["--public-gateway", "HTTPS://GW.example.com", "--public-relay", "HtTp://relay.example.com"],
+    {},
+  );
+  assert.equal(r.publicGatewayUrl, "https://GW.example.com");
+  assert.equal(r.publicRelayUrl, "http://relay.example.com");
 });
 
 test("banner: all-ASCII, Local/Network enumeration, NAME | PORT service table", () => {
@@ -166,6 +201,23 @@ test("banner: all-ASCII, Local/Network enumeration, NAME | PORT service table", 
   assert.ok(banner.includes("relay"));
   assert.ok(banner.includes("enabled"));
   assert.ok(banner.includes("Press Ctrl+C to stop"));
+});
+
+test("banner: non-ASCII dynamic values (Local host, version) are escaped, never bare-interpolated", () => {
+  // 9.1 动态值纪律：host/version 非 ASCII（UTF-8）时转义为 \xNN 小写 hex 字节序列
+  const banner = buildBanner({
+    version: "0.2.0-ü", // ü = U+00FC = UTF-8 c3 bc
+    gatewayBind: "höst.example:8787", // ö = U+00F6 = UTF-8 c3 b6
+    relayBind: "0.0.0.0:3340",
+    relayEnabled: true,
+    ips: ["192.168.2.13"],
+  });
+  assert.match(banner, ASCII, "banner must stay all-ASCII with non-ASCII inputs");
+  assert.ok(banner.includes("  * opendweb server v0.2.0-\\xc3\\xbc"));
+  assert.ok(banner.includes("  > Local:   http://h\\xc3\\xb6st.example:8787"));
+  // 服务表完好（端口为纯数字，转义为恒等变换）
+  assert.match(banner, /NAME\s+PORT\s+STATE/);
+  assert.ok(banner.includes("entry point"));
 });
 
 test("banner: placeholder line when no non-loopback IPv4 found", () => {
@@ -225,15 +277,20 @@ test("banner: no duplicate Network lines for repeated interface addresses", () =
   assert.equal(banner.split("http://192.168.2.13:8787").length - 1, 1);
 });
 
-test("networkIPv4s enumerates all non-loopback IPv4, deduped and sorted", () => {
+test("networkIPv4s enumerates all non-loopback IPv4, deduped and numerically sorted", () => {
   const expected = [];
   for (const list of Object.values(os.networkInterfaces())) {
     for (const ni of list ?? []) {
       if ((ni.family === "IPv4" || ni.family === 4) && !ni.internal) expected.push(ni.address);
     }
   }
-  const dedupedSorted = [...new Set(expected)].sort();
-  assert.deepEqual(networkIPv4s(), dedupedSorted);
+  // 期望序独立于实现表述：点分四段逐段数值升序（task 9.2 冻结语义）
+  const numeric = (a, b) => {
+    const pa = a.split(".").map(Number);
+    const pb = b.split(".").map(Number);
+    return (pa[0] - pb[0]) || (pa[1] - pb[1]) || (pa[2] - pb[2]) || (pa[3] - pb[3]);
+  };
+  assert.deepEqual(networkIPv4s(), [...new Set(expected)].sort(numeric));
   // 纯函数注入形态
   assert.deepEqual(
     networkIPv4s({
@@ -249,6 +306,17 @@ test("networkIPv4s enumerates all non-loopback IPv4, deduped and sorted", () => 
       en1: [{ family: "IPv4", internal: false, address: "10.0.0.2" }],
     }),
     ["10.0.0.1", "10.0.0.2"],
+  );
+  // task 9.2 回归：字符串字典序会把 "9.0.0.1" 排到 "10.0.0.2" 之后，数值序必须在前
+  assert.deepEqual(
+    networkIPv4s({
+      en0: [
+        { family: "IPv4", internal: false, address: "192.168.1.5" },
+        { family: "IPv4", internal: false, address: "10.0.0.2" },
+        { family: "IPv4", internal: false, address: "9.0.0.1" },
+      ],
+    }),
+    ["9.0.0.1", "10.0.0.2", "192.168.1.5"],
   );
 });
 
@@ -286,9 +354,14 @@ test("opendweb server e2e: ASCII banner + /services.json + GET / (random ports)"
   try {
     await waitHealthy(`http://127.0.0.1:${gatewayPort}`);
 
-    // 横幅：全 ASCII + Local/Network + 服务表
+    // 横幅：全 ASCII + Local/Network + 服务表（readiness 门使横幅略滞后，
+    // 必须等横幅完整出现再断言——banner 尾行是打印完成的标志）
+    await waitUntil(() => stdout.includes("Press Ctrl+C to stop"));
     assert.match(stdout, ASCII, "CLI output must be all-ASCII");
-    assert.ok(stdout.includes(`  > Local:   http://127.0.0.1:${gatewayPort}`));
+    assert.ok(
+      stdout.includes(`  > Local:   http://127.0.0.1:${gatewayPort}`),
+      `Local line missing; exitCode=${child.exitCode} stdout=${JSON.stringify(stdout.slice(0, 300))}`,
+    );
     const ips = networkIPv4s();
     if (ips.length > 0) {
       assert.ok(stdout.includes(`http://${ips[0]}:${gatewayPort}`), "banner lists network IPv4");
@@ -384,6 +457,8 @@ test("opendweb server e2e: public URL overrides are advertised in /services.json
   child.stderr.on("data", (d) => (stdout += d));
   try {
     await waitHealthy(`http://127.0.0.1:${gatewayPort}`);
+    // readiness 门使横幅滞后于 healthz；等横幅完整出现再断言 Public 节
+    await waitUntil(() => stdout.includes("Press Ctrl+C to stop"));
     // 横幅 Public 节（public-exposure D5）
     assert.ok(stdout.includes("  > Public:  gateway https://gw.example.com"));
     assert.ok(stdout.includes("             relay   https://relay.example.com"));
@@ -414,4 +489,44 @@ test("opendweb server e2e: invalid public URL fails fast with exit code 2", asyn
     child.on("exit", (c) => resolve(c));
   });
   assert.equal(code, 2);
+});
+
+test("opendweb server e2e: child bind failure propagates non-zero exit, no banner (R2 P1-2)", async () => {
+  // 端口冲突设计在 relay 端口：Rust main 先绑 relay 再绑 gateway，第二实例
+  // 在 relay bind 即失败退出；其 gateway 端口是全新空闲口——readiness 门的
+  // healthz 探测永远失败，必须由 exited 分支胜出：无横幅、stderr 转发、
+  // 非零退出码（CLI 不再伪成功）。
+  const relayPort = await freePort();
+  const first = spawn(
+    NODE,
+    [CLI, "server", "--gateway", `127.0.0.1:${await freePort()}`, "--relay", `127.0.0.1:${relayPort}`],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let firstOut = "";
+  first.stdout.on("data", (d) => (firstOut += d));
+  try {
+    await waitUntil(() => firstOut.includes("Press Ctrl+C to stop"));
+
+    const second = spawn(
+      NODE,
+      [CLI, "server", "--gateway", `127.0.0.1:${await freePort()}`, "--relay", `127.0.0.1:${relayPort}`],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let secondOut = "";
+    let secondErr = "";
+    second.stdout.on("data", (d) => (secondOut += d));
+    second.stderr.on("data", (d) => (secondErr += d));
+    const code = await new Promise((resolve) => {
+      second.once("exit", (c) => resolve(c));
+    });
+    assert.notEqual(code, 0, "conflicting bind must exit non-zero");
+    assert.ok(!secondOut.includes("opendweb server v"), "no success banner on failed start");
+    assert.ok(
+      secondErr.includes("exited unexpectedly"),
+      `stderr should surface the failure, got: ${secondErr.slice(0, 300)}`,
+    );
+  } finally {
+    first.kill("SIGINT");
+    await waitExit(first);
+  }
 });

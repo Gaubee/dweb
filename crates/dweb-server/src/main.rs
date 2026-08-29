@@ -98,15 +98,36 @@ fn env_addr(key: &str) -> Option<SocketAddr> {
     std::env::var(key).ok()?.parse().ok()
 }
 
-/// 公网 URL 白名单校验（public-exposure D2）：`http(s)://host[:port]`，
-/// path 仅允许空或 `/`，拒绝 query/fragment/userinfo。拒绝 path 的根因：
-/// iroh 客户端 `set_path("/relay")` 会丢弃 relay URL 中的任何 path；
-/// gateway 的 rendezvous 条目靠字符串拼接，path 前缀同样破坏语义。
-fn validate_public_url(value: &str) -> Result<(), String> {
+/// 公网 URL 白名单校验 + 规范化（public-exposure D2；R2 P1-1/P1-3）：
+/// `http(s)://host[:port]`，path 仅允许空或 `/`，拒绝 query/fragment/userinfo。
+/// 返回 canonical 形态——必须从解析结果重建而非对原始串做字符串手术：
+/// http::Uri 会把 scheme 归一为小写、把非法端口（`65536`、空串、非数字）
+/// 从 `port_u16()` 静默丢弃为 None；只对原始串做 strip/前缀判断会出现
+/// 「校验通过的值」与「公告的值」不一致（大写 scheme 被 services.rs 的
+/// starts_with 防御兜底判为禁用、`:65536` 绕过端口上限）。
+/// 拒绝 path 的根因：iroh 客户端 `set_path("/relay")` 会丢弃 relay URL 中
+/// 的任何 path；gateway 的 rendezvous 条目靠字符串拼接，path 前缀同样破坏语义。
+fn validate_public_url(value: &str) -> Result<String, String> {
     // http::Uri 解析会静默丢弃 fragment——必须先于解析显式拒绝
     if value.contains('#') {
         return Err(format!(
             "invalid public url {value}: fragment is not allowed"
+        ));
+    }
+    // R2 P0-1：http::Uri::host() 会剥离 userinfo 段（"user:pass@host" 只返回
+    // host），凭 userinfo 的输入能绕过后续 host 校验并把凭证原样写进
+    // services.json 公告——authority 的 '@' 前置显式拒绝（合法公网入口
+    // URL 不含 userinfo；'@' 出现在 path 的形态已被 path 规则拒绝）。
+    if value.contains('@') {
+        return Err(format!(
+            "invalid public url {value}: userinfo is not allowed"
+        ));
+    }
+    // 纯 ASCII、无空白/控制字符：scheme/host/port 的合法字符均为 ASCII，
+    // http::Uri 对部分控制字符宽容，但公告输出必须保持纯 ASCII（D10 同源）
+    if !value.is_ascii() || value.bytes().any(|b| b <= b' ') {
+        return Err(format!(
+            "invalid public url {value}: must be pure ASCII without whitespace"
         ));
     }
     let uri: axum::http::Uri = value
@@ -122,11 +143,29 @@ fn validate_public_url(value: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err(format!("invalid public url {value}: missing host"));
     }
-    if let Some(port) = uri.port_u16() {
-        if port == 0 {
-            return Err(format!("invalid public url {value}: port must be 1-65535"));
+    // 端口必须从 authority 原文判断「写没写」：port_u16() 对越界/非数字端口
+    // 返回 None，与「未写端口」不可区分（R2 P1-1）。括号 IPv6 的冒号在
+    // 括号内，authority 以 ']' 结尾即无端口。
+    let port = match uri.authority().map(|a| a.as_str()).and_then(|a| {
+        if a.ends_with(']') {
+            None
+        } else {
+            a.rsplit_once(':').map(|(_, p)| p)
         }
-    }
+    }) {
+        None => None,
+        Some("") => {
+            return Err(format!(
+                "invalid public url {value}: port must be 1-65535 (empty port)"
+            ));
+        }
+        Some(p) => match p.parse::<u32>() {
+            Ok(n) if (1..=65535).contains(&n) => Some(n),
+            _ => {
+                return Err(format!("invalid public url {value}: port must be 1-65535"));
+            }
+        },
+    };
     let path = uri.path();
     if path != "/" && !path.is_empty() {
         return Err(format!(
@@ -136,11 +175,16 @@ fn validate_public_url(value: &str) -> Result<(), String> {
     if uri.query().is_some() {
         return Err(format!("invalid public url {value}: query is not allowed"));
     }
-    Ok(())
+    let canonical = match port {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    };
+    Ok(canonical)
 }
 
-/// 解析公网覆盖（flag > env > 未设置）；尾随单个 `/` 归一化剥除。
-/// 非法值硬错误（与 bind 同类失败，退出码 2）。
+/// 解析公网覆盖（flag > env > 未设置）；存储 canonical 形态
+/// （scheme 小写、无尾随 `/`、端口规范化）。非法值硬错误（与 bind 同类
+/// 失败，退出码 2）。
 fn resolve_public_urls(
     cli: &Cli,
     get_env: impl Fn(&str) -> Option<String>,
@@ -151,9 +195,9 @@ fn resolve_public_urls(
                 Some(v) => v,
                 None => return Ok(None),
             };
-            validate_public_url(&raw).map_err(|e| format!("{e} ({label})"))?;
-            let normalized = raw.strip_suffix('/').unwrap_or(&raw).to_owned();
-            Ok(Some(normalized))
+            validate_public_url(&raw)
+                .map(Some)
+                .map_err(|e| format!("{e} ({label})"))
         };
     let gateway = resolve_one(
         cli.public_gateway.as_deref(),
@@ -184,6 +228,16 @@ async fn main() -> Result<()> {
         }
     };
 
+    // R2/R3：公网 URL 校验最先执行（静态输入，先于一切 bind/spawn）——
+    // 非法值是最早的 fail-fast（退出码 2），不被 bind 解析/端口冲突遮蔽。
+    let (public_gateway_url, public_relay_url) =
+        match resolve_public_urls(&cli, |k| std::env::var(k).ok()) {
+            Ok(v) => v,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+        };
     let relay_bind_addr = match relay_bind(&cli) {
         Ok(a) => a,
         Err(msg) => {
@@ -208,14 +262,6 @@ async fn main() -> Result<()> {
     let local = listener.local_addr()?;
     tracing::info!("dweb-server gateway listening on http://{local}");
 
-    let (public_gateway_url, public_relay_url) =
-        match resolve_public_urls(&cli, |k| std::env::var(k).ok()) {
-            Ok(v) => v,
-            Err(msg) => {
-                eprintln!("error: {msg}");
-                std::process::exit(2);
-            }
-        };
     if let Some(url) = &public_gateway_url {
         tracing::info!("public gateway url override: {url}");
     }
@@ -317,6 +363,41 @@ mod tests {
         }
     }
 
+    /// R2 P1-1/P1-3：校验必须产出 canonical 形态——scheme 归一为小写、
+    /// 尾随 `/` 剥除、无端口段保持无端口；公告值与校验值同源。
+    #[test]
+    fn validate_public_url_canonicalizes() {
+        assert_eq!(
+            validate_public_url("HTTPS://GW.example.com").unwrap(),
+            "https://GW.example.com"
+        );
+        assert_eq!(
+            validate_public_url("https://gw.example.com/").unwrap(),
+            "https://gw.example.com"
+        );
+        assert_eq!(
+            validate_public_url("http://[fd00::1]:9000").unwrap(),
+            "http://[fd00::1]:9000"
+        );
+        // 无端口输入不得伪造默认端口
+        assert_eq!(
+            validate_public_url("https://gw.example.com").unwrap(),
+            "https://gw.example.com"
+        );
+    }
+
+    /// R2 P1-1 回归：port_u16() 对越界/空/非数字端口静默返回 None，
+    /// 端口语义必须从 authority 原文判断，不得依赖 port_u16()。
+    #[test]
+    fn validate_public_url_rejects_degenerate_ports() {
+        assert!(validate_public_url("https://ex.com:65536").is_err());
+        assert!(validate_public_url("https://ex.com:").is_err());
+        assert!(validate_public_url("https://ex.com:abc").is_err());
+        assert!(validate_public_url("http://ex.com:0").is_err());
+        // 括号 IPv6 本体（含冒号）不算端口段
+        assert!(validate_public_url("http://[fd00::1]").is_ok());
+    }
+
     #[test]
     fn validate_public_url_rejects_structured_forms() {
         // path 前缀：iroh set_path("/relay") 会丢弃 path，必然错配
@@ -328,6 +409,12 @@ mod tests {
         assert!(validate_public_url("https://").is_err());
         assert!(validate_public_url("http://ex.com:0").is_err());
         assert!(validate_public_url("not a url").is_err());
+        assert!(validate_public_url("https://exa mple.com").is_err());
+        // R2 P0-1 回归：userinfo 必须被拒绝（http::Uri::host() 会静默剥离，
+        // 不前置拒绝则凭证进入 services.json 公告）
+        assert!(validate_public_url("https://user:pass@example.com").is_err());
+        assert!(validate_public_url("https://user@example.com").is_err());
+        assert!(validate_public_url("https://ex.com@evil.com").is_err());
     }
 
     #[test]

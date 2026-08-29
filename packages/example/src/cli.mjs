@@ -34,6 +34,7 @@ import {
   resolveSettings,
   configListLines,
   relayDisplay,
+  relayStatusLine,
   configSetValue,
 } from "./config.mjs";
 import { bootstrapRelay, probeRelayUrls } from "./relay-resolve.mjs";
@@ -486,12 +487,12 @@ async function main() {
         const st = await fabric.relayStatus();
         if (st && st.mode !== "disabled") {
           relayOnline = st.online === true;
-          if (st.online === true) {
-            // P1-5（R3）：不打印配置首项冒充实际可达项——快照无选中 URL，
-            // 打印候选数量（真实选中项语义属 activeUrl 提案，见 contracts）
-            relaySnapshotLine = `relay: online (${st.urls.length} candidate${st.urls.length === 1 ? "" : "s"})`;
+          // activeUrl（contracts C0.2）：online 时为配置序最小已连接 relay URL；
+          // 旧二进制快照无该字段，relayStatusLine 内 feature-detect 回退候选数。
+          const line = relayStatusLine(st);
+          if (line !== null) {
+            relaySnapshotLine = line;
           } else {
-            relaySnapshotLine = null;
             printWarning(
               `relay offline (last error: ${asciiEscape(st.lastError ?? "unknown")}) -- direct connections only; invites will fail until a relay is reachable`,
             );
@@ -509,8 +510,10 @@ async function main() {
         } else if (ev.type === "relay-online") {
           if (relayOnline !== true) {
             relayOnline = true;
-            const n = Array.isArray(ev.relay?.urls) ? ev.relay.urls.length : 0;
-            console.log(`relay: online (${n} candidate${n === 1 ? "" : "s"}) -- recovered`);
+            // 事件 payload 的 relay 快照与 relayStatus() 同构（含 activeUrl；
+            // 旧二进制无该字段 → 回退候选数）。online 由本事件本身判定。
+            const line = relayStatusLine({ ...ev.relay, online: true }) ?? "relay: online";
+            console.log(asciiEscape(`${line} -- recovered`));
           }
         } else if (ev.type === "relay-offline") {
           if (relayOnline !== false) {
@@ -523,7 +526,7 @@ async function main() {
       });
 
       console.log(`chat ready as ${fabric.endpointId} (${asciiEscape(dataDir)})`);
-      if (relaySnapshotLine) console.log(relaySnapshotLine);
+      if (relaySnapshotLine) console.log(asciiEscape(relaySnapshotLine));
 
       const members = await fabric.members();
       for (const m of members) {

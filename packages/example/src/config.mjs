@@ -10,6 +10,7 @@ import { CliError, UsageError } from "./errors.mjs";
 import { parseDurationMs, assertDurationRange, expandTilde } from "./args.mjs";
 
 export const CONFIG_KEYS = ["relay", "proxy", "data", "inviteTtlMs", "joinTimeoutMs"];
+/** iroh 官方入口域（历史 canonical；内核 n0 实际拨号 iroh 默认区域 relay 列表，快照 urls 透出真实值） */
 export const N0_RELAY_URL = "https://relay.iroh.network";
 export const TTL_MIN_MS = 1000;
 export const TTL_MAX_MS = 30 * 24 * 60 * 60 * 1000; // 30d
@@ -224,7 +225,7 @@ export function resolveSettings({ flags = {}, env = process.env, file = {} } = {
     if (v === "disabled") {
       relay = { mode: "disabled", urls: [], source: "env" };
     } else if (v === "n0") {
-      relay = { mode: "n0", urls: [N0_RELAY_URL], source: "env" };
+      relay = { mode: "n0", urls: [], source: "env" };
     } else if (v === "custom") {
       const urls = parseEnvUrlList(env.DWEB_RELAY_URLS);
       if (urls.length === 0) {
@@ -303,8 +304,27 @@ export function resolveSettings({ flags = {}, env = process.env, file = {} } = {
  */
 export function relayDisplay(relay) {
   if (relay.mode === "disabled") return "disabled";
-  if (relay.mode === "n0") return `n0 ${N0_RELAY_URL}`;
+  if (relay.mode === "n0") return "n0 (iroh default relays)";
   return relay.urls.join(",");
+}
+
+/**
+ * chat 的 relay 运行态显示行（task 8.3，快照与 relay-online 事件共用）。
+ * 输入为 RelayStatusJs 形态的快照对象（contracts C0.2）：
+ *  - online 且 activeUrl 非空 → 显示实际可达项 `relay: online (<activeUrl>)`；
+ *  - activeUrl 缺失（旧二进制 undefined）或空 → 回退候选数显示（feature-detect）；
+ *  - offline / disabled → null（offline 警告文案与 disabled 静默由调用方处理）。
+ * 返回串未经 asciiEscape（纯函数）；打印处统一转义。
+ * @param {{ mode?: string, online?: boolean | null, urls?: string[], activeUrl?: string | null }} st
+ * @returns {string | null}
+ */
+export function relayStatusLine(st) {
+  if (!st || st.mode === "disabled" || st.online !== true) return null;
+  if (typeof st.activeUrl === "string" && st.activeUrl !== "") {
+    return `relay: online (${st.activeUrl})`;
+  }
+  const n = Array.isArray(st.urls) ? st.urls.length : 0;
+  return `relay: online (${n} candidate${n === 1 ? "" : "s"})`;
 }
 
 /**

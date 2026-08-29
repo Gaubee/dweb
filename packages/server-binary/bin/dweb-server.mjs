@@ -14,7 +14,7 @@ const SUPPORTED = `${process.platform}-${process.arch}`;
 const BINARY_NAME = PLATFORM_BINARIES[SUPPORTED];
 if (!BINARY_NAME) {
   console.error(
-    `@jixo/opendweb-server-binary: 当前平台 ${SUPPORTED} 暂不支持。v0.1 提供 ${Object.keys(PLATFORM_BINARIES).join(" / ")}；其它平台请使用 docker 镜像 ghcr.io/gaubee/dweb。`,
+    `@jixo/opendweb-server-binary: 当前平台 ${SUPPORTED} 暂不支持。v0.2 提供 ${Object.keys(PLATFORM_BINARIES).join(" / ")}；其它平台请使用 docker 镜像 ghcr.io/gaubee/dweb。`,
   );
   process.exit(1);
 }

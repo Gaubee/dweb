@@ -36,8 +36,25 @@ const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.ur
 const VERSION = pkg.version;
 
 /**
- * 枚举本机全部非 loopback IPv4（去重、排序）。横幅 Network 节与 server 侧
- * services.json 的回退地址（首个非 loopback IPv4）共用同一枚举语义。
+ * IPv4 点分四段数值升序比较（task 9.2 冻结语义，与 Rust 侧统一）：
+ * 逐段按数值比较，"9.0.0.1" 必须排在 "10.0.0.2" 之前（字符串字典序则相反）。
+ * @param {string} a
+ * @param {string} b
+ */
+function compareIPv4Numeric(a, b) {
+  const pa = a.split(".");
+  const pb = b.split(".");
+  for (let i = 0; i < 4; i++) {
+    const d = (Number(pa[i]) || 0) - (Number(pb[i]) || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/**
+ * 枚举本机全部非 loopback IPv4（去重、按点分四段数值升序排序，task 9.2
+ * 冻结的跨侧统一语义；Rust 侧对齐由 server 批次负责）。横幅 Network 节
+ * 与 services.json 回退地址共用「首个 = 数值最小」的取值语义。
  * @param {NodeJS.Dict<os.NetworkInterfaceInfo[]>} [interfaces]
  * @returns {string[]}
  */
@@ -48,7 +65,7 @@ export function networkIPv4s(interfaces = os.networkInterfaces()) {
       if ((ni.family === "IPv4" || ni.family === 4) && !ni.internal) addrs.push(ni.address);
     }
   }
-  return [...new Set(addrs)].sort();
+  return [...new Set(addrs)].sort(compareIPv4Numeric);
 }
 
 /**
@@ -68,24 +85,38 @@ export function splitBind(bind) {
 }
 
 /**
- * 公网 URL 轻量校验（public-exposure D2，与 Rust 侧 validate_public_url 同规）：
- * `http(s)://host[:port]`，拒绝 path（尾随单个 "/" 先归一化剥除）、query、fragment、
- * userinfo。返回 null = 合法，否则错误消息。
+ * 公网 URL 校验 + 规范化（public-exposure D2，与 Rust validate_public_url 同规；
+ * R2 P1-1/P1-3 对齐）：`http(s)://host[:port]`；scheme 大小写不敏感并归一为
+ * 小写；host 仅限 ASCII 字母/数字/`.`/`-`（或括号 IPv6）；拒绝空白与非
+ * ASCII、path（尾随单个 "/" 先剥除）、query、fragment、userinfo、空端口与
+ * 1-65535 之外的端口。返回 canonical 形态字符串，非法返回 null。
+ * @param {string} value
+ * @returns {string | null}
+ */
+export function normalizePublicUrl(value) {
+  const raw = String(value);
+  const v = raw.endsWith("/") ? raw.slice(0, -1) : raw;
+  // 纯可打印 ASCII：scheme/host/port 合法字符均为 ASCII；与 Rust 侧的显式
+  // 拒绝保持一致（空格/控制字符/unicode host 不得进入公告）
+  if (!/^[\x21-\x7e]+$/.test(v)) return null;
+  // host 字符集排除 ':' —— 否则贪婪匹配会吞掉端口段绕过端口校验（如 ex.com:0）
+  const m = /^(https?):\/\/(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::(\d+))?$/i.exec(v);
+  if (!m) return null;
+  const port = m[3];
+  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) return null;
+  return `${m[1].toLowerCase()}://${m[2]}${port !== undefined ? `:${port}` : ""}`;
+}
+
+/**
+ * 公网 URL 校验（错误消息包装）：返回 null = 合法，否则错误消息。
  * @param {string} value
  * @param {string} label
  * @returns {string | null}
  */
 export function validatePublicUrl(value, label) {
   const raw = String(value);
-  const v = raw.endsWith("/") ? raw.slice(0, -1) : raw;
-  // host 字符集排除 ':' —— 否则贪婪匹配会吞掉端口段绕过端口校验（如 ex.com:0）
-  const m = /^(https?):\/\/(\[[^\]]+\]|[^/?#@:]+)(?::(\d+))?$/.exec(v);
-  if (!m) {
+  if (normalizePublicUrl(raw) === null) {
     return `invalid ${label}: ${raw} (expected http(s)://host[:port], no path/query/fragment)`;
-  }
-  const port = m[3];
-  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) {
-    return `invalid ${label}: ${raw} (port must be 1-65535)`;
   }
   return null;
 }
@@ -129,7 +160,6 @@ export function resolveServerArgs(argv, env = process.env) {
   const relayEnvOff = ["false", "0", "off"].includes(env.DWEB_RELAY_ENABLED ?? "true");
   const relayEnabled = !opts["--no-relay"] && !relayEnvOff;
   const trustProxy = Boolean(opts["--trust-proxy"]) || env.DWEB_TRUST_PROXY === "1";
-  const normalize = (v) => (v.endsWith("/") ? v.slice(0, -1) : v);
   const rawPublicGateway = opts["--public-gateway"] ?? env.DWEB_PUBLIC_GATEWAY_URL ?? null;
   const rawPublicRelay = opts["--public-relay"] ?? env.DWEB_PUBLIC_RELAY_URL ?? null;
   if (rawPublicGateway !== null) {
@@ -145,14 +175,17 @@ export function resolveServerArgs(argv, env = process.env) {
     relayBind,
     relayEnabled,
     trustProxy,
-    publicGatewayUrl: rawPublicGateway === null ? null : normalize(rawPublicGateway),
-    publicRelayUrl: rawPublicRelay === null ? null : normalize(rawPublicRelay),
+    // canonical 形态（scheme 小写、无尾随 "/"）——与 Rust 侧重建语义一致
+    publicGatewayUrl: rawPublicGateway === null ? null : normalizePublicUrl(rawPublicGateway),
+    publicRelayUrl: rawPublicRelay === null ? null : normalizePublicUrl(rawPublicRelay),
   };
 }
 
 /**
  * vite 风格启动横幅（全 ASCII，码位 < 128；design D1）。设置公网覆盖时
  * 追加 Public 节（public-exposure D5/D6），并把配置入口指引切换为公网地址。
+ * 动态值纪律（D10）：所有非字面量输出（version/Local host/port/Network ip/
+ * Public URL/服务表 port）一律经 asciiEscape，禁止裸插值。
  * @param {{ version: string, gatewayBind: string, relayBind: string, relayEnabled: boolean, ips: string[], publicGatewayUrl?: string | null, publicRelayUrl?: string | null }} input
  */
 export function buildBanner({ version, gatewayBind, relayBind, relayEnabled, ips, publicGatewayUrl = null, publicRelayUrl = null }) {
@@ -166,8 +199,8 @@ export function buildBanner({ version, gatewayBind, relayBind, relayEnabled, ips
   const uniqueIps = [...new Set(ips)];
 
   const lines = [];
-  lines.push(`  * opendweb server v${version}`);
-  lines.push(`  > Local:   http://${localHost}:${portText}`);
+  lines.push(`  * opendweb server v${asciiEscape(version)}`);
+  lines.push(`  > Local:   http://${asciiEscape(localHost)}:${asciiEscape(portText)}`);
   if (uniqueIps.length === 0) {
     // 全部网卡不可枚举时打印占位行而非省略
     lines.push(`  > Network: (no non-loopback IPv4 found)`);
@@ -199,7 +232,7 @@ export function buildBanner({ version, gatewayBind, relayBind, relayEnabled, ips
     ["gateway", portText, "entry point"],
     ["rendezvous", portText, "merged into gateway"],
     ["relay", relayPortText, relayEnabled ? "enabled" : "disabled"],
-  ];
+  ].map(([name, p, state]) => [name, asciiEscape(p), state]);
   const wName = Math.max("NAME".length, ...rows.map((r) => r[0].length)) + 3;
   const wPort = Math.max("PORT".length, ...rows.map((r) => r[1].length)) + 3;
   lines.push(`    ${"NAME".padEnd(wName)}${"PORT".padEnd(wPort)}STATE`);
@@ -209,6 +242,37 @@ export function buildBanner({ version, gatewayBind, relayBind, relayEnabled, ips
   lines.push("");
   lines.push("  Press Ctrl+C to stop");
   return lines.join("\n");
+}
+
+/**
+ * readiness 探测基址：unspecified bind（0.0.0.0/::）换 127.0.0.1；
+ * 裸 IPv6 host 加括号。
+ * @param {string} bind
+ * @returns {string}
+ */
+function probeBindBase(bind) {
+  const { host, port } = splitBind(bind);
+  const h = host === "0.0.0.0" || host === "::" || host === "" ? "127.0.0.1" : host;
+  const bracketed = h.includes(":") ? `[${h}]` : h;
+  return `http://${bracketed}:${port ?? 8787}`;
+}
+
+/**
+ * gateway /healthz 就绪探测（R2 P1-2 readiness 门）；超时抛错（子进程仍
+ * 存活但永不就绪属异常态，由调用方 stop 后上抛）。
+ * @param {string} base
+ * @param {number} [timeoutMs]
+ */
+async function waitForGatewayReady(base, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${base}/healthz`);
+      if (res.ok) return { ready: true };
+    } catch { /* not yet */ }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`server did not become healthy within ${timeoutMs}ms (${base}/healthz)`);
 }
 
 const command = process.argv[2] ?? "help";
@@ -229,6 +293,25 @@ async function main() {
       publicGatewayUrl: resolved.publicGatewayUrl ?? undefined,
       publicRelayUrl: resolved.publicRelayUrl ?? undefined,
     });
+    // R2 P1-2：先等 gateway 就绪（或子进程退出）再打横幅——子进程因端口冲突/
+    // 环境问题秒退时，不打印伪成功横幅；错误转发 stderr 且退出码保留。
+    const probeBase = probeBindBase(resolved.gatewayBind);
+    let ready;
+    try {
+      ready = await Promise.race([
+        waitForGatewayReady(probeBase),
+        server.exited.then((code) => ({ exited: code })),
+      ]);
+    } catch (e) {
+      await server.stop();
+      throw e;
+    }
+    if (ready && typeof ready.exited === "number") {
+      console.error(`error: server exited unexpectedly (code ${ready.exited})`);
+      process.stderr.write(server.stderrTail());
+      // 退出码 0 的"秒退"同样是异常态（server 不应自行退出），归一为 1
+      process.exit(ready.exited === 0 ? 1 : ready.exited);
+    }
     console.log(
       buildBanner({
         version: VERSION,
@@ -245,8 +328,8 @@ async function main() {
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
-    await server.exited;
-    return;
+    const code = await server.exited;
+    process.exit(code ?? 0);
   }
   if (command === "help" || command === "--help") {
     console.log(`opendweb - self-hosted server for opendweb fabrics
@@ -256,7 +339,8 @@ Usage:
                    [--public-gateway <url>] [--public-relay <url>]
       Start the self-hosted server. The gateway (default 0.0.0.0:8787) serves
       rendezvous + /healthz + /services.json; the iroh relay (default
-      0.0.0.0:3340) runs on its own port. --http is a legacy alias of --gateway.
+      0.0.0.0:3340) runs on its own port. Unknown options are rejected with
+      exit code 2 (the --http alias was removed in v0.2).
 
       --public-gateway / --public-relay declare the public entry URLs when
       running behind a reverse proxy or tunnel (e.g. Cloudflare Tunnel): the

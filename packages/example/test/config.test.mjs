@@ -16,6 +16,7 @@ import {
   resolveSettings,
   configListLines,
   relayDisplay,
+  relayStatusLine,
   configSetValue,
   parseEnvUrlList,
 } from "../src/config.mjs";
@@ -224,7 +225,7 @@ test("relay: implicit custom with all-empty URLS errors", () => {
 test("relay: n0 mode uses the official default relay URL", () => {
   const s = resolveSettings({ env: { DWEB_RELAY: "n0" }, file: {} });
   assert.equal(s.relay.mode, "n0");
-  assert.deepEqual(s.relay.urls, [N0_RELAY_URL]);
+  assert.deepEqual(s.relay.urls, []); // n0 配置层不再携带 canonical 单条（内核用真实默认列表）
 });
 
 test("relay: file value used when env absent (string or array)", () => {
@@ -284,10 +285,96 @@ test("inviteTtlMs / joinTimeoutMs: flag > file > default (no env entries)", () =
 
 test("relayDisplay formats the three modes", () => {
   assert.equal(relayDisplay({ mode: "disabled", urls: [] }), "disabled");
-  assert.equal(relayDisplay({ mode: "n0", urls: [N0_RELAY_URL] }), `n0 ${N0_RELAY_URL}`);
+  assert.equal(relayDisplay({ mode: "n0", urls: [] }), "n0 (iroh default relays)");
   assert.equal(
     relayDisplay({ mode: "custom", urls: ["http://a:3340", "http://b:3340"] }),
     "http://a:3340,http://b:3340",
+  );
+});
+
+// task 8.3：activeUrl 显示（contracts C0.2 RelayStatusJs 增量）。四形态 + 防御分支。
+test("relayStatusLine: online+activeUrl shows the connected relay URL", () => {
+  assert.equal(
+    relayStatusLine({
+      mode: "custom",
+      urls: ["http://a:3340", "http://b:3340"],
+      online: true,
+      lastError: null,
+      activeUrl: "http://a:3340",
+    }),
+    "relay: online (http://a:3340)",
+  );
+  assert.equal(
+    relayStatusLine({
+      mode: "n0",
+      urls: [N0_RELAY_URL],
+      online: true,
+      lastError: null,
+      activeUrl: N0_RELAY_URL,
+    }),
+    `relay: online (${N0_RELAY_URL})`,
+  );
+});
+
+test("relayStatusLine: online without activeUrl (old binary undefined) falls back to candidate count", () => {
+  assert.equal(
+    relayStatusLine({
+      mode: "custom",
+      urls: ["http://a:3340", "http://b:3340"],
+      online: true,
+      lastError: null,
+    }),
+    "relay: online (2 candidates)",
+  );
+  // 单候选用单数形式
+  assert.equal(
+    relayStatusLine({ mode: "custom", urls: ["http://a:3340"], online: true, lastError: null }),
+    "relay: online (1 candidate)",
+  );
+  // 防御：新二进制 online 时 activeUrl 契约上必为 URL，异常 null/空串也回退候选数
+  assert.equal(
+    relayStatusLine({
+      mode: "custom",
+      urls: ["http://a:3340", "http://b:3340"],
+      online: true,
+      lastError: null,
+      activeUrl: null,
+    }),
+    "relay: online (2 candidates)",
+  );
+  assert.equal(
+    relayStatusLine({
+      mode: "custom",
+      urls: ["http://a:3340", "http://b:3340"],
+      online: true,
+      lastError: null,
+      activeUrl: "",
+    }),
+    "relay: online (2 candidates)",
+  );
+});
+
+test("relayStatusLine: offline and disabled snapshots yield no online line (null)", () => {
+  // offline：无显示行，警告文案由调用方（chat）处理
+  assert.equal(
+    relayStatusLine({
+      mode: "custom",
+      urls: ["http://a:3340"],
+      online: false,
+      lastError: "dial failed",
+      activeUrl: null,
+    }),
+    null,
+  );
+  // online === null（未探测态）同样无显示行
+  assert.equal(
+    relayStatusLine({ mode: "custom", urls: ["http://a:3340"], online: null, lastError: null, activeUrl: null }),
+    null,
+  );
+  // disabled：静默
+  assert.equal(
+    relayStatusLine({ mode: "disabled", urls: [], online: null, lastError: null, activeUrl: null }),
+    null,
   );
 });
 

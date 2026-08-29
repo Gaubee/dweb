@@ -10,7 +10,70 @@ permissions:
   id-token: write # npm OIDC trusted publishing
 
 jobs:
+  build-windows:
+    # tag push 时 mingw 交叉编译出新鲜 Windows 产物，替代 in-repo 手动提交的旧文件
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # 覆盖 .cargo/config.toml 的本机绝对路径 target-dir（同 ci.yml 做法）
+      CARGO_TARGET_DIR: /tmp/cargo-target-win
+      # node.exe 源版本：CI 从它重建 libnode 导入库（本地 ~/libnode-win 同为 v22.20.0 生成）
+      NODE_WIN_VERSION: 22.20.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mingw toolchain
+        # gendef 在 mingw-w64-tools；dlltool/ar 在 binutils-mingw-w64-x86-64；
+        # gcc（.cargo/config.toml 配置的 linker）在 gcc-mingw-w64-x86-64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 mingw-w64-tools
+      # napi-build 的 setup_gnu() 要求 LIBNODE_PATH 目录下存在字面名为 libnode.dll
+      # 的文件（存在性检查通过后 rustc-link-lib=node，GNU ld 实际链接 libnode.dll.a）
+      - name: Cache node import library
+        id: libnode
+        uses: actions/cache@v4
+        with:
+          path: ~/libnode-win
+          key: libnode-win-x64-v1-node${{ env.NODE_WIN_VERSION }}
+      - name: Rebuild node import library (gendef + dlltool)
+        if: steps.libnode.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/libnode-win"
+          cd "$HOME/libnode-win"
+          curl -fsSLO "https://nodejs.org/dist/v${NODE_WIN_VERSION}/node-v${NODE_WIN_VERSION}-win-x64.zip"
+          unzip -o "node-v${NODE_WIN_VERSION}-win-x64.zip" "node-v${NODE_WIN_VERSION}-win-x64/node.exe"
+          gendef "node-v${NODE_WIN_VERSION}-win-x64/node.exe"
+          x86_64-w64-mingw32-dlltool -m i386:x86-64 -d node.def -l libnode.dll.a
+          # node.exe 本身就是导出这些符号的 PE，重命名即满足 napi-build 的 libnode.dll 检查
+          cp "node-v${NODE_WIN_VERSION}-win-x64/node.exe" libnode.dll
+          rm -f "node-v${NODE_WIN_VERSION}-win-x64.zip"
+          rm -rf "node-v${NODE_WIN_VERSION}-win-x64"
+      - name: Build dweb-server (windows exe)
+        run: cargo build --release --target x86_64-pc-windows-gnu -p dweb-server
+      - name: Build dweb-client-sdk (napi dll)
+        run: LIBNODE_PATH="$HOME/libnode-win" cargo build --release --target x86_64-pc-windows-gnu -p dweb-client-sdk
+      - name: Stage artifacts (release names)
+        # cdylib 产物名带下划线（dweb_client_sdk.dll），拷贝/重命名为 packages 期望的文件名
+        run: |
+          mkdir -p dist
+          cp "$CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/dweb-server.exe" dist/dweb-server-x86_64-pc-windows.exe
+          cp "$CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/dweb_client_sdk.dll" dist/dweb.win32-x64.node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: dist/
+          if-no-files-found: error
+
   publish-npm:
+    needs: build-windows
+    # workflow_dispatch 时 GITHUB_REF_NAME 是分支名，依赖 pin 会得到 ^main——
+    # 发布只允许 tag 触发（手动触发仅构建 Windows 产物）
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: npm-publish
     steps:
@@ -20,12 +83,32 @@ jobs:
           node-version: 22
       # npm trusted publishing 需要 npm >= 11.5（OIDC 免 token）
       - run: npm install -g npm@latest
+      - name: Download CI-built Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binaries
+          path: dist-windows
+      # CI 新鲜产物覆盖 in-repo 旧文件（原为本地手动 mingw 构建后提交）
+      - name: Replace in-repo Windows artifacts with CI builds
+        run: |
+          cp dist-windows/dweb-server-x86_64-pc-windows.exe packages/server-binary/bin/dweb-server-x86_64-pc-windows.exe
+          cp dist-windows/dweb.win32-x64.node packages/client-sdk/dweb.win32-x64.node
       - name: Verify packaged artifacts
         run: |
           test -f packages/client-sdk/dweb.darwin-arm64.node
           test -f packages/client-sdk/dweb.win32-x64.node
           test -f packages/server-binary/bin/dweb-server-aarch64-apple-darwin
           test -f packages/server-binary/bin/dweb-server-x86_64-pc-windows.exe
+      # R2：tarball 内容物门禁——files 数组笔误曾让 v0.2.1 的 npm 包漏掉
+      # Windows exe（test -f 只验证仓库文件存在，不验证打包清单）
+      - name: Verify npm tarball manifests
+        run: |
+          cd packages/server-binary && npm pack --dry-run | tee /tmp/sb.log
+          grep -q "bin/dweb-server-aarch64-apple-darwin" /tmp/sb.log
+          grep -q "bin/dweb-server-x86_64-pc-windows.exe" /tmp/sb.log
+          cd ../client-sdk && npm pack --dry-run | tee /tmp/sdk.log
+          grep -q "dweb.darwin-arm64.node" /tmp/sdk.log
+          grep -q "dweb.win32-x64.node" /tmp/sdk.log
       # npm 不替换 workspace:* 协议（pnpm 才会），发布前固定为实际版本
       - name: Pin workspace deps to released version
         run: |
