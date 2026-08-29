@@ -929,6 +929,9 @@ async fn exempt_corrupted_roster() {
     );
 }
 
+// 平台门控：Windows 目录 readonly 属性不阻止目录内建文件（与 POSIX 语义
+// 不同），写盘失败注入在 Windows 上不成立——join 会成功而非 Persistence 错误
+#[cfg(unix)]
 #[tokio::test]
 async fn exempt_roster_io_on_join_persist() {
     let _g = TEST_LOCK.lock().await;
