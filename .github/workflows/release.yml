@@ -100,13 +100,14 @@ jobs:
           test -f packages/server-binary/bin/dweb-server-aarch64-apple-darwin
           test -f packages/server-binary/bin/dweb-server-x86_64-pc-windows.exe
       # R2：tarball 内容物门禁——files 数组笔误曾让 v0.2.1 的 npm 包漏掉
+      # （npm notice 清单在 stderr，tee 须并流 2>&1，v0.3.0 首发实测）
       # Windows exe（test -f 只验证仓库文件存在，不验证打包清单）
       - name: Verify npm tarball manifests
         run: |
-          cd packages/server-binary && npm pack --dry-run | tee /tmp/sb.log
+          cd packages/server-binary && npm pack --dry-run 2>&1 | tee /tmp/sb.log
           grep -q "bin/dweb-server-aarch64-apple-darwin" /tmp/sb.log
           grep -q "bin/dweb-server-x86_64-pc-windows.exe" /tmp/sb.log
-          cd ../client-sdk && npm pack --dry-run | tee /tmp/sdk.log
+          cd ../client-sdk && npm pack --dry-run 2>&1 | tee /tmp/sdk.log
           grep -q "dweb.darwin-arm64.node" /tmp/sdk.log
           grep -q "dweb.win32-x64.node" /tmp/sdk.log
       # npm 不替换 workspace:* 协议（pnpm 才会），发布前固定为实际版本
