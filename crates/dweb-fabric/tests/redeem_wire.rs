@@ -13,10 +13,10 @@ use dweb_fabric::roster::Roster;
 use dweb_fabric::session::frame_type;
 use dweb_fabric::session::{self, MAX_REDEEM_FRAME, read_frame, redeem_err, write_frame};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
+use serde::Deserialize;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, mpsc};
-use serde::Deserialize;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -40,10 +40,11 @@ struct Case {
     violation: Option<&'static str>,
 }
 
-/// 权威 fixture（C0）：openspec/changes/connectivity-ux-hardening/contracts/
-/// redeem-err.fixtures.json —— include_str! 编译期嵌入，杜绝手工副本漂移（P1-11）。
+/// 权威 fixture（C0）：redeem-err.fixtures.json —— include_str! 编译期嵌入，
+/// 杜绝手工副本漂移（P1-11）。connectivity-ux-hardening 已归档，路径随归档
+/// 位置更新（hardening-backlog 批次顺带修复，避免全量 cargo test 编译失败）。
 const FIXTURE_JSON: &str = include_str!(
-    "../../../openspec/changes/connectivity-ux-hardening/contracts/redeem-err.fixtures.json"
+    "../../../openspec/changes/archive/2026-08-28-connectivity-ux-hardening/contracts/redeem-err.fixtures.json"
 );
 
 #[derive(Deserialize)]
@@ -75,8 +76,9 @@ fn cases() -> Vec<Case> {
     struct FixtureDoc {
         cases: Vec<FixtureCase>,
     }
-    let parsed: Vec<FixtureCase> =
-        serde_json::from_str::<FixtureDoc>(FIXTURE_JSON).expect("fixture JSON must parse").cases;
+    let parsed: Vec<FixtureCase> = serde_json::from_str::<FixtureDoc>(FIXTURE_JSON)
+        .expect("fixture JSON must parse")
+        .cases;
     assert_eq!(parsed.len(), 12, "fixture case count frozen at 12");
     parsed
         .into_iter()
@@ -90,7 +92,9 @@ fn cases() -> Vec<Case> {
                 .map(|r| (r.kind, r.payload_hex, r.presented))
                 .collect(),
             result: Box::leak(c.result.into_boxed_str()),
-            violation: c.violation.map(|v| Box::leak(v.into_boxed_str()) as &'static str),
+            violation: c
+                .violation
+                .map(|v| Box::leak(v.into_boxed_str()) as &'static str),
         })
         .collect()
 }
@@ -143,7 +147,9 @@ async fn wire_pipe() -> WirePipe {
     let server_ep = server.clone();
     let task = tokio::spawn(async move {
         while let Some(incoming) = server_ep.accept().await {
-            let Ok(conn) = incoming.accept() else { continue };
+            let Ok(conn) = incoming.accept() else {
+                continue;
+            };
             let Ok(conn) = conn.await else { continue };
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -285,7 +291,12 @@ async fn write_frame_round_trip_matches_fixture_bytes() {
         let mut frame = ((1 + payload.len()) as u32).to_be_bytes().to_vec();
         frame.push(0x14);
         frame.extend_from_slice(&payload);
-        assert_eq!(hex::encode(&frame), case.hex.replace(' ', ""), "{}", case.name);
+        assert_eq!(
+            hex::encode(&frame),
+            case.hex.replace(' ', ""),
+            "{}",
+            case.name
+        );
     }
 }
 
@@ -324,14 +335,18 @@ impl IssuerRig {
         let identity = handler_identity.clone();
         let task = tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
-                let Ok(conn) = incoming.accept() else { continue };
+                let Ok(conn) = incoming.accept() else {
+                    continue;
+                };
                 let Ok(conn) = conn.await else { continue };
                 let roster = roster2.clone();
                 let identity = identity.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let res = session::handle_redeem_as_issuer(&conn, &roster, &identity).await;
-                    let _ = tx.send(res.err().map(|e| e.to_string()).unwrap_or_default()).await;
+                    let _ = tx
+                        .send(res.err().map(|e| e.to_string()).unwrap_or_default())
+                        .await;
                     let _ = tokio::time::timeout(session::REDEEM_DEADLINE, conn.closed()).await;
                     conn.close(0u32.into(), b"redeem-done");
                 });
@@ -402,7 +417,12 @@ async fn dance(
     }
     let (t, payload) = match read_frame(&mut recv, MAX_REDEEM_FRAME).await {
         Ok(v) => v,
-        Err(e) => return FinalFrame::NoFrame(format!("entry read failed: {e}"), std::time::Duration::ZERO),
+        Err(e) => {
+            return FinalFrame::NoFrame(
+                format!("entry read failed: {e}"),
+                std::time::Duration::ZERO,
+            );
+        }
     };
     assert_eq!(t, frame_type::REDEEM_CHALLENGE, "challenge expected");
     let challenge: [u8; 32] = payload.as_slice().try_into().unwrap();
@@ -434,7 +454,6 @@ async fn dance(
     }
 }
 
-
 fn expect_no_structured_frame(name: &str, f: FinalFrame) {
     if let FinalFrame::NoFrame(_, elapsed) = &f {
         assert!(
@@ -443,7 +462,9 @@ fn expect_no_structured_frame(name: &str, f: FinalFrame) {
         );
     }
     match f {
-        FinalFrame::Frame(t, _) => panic!("{name}: must close WITHOUT a structured frame, got {t:#x}"),
+        FinalFrame::Frame(t, _) => {
+            panic!("{name}: must close WITHOUT a structured frame, got {t:#x}")
+        }
         FinalFrame::NoFrame(_, _) => {}
     }
 }
@@ -478,14 +499,7 @@ fn token_on(
     now: u64,
 ) -> InviteToken {
     roster
-        .issue_invite(
-            identity,
-            relay.to_owned(),
-            vec![],
-            None,
-            ttl_ms,
-            now,
-        )
+        .issue_invite(identity, relay.to_owned(), vec![], None, ttl_ms, now)
         .unwrap()
 }
 
@@ -500,7 +514,10 @@ async fn row_verify_wrong_fabric() {
     let token = token_on(&mut rb, &root, "https://relay.example", 60_000, now_ms());
     let redeemer = NodeIdentity::from_seed([0x21; 32]);
     let client = client_endpoint(&redeemer).await;
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     let (_t, payload) = decode_one("verify-wrong-fabric", f);
     let records = redeem_err::decode_records(&payload).unwrap();
     assert_eq!(records.len(), 1, "single record (v1)");
@@ -536,11 +553,13 @@ async fn row_verify_invite_not_root() {
         expires_at_ms: now_ms() + 60_000,
         recipient: None,
     };
-    let token =
-        dweb_fabric::protocol::InviteToken::sign(invite, other.secret_key()).unwrap();
+    let token = dweb_fabric::protocol::InviteToken::sign(invite, other.secret_key()).unwrap();
     let redeemer = NodeIdentity::from_seed([0x33; 32]);
     let client = client_endpoint(&redeemer).await;
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     let (_t, payload) = decode_one("verify-invite-not-root", f);
     assert_eq!(payload, vec![0x01, 0x00], "kind=1 NotRoot, empty payload");
     let records = redeem_err::decode_records(&payload).unwrap();
@@ -560,7 +579,10 @@ async fn row_verify_invite_expired() {
     drop(roster);
     let redeemer = NodeIdentity::from_seed([0x42; 32]);
     let client = client_endpoint(&redeemer).await;
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     let (_t, payload) = decode_one("verify-invite-expired", f);
     let records = redeem_err::decode_records(&payload).unwrap();
     assert_eq!(records[0].kind, 3);
@@ -587,7 +609,10 @@ async fn row_verify_recipient_mismatch() {
     drop(roster);
     let redeemer = NodeIdentity::from_seed([0x53; 32]);
     let client = client_endpoint(&redeemer).await;
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     let (_t, payload) = decode_one("verify-recipient-mismatch", f);
     let records = redeem_err::decode_records(&payload).unwrap();
     assert_eq!(records[0].kind, 3);
@@ -600,13 +625,26 @@ async fn row_verify_bad_pop() {
     let root = NodeIdentity::from_seed([0x61; 32]);
     let rig = IssuerRig::spawn(&root, &root).await;
     let mut roster = rig.roster.lock().await;
-    let token = token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms());
+    let token = token_on(
+        &mut roster,
+        &root,
+        "https://relay.example",
+        60_000,
+        now_ms(),
+    );
     drop(roster);
     let redeemer = NodeIdentity::from_seed([0x62; 32]);
     let client = client_endpoint(&redeemer).await;
     let wrong_signer = NodeIdentity::from_seed([0x63; 32]);
     let f = dance(
-        &client, &rig, &token, &redeemer, &wrong_signer, false, None, None,
+        &client,
+        &rig,
+        &token,
+        &redeemer,
+        &wrong_signer,
+        false,
+        None,
+        None,
     )
     .await;
     let (_t, payload) = decode_one("verify-bad-pop", f);
@@ -622,16 +660,28 @@ async fn row_consume_already_used_matches_canonical_fixture() {
     let client = client_endpoint(&redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     // 第一次：成功（REDEEM_OK）
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     match &f {
         FinalFrame::Frame(t, _) => assert_eq!(*t, frame_type::REDEEM_OK, "first redeem: {f:?}"),
         FinalFrame::NoFrame(why, _) => panic!("first redeem must succeed ({why})"),
     }
     // 第二次：Consumed —— 外层字节 == canonical 向量 00000003140000
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     let (t, payload) = decode_one("consume-already-used", f);
     assert_eq!(t, 0x14);
     assert_eq!(payload, vec![0x00, 0x00]);
@@ -656,7 +706,13 @@ async fn row_entry_wrong_first_frame() {
     let client = client_endpoint(&redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     let f = dance(
         &client,
@@ -724,13 +780,9 @@ fn issuer_mapping_rows_are_machine_verified() {
         mapping: serde_json::Value,
     }
     let doc: Doc = serde_json::from_str(FIXTURE_JSON).unwrap();
-    let rows: Vec<IssuerRow> = serde_json::from_value(
-        doc.mapping
-            .get("rows")
-            .expect("issuerMapping.rows")
-            .clone(),
-    )
-    .unwrap();
+    let rows: Vec<IssuerRow> =
+        serde_json::from_value(doc.mapping.get("rows").expect("issuerMapping.rows").clone())
+            .unwrap();
     assert_eq!(rows.len(), 17, "17 variantId rows frozen");
     // 机器一致性：emit=true 行必有 kind 0..=3 且 joinerResult 在两值集合；
     // emit=false 行 kind 必为 null 且 joinerResult 为 DIAL_FAILED
@@ -743,14 +795,26 @@ fn issuer_mapping_rows_are_machine_verified() {
                 r.variant_id
             );
         } else {
-            assert!(r.kind.is_none(), "{}: silent kind must be null", r.variant_id);
-            assert_eq!(r.joiner_result, "DIAL_FAILED", "{}: silent result", r.variant_id);
+            assert!(
+                r.kind.is_none(),
+                "{}: silent kind must be null",
+                r.variant_id
+            );
+            assert_eq!(
+                r.joiner_result, "DIAL_FAILED",
+                "{}: silent result",
+                r.variant_id
+            );
         }
         assert!(r.variant_id.is_ascii(), "{}: variantId ascii", r.variant_id);
     }
     // 与实现的分支投影一致性：redeem_verify_emit 的五个 emit 变体必须在 rows 中
     // 有对应行（kind 数值匹配）
-    let emitted_kinds: Vec<u8> = rows.iter().filter(|r| r.emit).filter_map(|r| r.kind).collect();
+    let emitted_kinds: Vec<u8> = rows
+        .iter()
+        .filter(|r| r.emit)
+        .filter_map(|r| r.kind)
+        .collect();
     for k in 0u8..=3 {
         assert!(emitted_kinds.contains(&k), "kind {k} must have an emit row");
     }
@@ -764,39 +828,63 @@ async fn io_failures_close_within_bound() {
     let redeemer = NodeIdentity::from_seed([0x92; 32]);
     let client = client_endpoint(&redeemer).await;
     let mut roster = rig.roster.lock().await;
-    let _token = token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms());
+    let _token = token_on(
+        &mut roster,
+        &root,
+        "https://relay.example",
+        60_000,
+        now_ms(),
+    );
     drop(roster);
 
     // 1. 建连后不开 bidi 流直接挂起：issuer 到达 REDEEM_DEADLINE 后立即关闭
     let t0 = std::time::Instant::now();
     {
-        let conn = client.connect(rig.addr(), session::ALPN_REDEEM).await.unwrap();
+        let conn = client
+            .connect(rig.addr(), session::ALPN_REDEEM)
+            .await
+            .unwrap();
         // 不 open_bi，等待对端关闭
         let _ = tokio::time::timeout(std::time::Duration::from_secs(7), conn.closed()).await;
-        assert!(t0.elapsed().as_secs() < 7, "deadline close must be immediate");
+        assert!(
+            t0.elapsed().as_secs() < 7,
+            "deadline close must be immediate"
+        );
     }
 
     // 2. 首帧 EOF（开流即 finish）：读失败 → Silent → 立即关闭
     let t0 = std::time::Instant::now();
     {
-        let conn = client.connect(rig.addr(), session::ALPN_REDEEM).await.unwrap();
+        let conn = client
+            .connect(rig.addr(), session::ALPN_REDEEM)
+            .await
+            .unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         let _ = send.finish();
         let _ = recv.read_to_end(64).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), conn.closed()).await;
-        assert!(t0.elapsed().as_secs() < 3, "EOF on first frame must close immediately");
+        assert!(
+            t0.elapsed().as_secs() < 3,
+            "EOF on first frame must close immediately"
+        );
     }
 
     // 3. 截断头（2 字节后 EOF）：read_frame 短读 → Silent → 立即关闭
     let t0 = std::time::Instant::now();
     {
-        let conn = client.connect(rig.addr(), session::ALPN_REDEEM).await.unwrap();
+        let conn = client
+            .connect(rig.addr(), session::ALPN_REDEEM)
+            .await
+            .unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         send.write_all(&[0x00, 0x00]).await.unwrap();
         let _ = send.finish();
         let _ = recv.read_to_end(64).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), conn.closed()).await;
-        assert!(t0.elapsed().as_secs() < 3, "truncated header must close immediately");
+        assert!(
+            t0.elapsed().as_secs() < 3,
+            "truncated header must close immediately"
+        );
     }
 }
 
@@ -809,7 +897,13 @@ async fn row_entry_decode_invalid() {
     let client = client_endpoint(&_redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     // INTENT 帧但载荷不是可解码令牌：无法经 dance 的 token 路径注入 —— 以坏字符串
     // 令牌直接走全舞步（decode 在 issuer 侧失败）
@@ -818,7 +912,10 @@ async fn row_entry_decode_invalid() {
         t.replace_range(10..14, "!!!!");
         t
     };
-    let conn = client.connect(rig.addr(), session::ALPN_REDEEM).await.unwrap();
+    let conn = client
+        .connect(rig.addr(), session::ALPN_REDEEM)
+        .await
+        .unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     write_frame(&mut send, frame_type::REDEEM_INTENT, bad_token.as_bytes())
         .await
@@ -838,7 +935,13 @@ async fn row_proof_wrong_frame_type() {
     let client = client_endpoint(&redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     let f = dance(
         &client,
@@ -863,7 +966,13 @@ async fn row_proof_bad_length() {
     let client = client_endpoint(&redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     let f = dance(
         &client,
@@ -888,11 +997,20 @@ async fn row_proof_peer_mismatch() {
     let client = client_endpoint(&_redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     // proof 声明的 redeemer != TLS 对端（client 的身份）
     let declared = NodeIdentity::from_seed([0x8B; 32]);
-    let conn = client.connect(rig.addr(), session::ALPN_REDEEM).await.unwrap();
+    let conn = client
+        .connect(rig.addr(), session::ALPN_REDEEM)
+        .await
+        .unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     let token_str = token.encode().unwrap();
     write_frame(&mut send, frame_type::REDEEM_INTENT, token_str.as_bytes())
@@ -937,7 +1055,10 @@ async fn row_verify_protocol() {
     let token = InviteToken::sign(invite, forger.secret_key()).unwrap();
     let redeemer = NodeIdentity::from_seed([0x8E; 32]);
     let client = client_endpoint(&redeemer).await;
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     expect_no_structured_frame("verify-protocol", f);
 }
 
@@ -953,7 +1074,13 @@ async fn row_consume_persistence() {
     // 先成功消费一次令 invites.consumed 存在
     let t1 = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     let f = dance(&client, &rig, &t1, &redeemer, &redeemer, false, None, None).await;
     assert!(matches!(f, FinalFrame::Frame(frame_type::REDEEM_OK, _)));
@@ -965,7 +1092,13 @@ async fn row_consume_persistence() {
     std::fs::set_permissions(&log, ro).unwrap();
     let t2 = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     let f = dance(&client, &rig, &t2, &redeemer, &redeemer, false, None, None).await;
     std::fs::set_permissions(&log, perms).unwrap();
@@ -983,9 +1116,18 @@ async fn row_post_grant_failed() {
     let client = client_endpoint(&redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
-    let f = dance(&client, &rig, &token, &redeemer, &redeemer, false, None, None).await;
+    let f = dance(
+        &client, &rig, &token, &redeemer, &redeemer, false, None, None,
+    )
+    .await;
     expect_no_structured_frame("post-grant-failed", f);
 }
 
@@ -998,7 +1140,13 @@ async fn row_post_write_redeem_ok_failed() {
     let client = client_endpoint(&redeemer).await;
     let token = {
         let mut roster = rig.roster.lock().await;
-        token_on(&mut roster, &root, "https://relay.example", 60_000, now_ms())
+        token_on(
+            &mut roster,
+            &root,
+            "https://relay.example",
+            60_000,
+            now_ms(),
+        )
     };
     // proof 后立即 stop 接收半边 → issuer 的 REDEEM_OK 写入失败（显式冻结行）
     let f = dance(

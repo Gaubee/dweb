@@ -2,7 +2,7 @@
 //! 全程仅 localhost 直连（relay 禁用），无任何外部设施。
 
 use dweb_fabric::fabric::{JOIN_TIMEOUT_MS_DEFAULT, JOIN_TIMEOUT_MS_MIN};
-use dweb_fabric::{Fabric, FabricConfig, FabricEvent, HttpProxyConfig, RelayConfig};
+use dweb_fabric::{Fabric, FabricConfig, FabricEvent, HttpProxyConfig, RelayConfig, RelayTlsTrust};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -14,7 +14,7 @@ fn cfg(dir: &TempDir) -> FabricConfig {
         secret: dweb_fabric::SecretInjection::Default,
         http_proxy: HttpProxyConfig::None,
         join_timeout_ms: JOIN_TIMEOUT_MS_DEFAULT,
-        relay_ca_tls: None,
+        relay_tls_trust: RelayTlsTrust::PlatformRoot,
         bind_addr: None,
     }
 }
@@ -34,7 +34,7 @@ fn cfg_fixed_port(dir: &TempDir, port: u16) -> FabricConfig {
         advertise_addrs: vec![format!("127.0.0.1:{port}")],
         bind_addr: Some(format!("127.0.0.1:{port}")),
         join_timeout_ms: JOIN_TIMEOUT_MS_MIN.max(5_000),
-        relay_ca_tls: None,
+        relay_tls_trust: RelayTlsTrust::PlatformRoot,
         ..cfg(dir)
     }
 }
@@ -65,7 +65,9 @@ async fn full_lifecycle_invite_join_message_revoke() {
     let dir_b = TempDir::new().unwrap();
 
     let port = reserve_loopback_port();
-    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port)).await.unwrap();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port))
+        .await
+        .unwrap();
     let mut ev_a = a.subscribe();
 
     let fabric_id = a.fabric_id_hex().await;
@@ -253,13 +255,23 @@ async fn remote_revoke_kicks_session_via_acceptor_path() {
 
     // relay 禁用场景：显式交换地址提示（仅 loopback：LAN 路径在本机发夹场景下
     // 与 iroh 路径状态竞争，会造成重拨卡死——见 dial_after_disconnect 复现）
-    for hint in c.direct_addr_hints_public().await.into_iter().filter(|h| h.starts_with("127.0.0.1:")) {
+    for hint in c
+        .direct_addr_hints_public()
+        .await
+        .into_iter()
+        .filter(|h| h.starts_with("127.0.0.1:"))
+    {
         b.add_known_addr(&c.endpoint_id(), hint.clone())
             .await
             .unwrap();
         a.add_known_addr(&c.endpoint_id(), hint).await.unwrap();
     }
-    for hint in b.direct_addr_hints_public().await.into_iter().filter(|h| h.starts_with("127.0.0.1:")) {
+    for hint in b
+        .direct_addr_hints_public()
+        .await
+        .into_iter()
+        .filter(|h| h.starts_with("127.0.0.1:"))
+    {
         c.add_known_addr(&b.endpoint_id(), hint.clone())
             .await
             .unwrap();

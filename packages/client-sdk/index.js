@@ -1,4 +1,6 @@
-// 平台守卫 + 原生模块加载 + 事件解包：v0.1 仅 darwin-arm64。
+// 平台守卫 + 原生模块加载 + 事件解包（v0.2+：darwin-arm64 / win32-x64）。
+// 二进制基线：本 SDK 仅支持 v0.2+ 原生二进制（off/relayStatus 等能力以 v0.2
+// 为前提）；方法缺失时的 feature-detect 降级是防御，不构成旧二进制兼容承诺。
 // 加载策略：把 .node 拷贝到 os.tmpdir() 下的内容寻址新路径再 require——
 // 规避网络磁盘（SMB）页缓存不一致导致的 CODESIGNING "Invalid Page"，
 // 以及 dyld 对既有路径的坏闭包缓存（同名覆写后同字节仍加载失败）。
@@ -18,7 +20,7 @@ const BINARY = PLATFORM_BINARIES[SUPPORTED];
 
 if (!BINARY) {
   throw new Error(
-    `@jixo/opendweb-client-sdk: 当前平台 ${SUPPORTED} 暂不支持。v0.1 提供 ${Object.keys(PLATFORM_BINARIES).join(" / ")} 原生二进制。`,
+    `@jixo/opendweb-client-sdk: 当前平台 ${SUPPORTED} 暂不支持。v0.2 提供 ${Object.keys(PLATFORM_BINARIES).join(" / ")} 原生二进制。`,
   );
 }
 
@@ -60,7 +62,7 @@ Native.Fabric.prototype.on = function onWrapped(callback) {
     }
     callback(ev);
   });
-  // off feature-detect（旧二进制无 off 方法时取消函数为 no-op，不 throw）
+  // off 自 v0.2+ 二进制起支持；feature-detect 为方法缺失时的 no-op 防御（不 throw）
   return () => {
     if (typeof nativeOff === "function") {
       nativeOff.call(this, id);
@@ -82,7 +84,7 @@ function deriveErrorCode(message) {
 Native.deriveErrorCode = deriveErrorCode;
 
 // relayStatus()：napi Option::None 序列化为 undefined，契约（C0 d.ts）要求 null——
-// 包装归一（事件 payload 的 relay 快照经 JSON.parse 天然是 null，无需处理）。
+// 包装归一（含 activeUrl；事件 payload 的 relay 快照经 JSON.parse 天然是 null）。
 const nativeRelayStatus = Native.Fabric.prototype.relayStatus;
 if (typeof nativeRelayStatus === "function") {
   Native.Fabric.prototype.relayStatus = async function relayStatusWrapped() {
@@ -92,6 +94,7 @@ if (typeof nativeRelayStatus === "function") {
       urls: r.urls ?? [],
       online: r.online ?? null,
       lastError: r.lastError ?? null,
+      activeUrl: r.activeUrl ?? null,
     };
   };
 }

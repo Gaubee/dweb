@@ -11,6 +11,9 @@ tokio = { workspace = true }
 iroh = { workspace = true }
 iroh-base = { workspace = true }
 iroh-relay = { workspace = true }
+# RelayTlsTrust::CustomPem 的 PEM 解析与 CertificateDer 构造（HB 5.1；
+# 与 iroh-relay 内部同源同版本，已在依赖树中，不引入新编译单元）
+rustls-pki-types = "1"
 # Content addressing (fact_id) and file checksums.
 blake3 = { workspace = true }
 base64 = { workspace = true }

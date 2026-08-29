@@ -3,7 +3,9 @@
 //! 实证：LAN 提示（本机发夹）与 iroh 路径状态竞争会造成重拨卡死；仅 loopback 提示稳定。
 
 use dweb_fabric::fabric::JOIN_TIMEOUT_MS_MIN;
-use dweb_fabric::{Fabric, FabricConfig, FabricEvent, HttpProxyConfig, RelayConfig, SecretInjection};
+use dweb_fabric::{
+    Fabric, FabricConfig, FabricEvent, HttpProxyConfig, RelayConfig, RelayTlsTrust, SecretInjection,
+};
 use tempfile::TempDir;
 
 fn cfg(dir: &TempDir) -> FabricConfig {
@@ -15,7 +17,7 @@ fn cfg(dir: &TempDir) -> FabricConfig {
         http_proxy: HttpProxyConfig::None,
         join_timeout_ms: 30_000,
         bind_addr: None,
-        relay_ca_tls: None,
+        relay_tls_trust: RelayTlsTrust::PlatformRoot,
     }
 }
 
@@ -42,7 +44,9 @@ async fn redial_after_disconnect_succeeds() {
     let dir_b = TempDir::new().unwrap();
 
     let port = reserve_loopback_port();
-    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port)).await.unwrap();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port))
+        .await
+        .unwrap();
     let fabric_id = a.fabric_id_hex().await;
     let b = Fabric::attach(cfg(&dir_b), &fabric_id).await.unwrap();
     let token = a
@@ -52,7 +56,12 @@ async fn redial_after_disconnect_succeeds() {
     b.join(&token).await.unwrap();
 
     // 仅 loopback 提示：LAN 路径在本机发夹场景与 iroh 路径状态竞争（见文件头注释）
-    for hint in b.direct_addr_hints_public().await.into_iter().filter(|h| h.starts_with("127.0.0.1:")) {
+    for hint in b
+        .direct_addr_hints_public()
+        .await
+        .into_iter()
+        .filter(|h| h.starts_with("127.0.0.1:"))
+    {
         a.add_known_addr(&b.endpoint_id(), hint).await.unwrap();
     }
     for hint in a.direct_addr_hints_public().await {
@@ -80,7 +89,9 @@ async fn concurrent_connect_single_flight() {
     let dir_b = TempDir::new().unwrap();
 
     let port = reserve_loopback_port();
-    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port)).await.unwrap();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port))
+        .await
+        .unwrap();
     let fabric_id = a.fabric_id_hex().await;
     let b = Fabric::attach(cfg(&dir_b), &fabric_id).await.unwrap();
     let token = a
@@ -133,7 +144,9 @@ async fn connect_and_shutdown_no_deadlock() {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
     let port = reserve_loopback_port();
-    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port)).await.unwrap();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port))
+        .await
+        .unwrap();
     let fabric_id = a.fabric_id_hex().await;
     let b = Fabric::attach(cfg(&dir_b), &fabric_id).await.unwrap();
     let token = a
@@ -159,6 +172,9 @@ async fn connect_and_shutdown_no_deadlock() {
         s
     })
     .await;
-    assert!(res.is_ok(), "connect+shutdown must complete within 10s (no lock-order deadlock)");
+    assert!(
+        res.is_ok(),
+        "connect+shutdown must complete within 10s (no lock-order deadlock)"
+    );
     let _ = b.shutdown().await;
 }

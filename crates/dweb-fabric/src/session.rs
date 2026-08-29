@@ -309,17 +309,44 @@ pub enum LinkStatus {
 }
 
 /// 监听一条连接的 path_events，把选中路径归纳为 LinkStatus 回写并在变化时发事件。
+/// 独立会话入口没有 Fabric 生命周期门；Fabric 内部应使用
+/// [`spawn_path_watcher_gated`]。
 pub fn spawn_path_watcher(
     conn: Connection,
     tx: Arc<std::sync::Mutex<LinkStatus>>,
     events_tx: tokio::sync::broadcast::Sender<crate::FabricEvent>,
     endpoint_id: EndpointId,
 ) {
+    // [R8-2] 保留独立 session API 的原有语义；Fabric 路径由 gated 入口共享主门。
+    spawn_path_watcher_gated(
+        conn,
+        Arc::new(std::sync::Mutex::new(false)),
+        std::sync::Arc::new(std::sync::Mutex::new(false)),
+        tx,
+        events_tx,
+        endpoint_id,
+    );
+}
+
+/// Fabric 生命周期内的 path watcher；事件发送与 shutdown 主门线性化。
+pub fn spawn_path_watcher_gated(
+    conn: Connection,
+    lifecycle_gate: Arc<std::sync::Mutex<bool>>,
+    shutdown_requested: Arc<std::sync::Mutex<bool>>,
+    tx: Arc<std::sync::Mutex<LinkStatus>>,
+    events_tx: tokio::sync::broadcast::Sender<crate::FabricEvent>,
+    endpoint_id: EndpointId,
+) -> tokio::task::JoinHandle<()> {
+    // lifecycle_gate（R7）：与 shutdown 置位同锁——draining 后抑制 PathChanged
     use n0_future::StreamExt;
     let mut events = conn.path_events();
     tokio::spawn(async move {
         let mut last: Option<LinkStatus> = None;
         while let Some(ev) = events.next().await {
+            // [R8-1] 主门后不再更新路径状态或尝试发事件。
+            if *shutdown_requested.lock().unwrap() || *lifecycle_gate.lock().unwrap() {
+                break;
+            }
             if !matches!(&ev, iroh::endpoint::PathEvent::Selected { .. }) {
                 continue;
             }
@@ -336,13 +363,18 @@ pub fn spawn_path_watcher(
             *tx.lock().unwrap() = status;
             if last != Some(status) {
                 last = Some(status);
-                let _ = events_tx.send(crate::FabricEvent::PathChanged {
-                    endpoint_id: crate::identity::endpoint_id_display(&endpoint_id),
-                    status,
-                });
+                crate::fabric::FabricInner::emit_gated_on(
+                    &lifecycle_gate,
+                    &shutdown_requested,
+                    &events_tx,
+                    crate::FabricEvent::PathChanged {
+                        endpoint_id: crate::identity::endpoint_id_display(&endpoint_id),
+                        status,
+                    },
+                );
             }
         }
-    });
+    })
 }
 
 /// 发起方控制流握手：开唯一控制 bidi 流并发送 HELLO（全量事实），读回对端 HELLO。
@@ -444,11 +476,8 @@ pub async fn redeem_as_joiner(
             .await
             .map_err(unstructured)?;
         match t {
-            frame_type::REDEEM_OK => {
-                SignedFact::decode_all(&payload).map_err(|e| {
-                    RedeemError::Unstructured(format!("receipt fact decode failed: {e}"))
-                })
-            }
+            frame_type::REDEEM_OK => SignedFact::decode_all(&payload)
+                .map_err(|e| RedeemError::Unstructured(format!("receipt fact decode failed: {e}"))),
             frame_type::REDEEM_ERR => {
                 // 记录段短读（含外层 payload 末尾不完整记录）= 协议违规 → 非结构化
                 let records = redeem_err::decode_records(&payload).map_err(|v| {
@@ -485,9 +514,7 @@ pub fn redeem_verify_emit(e: &crate::roster::RosterError) -> Option<redeem_err::
             crate::roster::fabric_id_short16(expected)
         ))),
         RosterError::InviteNotRoot { .. } => Some(RedeemErrorKind::NotRoot),
-        RosterError::InviteExpired { .. } => {
-            Some(RedeemErrorKind::Other("invite expired".into()))
-        }
+        RosterError::InviteExpired { .. } => Some(RedeemErrorKind::Other("invite expired".into())),
         RosterError::InviteRecipientMismatch { .. } => {
             Some(RedeemErrorKind::Other("recipient mismatch".into()))
         }
@@ -506,13 +533,31 @@ pub fn redeem_verify_emit(e: &crate::roster::RosterError) -> Option<redeem_err::
     }
 }
 
-/// 兑换（issuer 侧）：单 bidi 流 + 整体时限；成功即已签发 Grant 并回执全量 dump。
-/// 拒绝语义按 issuerMapping：emit=true 行发单记录 REDEEM_ERR 后关闭；
-/// emit=false 行（协议违规/入口解码/内部 IO/post-consume 失败）不发结构化帧直接关闭。
+/// 独立 issuer 会话入口：不属于 Fabric 生命周期时使用。Fabric accept loop 必须
+/// 使用 [`handle_redeem_as_issuer_gated`] 以获得 [R8-1] 提交门保护。
 pub async fn handle_redeem_as_issuer(
     conn: &Connection,
     roster: &Arc<tokio::sync::Mutex<Roster>>,
     identity: &crate::identity::NodeIdentity,
+) -> Result<(), SessionError> {
+    let commit = tokio::sync::Mutex::new(());
+    let gate = Arc::new(std::sync::Mutex::new(false));
+    let requested = std::sync::Mutex::new(false);
+    handle_redeem_as_issuer_gated(conn, roster, identity, &commit, &requested, gate).await
+}
+
+/// 兑换（issuer 侧）：单 bidi 流 + 整体时限；成功即已签发 Grant 并回执全量 dump。
+/// 拒绝语义按 issuerMapping：emit=true 行发单记录 REDEEM_ERR 后关闭；
+/// emit=false 行（协议违规/入口解码/内部 IO/post-consume 失败）不发结构化帧直接关闭。
+/// `roster_commit` 与 `lifecycle_gate` 由 Fabric 提供，用于 [R8-1] 将 grant
+/// 提交和 shutdown 门切换线性化。
+pub async fn handle_redeem_as_issuer_gated(
+    conn: &Connection,
+    roster: &Arc<tokio::sync::Mutex<Roster>>,
+    identity: &crate::identity::NodeIdentity,
+    roster_commit: &tokio::sync::Mutex<()>,
+    shutdown_requested: &std::sync::Mutex<bool>,
+    lifecycle_gate: Arc<std::sync::Mutex<bool>>,
 ) -> Result<(), SessionError> {
     /// 兑换失败的两类出口：
     /// - Silent：emit=false 行与一切 I/O/校验异常——无结构化帧，**立即关闭**
@@ -525,12 +570,17 @@ pub async fn handle_redeem_as_issuer(
     }
     let silent = |r: String| InnerErr::Silent(r);
     let expected_remote = conn.remote_id();
+    // [R8-1] 入场快拒只是副作用削减；提交事务内仍必须再次检查，覆盖检查后
+    // shutdown 的竞态。
+    if *shutdown_requested.lock().unwrap() || *lifecycle_gate.lock().unwrap() {
+        conn.close(1u32.into(), b"fabric-shutting-down");
+        return Err(SessionError::RedeemRejected(
+            "fabric is shutting down".into(),
+        ));
+    }
     let res = tokio::time::timeout(REDEEM_DEADLINE, async {
         // ---- session_entry：违规/坏令牌/IO 异常均无结构化帧（entry-* 行）----
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| silent(format!("{e}")))?;
+        let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| silent(format!("{e}")))?;
         let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME)
             .await
             .map_err(|e| silent(format!("{e}")))?;
@@ -568,6 +618,14 @@ pub async fn handle_redeem_as_issuer(
             Receipt(Vec<u8>),
         }
         let flow = {
+            // [R8-1] grant/consume 与 shutdown 门共享提交锁；门置位后拒绝，
+            // 门置位前已获锁的事务先完整提交，故不存在门后名册写入。
+            let _commit = roster_commit.lock().await;
+            let requested = *shutdown_requested.lock().unwrap();
+            let closed = *lifecycle_gate.lock().unwrap();
+            if requested || closed {
+                return Err(silent("fabric is shutting down".into()));
+            }
             let mut r = roster.lock().await;
             // 过期判断取当前时间，而非任务开始时的快照
             if let Err(e) = r.redeem_verify(&token, &redeemer, &challenge, &sig, now_ms()) {
@@ -588,7 +646,7 @@ pub async fn handle_redeem_as_issuer(
                             Err(e) => {
                                 return Err(silent(format!(
                                     "post-consume receipt encode failed: {e}"
-                                )))
+                                )));
                             }
                         }
                     }
@@ -607,7 +665,8 @@ pub async fn handle_redeem_as_issuer(
                     .await
                     .map_err(|e| silent(format!("{e}")))?;
                 // R4 P1-3：finish 是发送流收尾 I/O——失败同样走 silent 立即关闭
-                send.finish().map_err(|e| silent(format!("finish failed: {e}")))?;
+                send.finish()
+                    .map_err(|e| silent(format!("finish failed: {e}")))?;
                 Err(InnerErr::Emitted(reason))
             }
             Flow::Receipt(receipt) => {
@@ -626,7 +685,9 @@ pub async fn handle_redeem_as_issuer(
         // deadline：同样立即关闭
         Err(_) => {
             conn.close(1u32.into(), b"redeem-deadline");
-            Err(SessionError::RedeemRejected("redeem deadline exceeded".into()))
+            Err(SessionError::RedeemRejected(
+                "redeem deadline exceeded".into(),
+            ))
         }
         Ok(Ok(())) => Ok(()),
         Ok(Err(InnerErr::Silent(reason))) => {
@@ -677,7 +738,10 @@ mod redeem_err_tests {
         );
         // other 带原因 → [03 len ..]
         let e = RedeemErrorKind::Other("not-root".into());
-        assert_eq!(e.encode_record(), vec![0x03, 0x08, b'n', b'o', b't', 0x2d, b'r', b'o', b'o', b't']);
+        assert_eq!(
+            e.encode_record(),
+            vec![0x03, 0x08, b'n', b'o', b't', 0x2d, b'r', b'o', b'o', b't']
+        );
         // not-root / bad-pop：无载荷
         assert_eq!(RedeemErrorKind::NotRoot.encode_record(), vec![0x01, 0x00]);
         assert_eq!(RedeemErrorKind::BadPoP.encode_record(), vec![0x02, 0x00]);
@@ -688,10 +752,7 @@ mod redeem_err_tests {
         // 非 ASCII（UTF-8 中）剥除
         assert_eq!(normalize_payload("中"), Vec::<u8>::new());
         // 控制字符剥除、可打印保留
-        assert_eq!(
-            normalize_payload("a\x01b\x7fc d"),
-            b"abc d".to_vec()
-        );
+        assert_eq!(normalize_payload("a\x01b\x7fc d"), b"abc d".to_vec());
         // >255 截断
         let long = "x".repeat(300);
         assert_eq!(normalize_payload(&long).len(), 255);
@@ -812,7 +873,10 @@ mod redeem_err_tests {
         let e = RosterError::WrongFabric { got, expected };
         match super::redeem_verify_emit(&e) {
             Some(RedeemErrorKind::Other(reason)) => {
-                assert_eq!(reason, format!("wrong fabric {} vs {}", id16(&got), id16(&expected)));
+                assert_eq!(
+                    reason,
+                    format!("wrong fabric {} vs {}", id16(&got), id16(&expected))
+                );
             }
             other => panic!("wrong-fabric must emit Other, got {other:?}"),
         }

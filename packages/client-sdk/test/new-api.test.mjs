@@ -109,8 +109,22 @@ maybeTest("relayStatus: disabled => online null, no relay events", async () => {
   assert.equal(s.mode, "disabled");
   assert.deepEqual(s.urls, []);
   assert.equal(s.online, null, "disabled => null, not false");
+  // activeUrl（8.2）：disabled => null。旧二进制（无该字段）经 index.js 包装
+  // 归一同为 null，断言整合前后均成立。
+  assert.equal(s.activeUrl, null, "disabled => activeUrl null");
   await sleep(300);
   assert.ok(!events.some((e) => e.type === "relay-online" || e.type === "relay-offline"));
+  await a.shutdown();
+});
+
+maybeTest("concurrent shutdown() calls share completion", async () => {
+  // R3 P1-1：并发 shutdown 共享完成门——两路都必须在 drain（含事件泵
+  // abort）完成后才返回；任何一路提前 resolve 都会让"关闭后无后续事件"
+  // 的契约失效。
+  const a = await Fabric.createRoot({ dataDir: tmpdir("dweb-rs-conc-"), relay: { mode: "disabled" } });
+  const results = await Promise.all([a.shutdown(), a.shutdown(), a.shutdown()]);
+  assert.equal(results.length, 3);
+  // 再次串行调用（已完成态快速路径）
   await a.shutdown();
 });
 
@@ -121,12 +135,19 @@ maybeTest("relayStatus: custom => online boolean (not null)", async () => {
   });
   const s = await a.relayStatus();
   assert.equal(s.mode, "custom");
+  // urls 为配置原样字符串（R2 P1-4：对外契约不做尾斜杠规范化改写；
+  // 规范化仅作为内核聚合匹配的内部键）
   assert.deepEqual(s.urls, ["http://127.0.0.1:9"]);
   assert.notEqual(s.online, null, "enabled mode => boolean");
   // lastError 为 null 或脱敏类别串（不含 URL 凭证段）
   if (s.lastError !== null) {
     assert.equal(typeof s.lastError, "string");
   }
+  // activeUrl（8.2）：offline => null；online => 配置序最小已连接 relay URL。
+  // 此处 relay 恒不可达（127.0.0.1:9）=> 恒 offline => null；旧二进制（无该
+  // 字段）经包装归一同为 null。online=>string 断言依赖新二进制 + 真实 relay，
+  // 归 ZCode 4.1 整合期收紧。
+  assert.equal(s.activeUrl, null, "offline custom => activeUrl null");
   await a.shutdown();
 });
 

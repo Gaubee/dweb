@@ -1,6 +1,6 @@
 {
   "name": "@jixo/opendweb-client-sdk",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "@jixo/opendweb-client-sdk — dweb application-level fabric SDK for Node (napi-rs binding)",
   "license": "MIT OR Apache-2.0",
   "main": "index.js",
@@ -14,12 +14,14 @@
   "scripts": {
     "build": "napi build --platform --release --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs",
     "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js",
-    "test": "node --test --test-force-exit",
+    "test": "npm run test:types && node --test --test-force-exit test/*.test.mjs",
+    "test:types": "tsc --noEmit -p test/tsconfig.fixture.json",
     "typecheck": "tsc --noEmit",
     "build:win": "PATH=\"$HOME/.cargo/bin:$PATH\" LIBNODE_PATH=\"$HOME/libnode-win\" cargo build --release --target x86_64-pc-windows-gnu -p dweb-client-sdk && cp \"$HOME/.cargo-target/dweb/x86_64-pc-windows-gnu/release/dweb_client_sdk.dll\" dweb.win32-x64.node"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.0",
+    "@types/node": "^22",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   },

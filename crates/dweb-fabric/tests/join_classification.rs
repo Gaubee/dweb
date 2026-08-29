@@ -6,7 +6,7 @@ use dweb_fabric::fabric::{JOIN_TIMEOUT_MS_DEFAULT, JOIN_TIMEOUT_MS_MIN};
 use dweb_fabric::protocol::InviteToken;
 use dweb_fabric::roster::Roster;
 use dweb_fabric::{
-    Fabric, FabricConfig, FabricError, HttpProxyConfig, JoinErrorCode, RelayConfig,
+    Fabric, FabricConfig, FabricError, HttpProxyConfig, JoinErrorCode, RelayConfig, RelayTlsTrust,
     SecretInjection,
 };
 use iroh::RelayMode;
@@ -24,7 +24,7 @@ fn cfg(dir: &TempDir) -> FabricConfig {
         secret: SecretInjection::Default,
         http_proxy: HttpProxyConfig::None,
         join_timeout_ms: JOIN_TIMEOUT_MS_DEFAULT,
-        relay_ca_tls: None,
+        relay_tls_trust: RelayTlsTrust::PlatformRoot,
         bind_addr: None,
     }
 }
@@ -124,12 +124,19 @@ async fn no_reachable_path_fails_before_dialing() {
     let start = std::time::Instant::now();
     let err = j.join(&token).await.unwrap_err();
     let elapsed = start.elapsed();
-    assert_eq!(join_code(&err), Some(JoinErrorCode::NoReachablePath), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::NoReachablePath),
+        "{err:?}"
+    );
     assert!(
         elapsed < std::time::Duration::from_millis(900),
         "must fail before dialing (zero wait), took {elapsed:?}"
     );
-    assert!(err.to_string().contains("no relay URL and no direct addresses"));
+    assert!(
+        err.to_string()
+            .contains("no relay URL and no direct addresses")
+    );
 }
 
 // ---- 2. TOKEN_EXPIRED：固定过去时间 ------------------------------------------
@@ -141,7 +148,11 @@ async fn token_expired_fixed_past_time() {
     let dir_j = TempDir::new().unwrap();
     let j = Fabric::attach(cfg(&dir_j), &fid_hex).await.unwrap();
     let err = j.join(&token).await.unwrap_err();
-    assert_eq!(join_code(&err), Some(JoinErrorCode::TokenExpired), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::TokenExpired),
+        "{err:?}"
+    );
 }
 
 // ---- 1/3. TOKEN_INVALID：解码坏 + 地址规范化坏 ---------------------------------
@@ -151,23 +162,41 @@ async fn token_invalid_variants() {
     let _g = TEST_LOCK.lock().await;
     let dir_j = TempDir::new().unwrap();
     let identity = dweb_fabric::identity::NodeIdentity::load_or_create(dir_j.path()).unwrap();
-    let (_d, fid_hex, good) = issue_token_as(&identity, "https://relay.example", &[], 60_000, now_ms());
+    let (_d, fid_hex, good) =
+        issue_token_as(&identity, "https://relay.example", &[], 60_000, now_ms());
     let j = Fabric::attach(cfg(&dir_j), &fid_hex).await.unwrap();
     // 篡改令牌串
     let mut tampered = good.clone();
     tampered.replace_range(8..12, "!!!!");
     let err = j.join(&tampered).await.unwrap_err();
-    assert_eq!(join_code(&err), Some(JoinErrorCode::TokenInvalid), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::TokenInvalid),
+        "{err:?}"
+    );
     // 令牌 relay 非空但不可解析
     let (_d, _f, bad_relay) = issue_token_as(&identity, "http://[::bad", &[], 60_000, now_ms());
     let err = j.join(&bad_relay).await.unwrap_err();
-    assert_eq!(join_code(&err), Some(JoinErrorCode::TokenInvalid), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::TokenInvalid),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("relay URL"), "{err}");
     // 直连地址不可解析
-    let (_d, _f, bad_addr) =
-        issue_token_as(&identity, "https://relay.example", &["localhost:9"], 60_000, now_ms());
+    let (_d, _f, bad_addr) = issue_token_as(
+        &identity,
+        "https://relay.example",
+        &["localhost:9"],
+        60_000,
+        now_ms(),
+    );
     let err = j.join(&bad_addr).await.unwrap_err();
-    assert_eq!(join_code(&err), Some(JoinErrorCode::TokenInvalid), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::TokenInvalid),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("direct address"), "{err}");
 }
 
@@ -182,7 +211,8 @@ async fn wrong_fabric_dir_a_token_b() {
     // 令牌 B：另一 fabric 的合法令牌
     let dir_b = TempDir::new().unwrap();
     let identity_b = dweb_fabric::identity::NodeIdentity::load_or_create(dir_b.path()).unwrap();
-    let (_dir_t, _fid_b, token_b) = issue_token_as(&identity_b, "https://relay.example", &[], 60_000, now_ms());
+    let (_dir_t, _fid_b, token_b) =
+        issue_token_as(&identity_b, "https://relay.example", &[], 60_000, now_ms());
     let decoded = InviteToken::decode(&token_b).unwrap();
 
     // 内核路径：open 目录 A（roster fabric A）后 join 令牌 B → DirFabricMismatch
@@ -204,8 +234,13 @@ async fn wrong_fabric_dir_a_token_b() {
     let msg = err.to_string();
     assert!(msg.contains("use a fresh --data directory"), "{msg}");
     // 16 hex 短标识（各 8 字节）
-    assert_eq!(dweb_fabric::roster::fabric_id_short16(&decoded.invite.fabric_id).len(), 16);
-    assert!(msg.contains(&dweb_fabric::roster::fabric_id_short16(&decoded.invite.fabric_id)));
+    assert_eq!(
+        dweb_fabric::roster::fabric_id_short16(&decoded.invite.fabric_id).len(),
+        16
+    );
+    assert!(msg.contains(&dweb_fabric::roster::fabric_id_short16(
+        &decoded.invite.fabric_id
+    )));
 
     // SDK joinWithToken 等价路径：attach（目录 A）+ 令牌 B 的 fabric → 构造期即拒
     let fid_b_hex = hex::encode(decoded.invite.fabric_id.as_bytes());
@@ -243,7 +278,11 @@ async fn self_connect_join(relay: &str, addrs: &[&str], join_timeout_ms: u64) ->
 async fn relay_offline_probe_closed_port_instant_refusal() {
     let _g = TEST_LOCK.lock().await;
     let err = self_connect_join("http://127.0.0.1:9", &[], JOIN_TIMEOUT_MS_DEFAULT).await;
-    assert_eq!(join_code(&err), Some(JoinErrorCode::RelayOffline), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::RelayOffline),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("unreachable"), "{err}");
 }
 
@@ -251,9 +290,17 @@ async fn relay_offline_probe_closed_port_instant_refusal() {
 async fn relay_offline_probe_dns_failure() {
     let _g = TEST_LOCK.lock().await;
     // .invalid TLD（RFC 6761）：解析必然失败，计入 2s 探针预算
-    let err = self_connect_join("http://no-such-host-dweb.invalid:80", &[], JOIN_TIMEOUT_MS_DEFAULT)
-        .await;
-    assert_eq!(join_code(&err), Some(JoinErrorCode::RelayOffline), "{err:?}");
+    let err = self_connect_join(
+        "http://no-such-host-dweb.invalid:80",
+        &[],
+        JOIN_TIMEOUT_MS_DEFAULT,
+    )
+    .await;
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::RelayOffline),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -270,7 +317,12 @@ async fn dial_failed_when_probe_succeeds_accept_and_close_listener() {
             }
         }
     });
-    let err = self_connect_join(&format!("http://127.0.0.1:{port}"), &[], JOIN_TIMEOUT_MS_DEFAULT).await;
+    let err = self_connect_join(
+        &format!("http://127.0.0.1:{port}"),
+        &[],
+        JOIN_TIMEOUT_MS_DEFAULT,
+    )
+    .await;
     assert_eq!(join_code(&err), Some(JoinErrorCode::DialFailed), "{err:?}");
     drop(server);
 }
@@ -281,7 +333,12 @@ async fn dial_failed_when_probe_succeeds_accept_and_close_listener() {
 async fn probe_not_applicable_with_direct_addr_is_dial_failed() {
     let _g = TEST_LOCK.lock().await;
     // 令牌含直连地址：即使 relay 探针会失败也不判 RELAY_OFFLINE
-    let err = self_connect_join("http://127.0.0.1:9", &["127.0.0.1:1"], JOIN_TIMEOUT_MS_DEFAULT).await;
+    let err = self_connect_join(
+        "http://127.0.0.1:9",
+        &["127.0.0.1:1"],
+        JOIN_TIMEOUT_MS_DEFAULT,
+    )
+    .await;
     assert_eq!(join_code(&err), Some(JoinErrorCode::DialFailed), "{err:?}");
 }
 
@@ -312,9 +369,8 @@ async fn probe_handle_is_replaceable() {
     let _g = TEST_LOCK.lock().await;
     type F = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
     let make = |ok: bool| {
-        Arc::new(move |_url: String| -> F {
-            Box::pin(async move { ok })
-        }) as dweb_fabric::RelayProbeFn
+        Arc::new(move |_url: String| -> F { Box::pin(async move { ok }) })
+            as dweb_fabric::RelayProbeFn
     };
     // 注入“探针成功”：关闭端口也判 DIAL_FAILED（不判 RELAY_OFFLINE）
     dweb_fabric::set_relay_probe_for_tests(Some(make(true)));
@@ -332,9 +388,18 @@ async fn probe_handle_is_replaceable() {
         }
     });
     dweb_fabric::set_relay_probe_for_tests(Some(make(false)));
-    let err = self_connect_join(&format!("http://127.0.0.1:{port}"), &[], JOIN_TIMEOUT_MS_DEFAULT).await;
+    let err = self_connect_join(
+        &format!("http://127.0.0.1:{port}"),
+        &[],
+        JOIN_TIMEOUT_MS_DEFAULT,
+    )
+    .await;
     dweb_fabric::set_relay_probe_for_tests(None);
-    assert_eq!(join_code(&err), Some(JoinErrorCode::RelayOffline), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::RelayOffline),
+        "{err:?}"
+    );
     drop(server);
 }
 
@@ -360,7 +425,10 @@ impl HoldListener {
                 }
             }
         });
-        Self { _keep: Vec::new(), port }
+        Self {
+            _keep: Vec::new(),
+            port,
+        }
     }
 }
 
@@ -397,6 +465,282 @@ async fn dial_timeout_without_probe_success_note() {
     let msg = err.to_string();
     assert!(msg.contains("join deadline exceeded"), "{msg}");
     assert!(!msg.contains("issuer likely offline"), "{msg}");
+}
+
+// ---- HB 4.1：detached connect 任务纳入 shutdown 可等待集合 ------------------------
+
+#[tokio::test]
+async fn shutdown_joins_detached_connect_tasks() {
+    let _g = TEST_LOCK.lock().await;
+    // 挂起 relay 路径 + 最短 deadline：join 归类 DIAL_TIMEOUT，connect 任务按
+    // P1-10 语义不取消、在登记表中悬挂
+    let hold = HoldListener::spawn();
+    let dir_j = TempDir::new().unwrap();
+    let issuer = dweb_fabric::identity::NodeIdentity::from_seed([0xEE; 32]);
+    let (_dir_t, fid_hex, token) = issue_token_as(
+        &issuer,
+        &format!("http://127.0.0.1:{}", hold.port),
+        &[],
+        60_000,
+        now_ms(),
+    );
+    let j = Fabric::attach(cfg_with(&dir_j, JOIN_TIMEOUT_MS_MIN), &fid_hex)
+        .await
+        .unwrap();
+    let err = j.join(&token).await.unwrap_err();
+    assert_eq!(join_code(&err), Some(JoinErrorCode::DialTimeout), "{err:?}");
+    assert!(
+        j.detached_connect_pending() >= 1,
+        "connect task must be registered and still pending"
+    );
+    // shutdown 有界收尾（endpoint 关闭后自然结束，或 5s 上限 abort）
+    tokio::time::timeout(std::time::Duration::from_secs(15), j.shutdown())
+        .await
+        .expect("shutdown must be bounded")
+        .unwrap();
+    assert_eq!(
+        j.detached_connect_pending(),
+        0,
+        "no detached connect residue after shutdown"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_shutdown_calls_share_completion() {
+    let _g = TEST_LOCK.lock().await;
+    // R3 P1-1：并发 shutdown 共享完成门——晚到调用必须等首次 drain 完成后
+    // 返回，不得在 drain 进行中就提前 Ok（残留任务/后续事件违例）。
+    let hold = HoldListener::spawn();
+    let dir_j = TempDir::new().unwrap();
+    let issuer = dweb_fabric::identity::NodeIdentity::from_seed([0xE1; 32]);
+    let (_dir_t, fid_hex, token) = issue_token_as(
+        &issuer,
+        &format!("http://127.0.0.1:{}", hold.port),
+        &[],
+        60_000,
+        now_ms(),
+    );
+    let j = Fabric::attach(cfg_with(&dir_j, JOIN_TIMEOUT_MS_MIN), &fid_hex)
+        .await
+        .unwrap();
+    // 制造一个悬挂的 detached connect（归类超时后任务仍在登记表）
+    let _ = j.join(&token).await;
+    assert!(j.detached_connect_pending() >= 1);
+    // 并发关闭：两路都应等待 drain 完成后才返回
+    let (r1, r2) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::join!(j.shutdown(), j.shutdown())
+    })
+    .await
+    .expect("concurrent shutdown must be bounded");
+    r1.unwrap();
+    r2.unwrap();
+    assert_eq!(
+        j.detached_connect_pending(),
+        0,
+        "both callers must observe completed drain"
+    );
+}
+
+#[tokio::test]
+async fn sequential_and_cancelled_shutdown_stay_bounded() {
+    let _g = TEST_LOCK.lock().await;
+    // R4 P1-1 回归三连：
+    // 1) 顺序二调：首调完成时无订阅者——send_replace 落值，第二次即见 true
+    //    （R3 报告的确定性死锁：watch::send 无订阅者丢弃值）
+    // 2) 首调用 Future 取消（drop）：drain 由后台任务继续，后续调用必放行
+    // 3) shutdown 后 connect 拒绝（R4 P1-2：无新航班越过完成门）
+    let dir = TempDir::new().unwrap();
+    let issuer = dweb_fabric::identity::NodeIdentity::from_seed([0xE2; 32]);
+    let (_dir_t, fid_hex, _token) =
+        issue_token_as(&issuer, "http://127.0.0.1:9", &[], 60_000, now_ms());
+    let j = Fabric::attach(cfg_with(&dir, 30_000), &fid_hex)
+        .await
+        .unwrap();
+    // 1) 顺序二调有界
+    tokio::time::timeout(std::time::Duration::from_secs(15), j.shutdown())
+        .await
+        .expect("first shutdown must be bounded")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), j.shutdown())
+        .await
+        .expect("sequential second shutdown must see stored completion")
+        .unwrap();
+    // 3) shutdown 后 connect 快速失败（入口拒绝）
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        j.connect(&issuer.endpoint_id().to_string()),
+    )
+    .await
+    .expect("connect after shutdown must be bounded");
+    assert!(
+        err.is_err(),
+        "connect must be rejected while shutting down: {err:?}"
+    );
+
+    // 2) 取消路径（独立 fabric）
+    let dir2 = TempDir::new().unwrap();
+    let j2 = Fabric::attach(cfg_with(&dir2, 30_000), &fid_hex)
+        .await
+        .unwrap();
+    let j2c = j2.clone();
+    let owner = tokio::spawn(async move { j2c.shutdown().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    owner.abort(); // 取消首调用（drain 后台任务不受影响）
+    tokio::time::timeout(std::time::Duration::from_secs(15), j2.shutdown())
+        .await
+        .expect("post-cancellation shutdown must complete via background drain")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_collects_stalled_accept_child_before_completion() {
+    let _g = TEST_LOCK.lock().await;
+    // [R8-2] 真实 accept child 卡在 redeem 入口（不打开 bidi 流）；关闭必须
+    // 先结束外层 accept loop，再 abort/join 该 child，完成门不可越过残留任务。
+    let port = reserve_port();
+    let dir = TempDir::new().unwrap();
+    let fabric = Fabric::create_root(FabricConfig {
+        advertise_addrs: vec![format!("127.0.0.1:{port}")],
+        bind_addr: Some(format!("127.0.0.1:{port}")),
+        ..cfg(&dir)
+    })
+    .await
+    .unwrap();
+    let token = fabric.invite(60_000, None).await.unwrap();
+    let decoded = InviteToken::decode(&token).unwrap();
+    let addr = dweb_fabric::session::endpoint_addr_from_invite(&decoded).unwrap();
+    let raw = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .alpns(vec![dweb_fabric::session::ALPN_REDEEM.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let _conn = raw
+        .connect(addr, dweb_fabric::session::ALPN_REDEEM)
+        .await
+        .unwrap();
+    // 让 accept loop 完成 incoming -> child 的登记；child 随后停在 accept_bi。
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(15), fabric.shutdown())
+        .await
+        .expect("stalled accept child must not hold completion gate")
+        .unwrap();
+    raw.close().await;
+}
+
+#[tokio::test]
+async fn inflight_connect_owner_cannot_cross_shutdown_completion() {
+    let _g = TEST_LOCK.lock().await;
+    // R5 P1-1 确定性 fixture：真实 join 建立成员关系后杀死对端、注入持流
+    // relay 候选——connect owner 挂在拨号上；随后验证——
+    // 1) owner 登记确定性可观察（connect_inflight_len 轮询）
+    // 2) 首调用 shutdown 的调用方 Future 被取消（drain 确实进行中：空表
+    //    等待卡在挂起拨号上）——drain 后台任务继续
+    // 3) 完成门放行后：connect 有界失败、无 PeerConnected 事件
+    let hold = HoldListener::spawn();
+    let port_a = reserve_port();
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let a = Fabric::create_root(FabricConfig {
+        advertise_addrs: vec![format!("127.0.0.1:{port_a}")],
+        bind_addr: Some(format!("127.0.0.1:{port_a}")),
+        join_timeout_ms: JOIN_TIMEOUT_MS_MIN.max(5_000),
+        ..cfg(&dir_a)
+    })
+    .await
+    .unwrap();
+    let fabric_id = a.fabric_id_hex().await;
+    let token = a.invite(300_000, None).await.unwrap();
+    let b = Fabric::attach(cfg_with(&dir_b, JOIN_TIMEOUT_MS_MIN), &fabric_id)
+        .await
+        .unwrap();
+    b.join(&token).await.expect("join establishes membership");
+    let a_id = a.endpoint_id();
+    a.shutdown().await.unwrap(); // 对端死亡：直连候选快速失败
+    drop(a);
+    let mut events = b.subscribe();
+    b.add_known_addr(&a_id, format!("http://127.0.0.1:{}", hold.port))
+        .await
+        .unwrap();
+    let b2 = b.clone();
+    let a_id_dial = a_id.clone();
+    let connect_task = tokio::spawn(async move { b2.connect(&a_id_dial).await });
+    // 1) 确定性等待 owner 登记
+    let dl = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while b.connect_inflight_len() == 0 && std::time::Instant::now() < dl {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if b.connect_inflight_len() == 0 {
+        let diag = if connect_task.is_finished() {
+            format!(
+                "connect already finished (fast-fail): {:?}",
+                connect_task.await
+            )
+        } else {
+            "connect still pending but no flight registered".to_string()
+        };
+        panic!("owner flight must be registered — {diag}");
+    }
+    // 2) 首调用取消（drain 进行中：空表等待卡在挂起拨号）
+    let b3 = b.clone();
+    let owner = tokio::spawn(async move { b3.shutdown().await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    owner.abort();
+    // 后续调用必须经后台 drain 的完成通知放行（有界）
+    tokio::time::timeout(std::time::Duration::from_secs(20), b.shutdown())
+        .await
+        .expect("shutdown must complete via background drain despite cancelled owner call")
+        .unwrap();
+    // 3) 完成后：航班表真实清空（R6：owner 条目保留至其退出——收敛可观测）
+    assert_eq!(
+        b.connect_inflight_len(),
+        0,
+        "owner flight must be cleaned up by guard after completion"
+    );
+    // 完成后：connect 有界失败；无 PeerConnected
+    let r = tokio::time::timeout(std::time::Duration::from_secs(15), connect_task)
+        .await
+        .expect("in-flight connect must terminate after shutdown completion")
+        .unwrap();
+    assert!(r.is_err(), "connect must fail on shut-down fabric: {r:?}");
+    while let Ok(ev) = events.try_recv() {
+        assert!(
+            !matches!(ev, dweb_fabric::FabricEvent::PeerConnected { .. }),
+            "no peer-connected after shutdown completion: {ev:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn join_after_shutdown_fails_fast_without_registration() {
+    let _g = TEST_LOCK.lock().await;
+    // R2 P0-2 回归：shutdown 置位后到达的 join（登记侧看见 shutting_down）
+    // 必须本地 abort + await 收割 connect wrapper——不进登记表、无残留、
+    // 有界返回（消灭"spawn 后、登记前"窗口的关闭后残留）。
+    let hold = HoldListener::spawn();
+    let dir_j = TempDir::new().unwrap();
+    let issuer = dweb_fabric::identity::NodeIdentity::from_seed([0xEF; 32]);
+    let (_dir_t, fid_hex, token) = issue_token_as(
+        &issuer,
+        &format!("http://127.0.0.1:{}", hold.port),
+        &[],
+        60_000,
+        now_ms(),
+    );
+    let j = Fabric::attach(cfg_with(&dir_j, JOIN_TIMEOUT_MS_MIN), &fid_hex)
+        .await
+        .unwrap();
+    j.shutdown().await.unwrap();
+    // shutdown 之后的 join：无论 connect 结果如何，不得在登记表留下任务
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), j.join(&token)).await;
+    assert!(result.is_ok(), "join after shutdown must be bounded");
+    // 归类为超时族（endpoint 已关，任何失败形态均可，但不得挂死）
+    assert!(result.unwrap().is_err(), "join after shutdown must fail");
+    assert_eq!(
+        j.detached_connect_pending(),
+        0,
+        "registration after shutdown must abort locally, never register"
+    );
 }
 
 // ---- redeem 通道超时 / 中断（raw issuer endpoint） -------------------------------
@@ -439,7 +783,9 @@ async fn raw_issuer_accept_loop(endpoint: iroh::Endpoint, mode: RawIssuerMode) {
     use dweb_fabric::session::frame_type;
     use dweb_fabric::session::{MAX_REDEEM_FRAME, read_frame, write_frame};
     while let Some(incoming) = endpoint.accept().await {
-        let Ok(conn) = incoming.accept() else { continue };
+        let Ok(conn) = incoming.accept() else {
+            continue;
+        };
         let Ok(conn) = conn.await else { continue };
         match mode {
             RawIssuerMode::HangAfterIntent => {
@@ -458,8 +804,7 @@ async fn raw_issuer_accept_loop(endpoint: iroh::Endpoint, mode: RawIssuerMode) {
                         return;
                     };
                     let _ = read_frame(&mut recv, MAX_REDEEM_FRAME).await;
-                    let _ =
-                        write_frame(&mut send, frame_type::REDEEM_CHALLENGE, &[0u8; 32]).await;
+                    let _ = write_frame(&mut send, frame_type::REDEEM_CHALLENGE, &[0u8; 32]).await;
                     conn.close(0u32.into(), b"boom");
                 });
             }
@@ -514,10 +859,7 @@ async fn redeem_unstructured_interrupt_is_dial_failed() {
     // 连接中断（challenge 后连接被 issuer 关闭）→ 非结构化失败 → DIAL_FAILED
     let err = raw_issuer_join(RawIssuerMode::CloseAfterIntent, JOIN_TIMEOUT_MS_DEFAULT).await;
     assert_eq!(join_code(&err), Some(JoinErrorCode::DialFailed), "{err:?}");
-    assert!(
-        err.to_string().contains("redeem channel failed"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("redeem channel failed"), "{err}");
 }
 
 // ---- TOKEN_CONSUMED（固定端口全链路二次兑换） ------------------------------------
@@ -540,7 +882,11 @@ async fn token_consumed_second_redeem() {
     let token = a.invite(60_000, None).await.unwrap();
     b.join(&token).await.expect("first redeem succeeds");
     let err = b.join(&token).await.unwrap_err();
-    assert_eq!(join_code(&err), Some(JoinErrorCode::TokenConsumed), "{err:?}");
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::TokenConsumed),
+        "{err:?}"
+    );
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
@@ -555,10 +901,7 @@ async fn exempt_missing_identity() {
         Err(e) => e,
         Ok(_) => panic!("open on empty dir must fail"),
     };
-    assert!(
-        matches!(err, FabricError::MissingIdentity(_)),
-        "{err:?}"
-    );
+    assert!(matches!(err, FabricError::MissingIdentity(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -633,7 +976,10 @@ async fn relay_disabled_no_events_and_online_null() {
     assert_eq!(status.urls, Vec::<String>::new());
     assert_eq!(status.online, None, "disabled => null, not false");
     assert!(status.last_error.is_none());
-    assert!(a.relay_watcher_exited(), "no watcher task for disabled mode");
+    assert!(
+        a.relay_watcher_exited(),
+        "no watcher task for disabled mode"
+    );
     a.shutdown().await.unwrap();
     assert!(rx.try_recv().is_err(), "no relay events ever");
 }

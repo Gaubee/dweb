@@ -11,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dweb_fabric::secret::SecretSeed;
 use dweb_fabric::{
     Fabric as RustFabric, FabricConfig as RustFabricConfig, FabricEvent, HttpProxyConfig,
-    LinkStatus, RelayConfig, RelayStatusSnapshot, SecretInjection,
+    LinkStatus, RelayConfig, RelayStatusSnapshot, RelayTlsTrust, SecretInjection,
 };
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -20,7 +20,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 type EventCallbacks = Arc<Mutex<Vec<(u64, ThreadsafeFunction<String>)>>>;
-
 
 /// relay 配置（判别联合的 napi 投影）：
 /// - `{}` / `{ mode: "n0" }`：n0 官方默认（不接受 urls）
@@ -78,6 +77,9 @@ pub struct RelayStatusJs {
     pub online: Option<bool>,
     /// 最近一次连接错误（脱敏：仅类别 + host，无 URL 凭证段）
     pub last_error: Option<String>,
+    /// 配置序最小的已连接 relay URL；offline/disabled 时为 null
+    /// （tie-break：同时连上多个 relay 时取配置序最小者，内核既有语义）
+    pub active_url: Option<String>,
 }
 
 impl From<RelayStatusSnapshot> for RelayStatusJs {
@@ -87,6 +89,7 @@ impl From<RelayStatusSnapshot> for RelayStatusJs {
             urls: s.urls,
             online: s.online,
             last_error: s.last_error,
+            active_url: s.active_url,
         }
     }
 }
@@ -174,9 +177,7 @@ fn to_join_timeout_ms(v: Option<f64>) -> Result<u64> {
             {
                 return Err(Error::new(
                     Status::GenericFailure,
-                    format!(
-                        "joinTimeoutMs {ms} out of range [1000, 600000]"
-                    ),
+                    format!("joinTimeoutMs {ms} out of range [1000, 600000]"),
                 ));
             }
             Ok(ms)
@@ -198,7 +199,7 @@ fn take_options(
             http_proxy: to_http_proxy_config(opts.http_proxy.clone())?,
             join_timeout_ms: to_join_timeout_ms(opts.join_timeout_ms)?,
             bind_addr: None,
-        relay_ca_tls: None,
+            relay_tls_trust: RelayTlsTrust::PlatformRoot,
         })
     };
     // P1-2：先完整解析/校验配置，再 take 句柄——校验失败不消费 seed，
@@ -318,11 +319,17 @@ pub async fn import_secret(token: String, passphrase: String) -> Result<SecretSe
 pub struct Fabric {
     inner: RustFabric,
     event_callbacks: EventCallbacks,
-    /// 事件泵任务句柄（P1-8：shutdown 时 abort+join，防永久阻塞在 recv）
-    pump_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 事件泵任务句柄（P1-8：shutdown 时 abort+join，防永久阻塞在 recv；
+    /// R4 Arc 化——drain 后台任务需要所有权）
+    pump_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     next_callback_id: Arc<std::sync::atomic::AtomicU64>,
-    relay_snapshot: Arc<std::sync::Mutex<RelayStatusSnapshot>>,
-    shutdown_done: Arc<std::sync::atomic::AtomicBool>,
+    /// shutdown 已开始（事件泵的快速退出标志；R3 改名区分完成门）
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// R3 P1-1 共享完成门：首个 Some 由首次 shutdown 写入（订阅完成通知），
+    /// 晚到调用克隆 Receiver 等待 drain（含事件泵 abort）完成后返回
+    shutdown_gate: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    /// R3 P1-1 完成通知：drain 全部结束后 send(true)
+    shutdown_completed: tokio::sync::watch::Sender<bool>,
 }
 
 #[napi]
@@ -392,14 +399,14 @@ impl Fabric {
 
     fn build(fabric: std::result::Result<RustFabric, dweb_fabric::FabricError>) -> Result<Fabric> {
         let inner = fabric.map_err(fabric_err)?;
-        let relay_snapshot = inner.relay_snapshot_handle();
         let fabric = Fabric {
             inner,
             event_callbacks: Arc::new(Mutex::new(Vec::new())),
-            pump_handle: std::sync::Mutex::new(None),
+            pump_handle: Arc::new(std::sync::Mutex::new(None)),
             next_callback_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            relay_snapshot,
-            shutdown_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_gate: std::sync::Mutex::new(None),
+            shutdown_completed: tokio::sync::watch::channel(false).0,
         };
         let pump = spawn_event_pump(&fabric);
         *fabric.pump_handle.lock().unwrap() = Some(pump);
@@ -466,7 +473,10 @@ impl Fabric {
         opts: Option<InviteOptions>,
     ) -> Result<String> {
         let rust_opts = dweb_fabric::InviteOptions {
-            allow_relayless: opts.as_ref().and_then(|o| o.allow_relayless).unwrap_or(false),
+            allow_relayless: opts
+                .as_ref()
+                .and_then(|o| o.allow_relayless)
+                .unwrap_or(false),
         };
         self.inner
             .invite_with(ttl_ms.max(0.0) as u64, recipient.as_deref(), rust_opts)
@@ -570,23 +580,54 @@ impl Fabric {
     }
 
     /// 优雅关闭：断开全部会话并释放网络资源。幂等。
+    /// R3 P1-1：共享完成门——只有首次调用执行 drain（内核 shutdown + 事件泵
+    /// abort）；并发晚到调用等待同一完成通知后返回（返回即"无后续事件"）。
     #[napi]
     pub async fn shutdown(&self) -> Result<()> {
-        if self
-            .shutdown_done
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        let waiter = {
+            let mut gate = self.shutdown_gate.lock().unwrap();
+            match gate.as_ref() {
+                Some(rx) => Some(rx.clone()),
+                None => {
+                    *gate = Some(self.shutdown_completed.subscribe());
+                    None
+                }
+            }
+        };
+        if let Some(mut rx) = waiter {
+            // 完成通知已发出的竞态：先查当前值，未完成再等变更
+            if !*rx.borrow_and_update() {
+                let _ = rx.changed().await;
+            }
             return Ok(());
         }
-        let res = self.inner.shutdown().await.map_err(fabric_err);
-        // P1-8：endpoint 关闭后广播 sender 仍可能存活——abort 事件泵
-        // 防止其永久阻塞在 recv（无新事件时不醒来检查标志）
-        let pump = { self.pump_handle.lock().unwrap().take() };
-        if let Some(pump) = pump {
-            pump.abort();
-            let _ = pump.await;
-        }
-        res
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // R4 P1-1：drain 任务化——首调用 Future 取消只是不再等 JoinHandle，
+        // drain（内核 shutdown + 事件泵 abort）不受中断；send_replace 落值，
+        // 顺序晚到调用即见 true。JoinHandle await cancel-safe。
+        let inner = self.inner.clone();
+        let pump_handle = self.pump_handle.clone();
+        let completed = self.shutdown_completed.clone();
+        let drain = tokio::spawn(async move {
+            let res = inner.shutdown().await.map_err(fabric_err);
+            // P1-8：endpoint 关闭后广播 sender 仍可能存活——abort 事件泵
+            // 防止其永久阻塞在 recv（无新事件时不醒来检查标志）
+            let pump = { pump_handle.lock().unwrap().take() };
+            if let Some(pump) = pump {
+                pump.abort();
+                let _ = pump.await;
+            }
+            // 无论内核结果如何都放行晚到等待者（错误也已 drain 完毕）
+            completed.send_replace(true);
+            res
+        });
+        drain.await.unwrap_or_else(|e| {
+            Err(Error::new(
+                napi::bindgen_prelude::Status::GenericFailure,
+                format!("shutdown drain task failed: {e}"),
+            ))
+        })
     }
 }
 
@@ -595,8 +636,7 @@ impl Fabric {
 fn spawn_event_pump(fabric: &Fabric) -> tokio::task::JoinHandle<()> {
     let mut rx = fabric.inner.subscribe();
     let callbacks = fabric.event_callbacks.clone();
-    let shutdown = fabric.shutdown_done.clone();
-    let relay_snapshot = fabric.relay_snapshot.clone();
+    let shutdown = fabric.shutdown_flag.clone();
     tokio::spawn(async move {
         loop {
             let ev = match rx.recv().await {
@@ -609,13 +649,15 @@ fn spawn_event_pump(fabric: &Fabric) -> tokio::task::JoinHandle<()> {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            let relay_payload = || {
-                let snap = relay_snapshot.lock().unwrap().clone();
+            // R3 P1-2：relay-* payload 一律取**事件携带的快照副本**（跳变后
+            // 状态）——不事后读共享可变快照（连续跳变时会拿到错配状态）
+            let relay_payload_of = |snap: &RelayStatusSnapshot| {
                 serde_json::json!({
                     "mode": snap.mode,
                     "urls": snap.urls,
                     "online": snap.online,
                     "lastError": snap.last_error,
+                    "activeUrl": snap.active_url,
                 })
             };
             let payload = match &ev {
@@ -645,16 +687,16 @@ fn spawn_event_pump(fabric: &Fabric) -> tokio::task::JoinHandle<()> {
                     "endpointId": endpoint_id,
                     "status": link_status_str(*status),
                 }),
-                FabricEvent::RelayOnline { .. } => {
+                FabricEvent::RelayOnline { snapshot } => {
                     let mut o = serde_json::Map::new();
                     o.insert("type".into(), "relay-online".into());
-                    o.insert("relay".into(), relay_payload());
+                    o.insert("relay".into(), relay_payload_of(snapshot));
                     serde_json::Value::Object(o)
                 }
-                FabricEvent::RelayOffline => {
+                FabricEvent::RelayOffline { snapshot } => {
                     let mut o = serde_json::Map::new();
                     o.insert("type".into(), "relay-offline".into());
-                    o.insert("relay".into(), relay_payload());
+                    o.insert("relay".into(), relay_payload_of(snapshot));
                     serde_json::Value::Object(o)
                 }
             };
