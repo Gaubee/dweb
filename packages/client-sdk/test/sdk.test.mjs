@@ -24,7 +24,11 @@ function opts(dir) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 test("nativeVersion returns crate version", () => {
-  assert.match(nativeVersion(), /^0\.2\./);
+  // 与包版本同步断言（v0.3.1 起不再硬编码前缀——曾漏更新导致假红）
+  const pkgVersion = JSON.parse(
+    fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ).version;
+  assert.equal(nativeVersion(), pkgVersion);
 });
 
 test("identity persists across restart", async () => {
