@@ -57,7 +57,11 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
   let lastError = "";
   while (Date.now() < deadline) {
     try {
-      const res = await fetchImpl(`${publicGatewayUrl.replace(/\/+$/, "")}/services.json`);
+      // R2 阻塞-7：单次 fetch 受剩余时间约束——悬挂的连接会让 await 永不
+      // 返回，while 的 deadline 检查也就永不发生（postReady 整体挂死）
+      const res = await fetchImpl(`${publicGatewayUrl.replace(/\/+$/, "")}/services.json`, {
+        signal: AbortSignal.timeout(Math.max(1000, deadline - Date.now())),
+      });
       if (res.ok) {
         const manifest = await res.json();
         const relayEntry = (manifest.services ?? []).find((s) => s.name === "relay");
@@ -134,8 +138,13 @@ export async function runSetup(input) {
   const configPath = path.join(cwd, "opendweb.config.toml");
   if (exists(configPath)) {
     log("opendweb.config.toml already exists; merge these values manually:");
-    log(`  server.publicGatewayUrl = ${JSON.stringify(plan.publicGatewayUrl)}`);
-    log(`  server.publicRelayUrl   = ${JSON.stringify(plan.publicRelayUrl)}`);
+    log(`  [server]`);
+    log(`  publicGatewayUrl = ${JSON.stringify(plan.publicGatewayUrl)}`);
+    log(`  publicRelayUrl   = ${JSON.stringify(plan.publicRelayUrl)}`);
+    log(`  [[plugins]]`);
+    log(`  name = "cf"`);
+    log(`  [plugins.options]`);
+    log(`  tokenEnv = ${JSON.stringify(tokenEnvName)}`);
   } else {
     await writeFile(configPath, renderConfigToml({ plan, tokenEnv: tokenEnvName }));
     log(`wrote ${configPath}`);

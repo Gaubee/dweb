@@ -17,6 +17,7 @@ import {
   networkIPv4s,
   resolveServerArgs,
   splitBind,
+  validateBind,
 } from "../bin/opendweb.mjs";
 
 const NODE = process.execPath;
@@ -803,4 +804,74 @@ test("plugin e2e: get is an alias of add", async () => {
   });
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, /installed: echo \(@jixo\/opendweb-ext-echo@1\.2\.3\)/);
+});
+
+test("plugin e2e: add works for src/-layout exports packages (findPackageRoot walks up)", async () => {
+  const env = await pluginProjectEnv();
+  const shim = await fakePmShim(FIXTURES_DIR);
+  const r = await new Promise((resolve) => {
+    const child = spawn(NODE, [CLI, "plugin", "add", "srclayout"], {
+      cwd: env.dir,
+      env: {
+        PATH: `${shim.dir}:${process.env.PATH}`,
+        HOME: process.env.HOME,
+        DWEB_HOME: env.home,
+        DWEB_FAKE_PM_SRC: shim.srcDir,
+        NO_COLOR: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("exit", (c) => resolve({ code: c ?? 0, out, err }));
+  });
+  assert.equal(r.code, 0, r.err);
+  // 入口在 src/ 下：版本读取必须向上找到包根（R2 阻塞-2）
+  assert.match(r.out, /installed: srclayout \(@jixo\/opendweb-ext-srclayout@3\.1\.4\)/);
+  // 安装后自适应派发也可用（exports 子路径 src/plugin.js 解析）
+  const dispatch = await runCli(["srclayout", "ping"], env);
+  assert.equal(dispatch.code, 0, dispatch.err);
+  assert.equal(dispatch.out, "pong\n");
+});
+
+test("reserved word: opendweb config is rejected, never dispatched to a plugin (R2 blocked-4)", async () => {
+  const env = await pluginProjectEnv();
+  // 即便同名插件已安装，保留字也必须被 builtin 分支显式拒绝
+  await fsp.cp(path.join(FIXTURES_DIR, "opendweb-echo"), path.join(env.dir, "node_modules", "opendweb-echo"), { recursive: true });
+  const r = await runCli(["config"], env);
+  assert.equal(r.code, 2);
+  assert.match(r.err, /"config" is reserved/);
+});
+
+test("setup e2e: --config <path> works and local plugin file resolves relative to the config dir (R2 blocked-3)", async () => {
+  const env = await pluginProjectEnv();
+  // 配置文件放在子目录，file 用相对路径——必须相对配置文件目录而非 cwd 解析
+  const cfgDir = path.join(env.dir, "custom");
+  await fsp.mkdir(cfgDir, { recursive: true });
+  await fsp.copyFile(path.join(FIXTURES_DIR, "local-echo.mjs"), path.join(cfgDir, "local-echo.mjs"));
+  await fsp.writeFile(
+    path.join(cfgDir, "cfg.toml"),
+    ['configVersion = 1', "", "[[plugins]]", 'file = "local-echo.mjs"'].join("\n"),
+    "utf8",
+  );
+  const r = await runCli(["setup", "--config", "custom/cfg.toml"], env);
+  assert.equal(r.code, 0, `stderr: ${r.err}`);
+  assert.match(r.out, /setup ok: local-echo/);
+
+  // 缺值报错（退出码 2）
+  const missing = await runCli(["setup", "--config"], env);
+  assert.equal(missing.code, 2);
+  assert.match(missing.err, /missing value for --config/);
+});
+
+test("validateBind: host:port form with port range (R2 blocked-8, preStart override same-rule validation)", () => {
+  for (const ok of ["127.0.0.1:8787", "0.0.0.0:9000", "[::1]:3340", "example.com:80"]) {
+    assert.equal(validateBind(ok, "bind"), null, ok);
+  }
+  for (const bad of ["", ":8080", "localhost", "host:0", "host:70000", "host:abc", "a:b:c"]) {
+    assert.notEqual(validateBind(bad, "bind"), null, bad);
+  }
+  assert.match(validateBind("host:0", "preStart override gatewayBind"), /port 1-65535/);
 });

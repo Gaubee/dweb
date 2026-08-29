@@ -80,7 +80,8 @@ export async function marketplaceAdd({ fs, path, input }) {
   return { added, globs };
 }
 
-/** `opendweb marketplace remove`：精确匹配移除；不存在 → 硬错误 */
+/** `opendweb marketplace remove`：精确匹配移除；不存在 → 硬错误；
+ * 移除后为空 → 硬错误（至少保留一个 glob，防止候选集自损到不可恢复） */
 export async function marketplaceRemove({ fs, path, input }) {
   const current = await loadMarketplace({ fs, path });
   const targets = parseGlobInput(input);
@@ -88,11 +89,14 @@ export async function marketplaceRemove({ fs, path, input }) {
   for (const t of targets) {
     if (!known.has(t)) throw new CliExit(`glob not in marketplace: ${t}`, 2);
   }
-  const globs = await saveMarketplace({
-    fs,
-    path,
-    globs: current.globs.filter((g) => !targets.includes(g)),
-  });
+  const remaining = current.globs.filter((g) => !targets.includes(g));
+  if (remaining.length === 0) {
+    throw new CliExit(
+      "cannot remove the last marketplace glob (at least one must remain); add a replacement first",
+      2,
+    );
+  }
+  const globs = await saveMarketplace({ fs, path, globs: remaining });
   return { removed: targets, globs };
 }
 

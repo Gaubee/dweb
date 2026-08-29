@@ -94,6 +94,42 @@ file = ${JSON.stringify(path.join(REPO, "opendweb/test/fixtures/local-echo.mjs")
   assert.match(r.out, /setup ok: local-echo/);
 });
 
+test("cf status: read-only dispatch through the real CLI (spec scenario)", async () => {
+  const e = await env();
+  // 无配置：状态未知也是正常退出（status 是盘点，不是断言）
+  const bare = await runCli(["cf", "status"], e);
+  assert.equal(bare.code, 0, bare.err);
+  assert.match(bare.out, /config:\s+not found/);
+  assert.match(bare.out, /plan:\s+unknown/);
+
+  // 配置 + 锁定记录齐备：plan 从 server.publicGatewayUrl 推导，各段齐全
+  await fsp.writeFile(
+    path.join(e.dir, "opendweb.config.toml"),
+    [
+      "configVersion = 1",
+      "",
+      "[server]",
+      'publicGatewayUrl = "https://dweb.example.com"',
+      "",
+      "[[plugins]]",
+      'name = "cf"',
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  await fsp.writeFile(
+    path.join(e.home, "plugins.json"),
+    JSON.stringify({ cf: { package: "@jixo/opendweb-ext-cf", version: "0.0.0" } }),
+    "utf8",
+  );
+  const done = await runCli(["cf", "status"], e);
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /config:\s+opendweb\.config\.toml/);
+  assert.match(done.out, /gateway:\s+dweb\.example\.com \(https:\/\/dweb\.example\.com\)/);
+  assert.match(done.out, /relay:\s+relay\.dweb\.example\.com/);
+  assert.match(done.out, /plugin:\s+cf declared in the config/);
+  assert.match(done.out, /lock:\s+cf @jixo\/opendweb-ext-cf@0\.0\.0/);
+});
+
 test("dual consumer: failing local plugin aggregates non-zero while cf stays ok", async () => {
   const e = await env();
   const cfg = `

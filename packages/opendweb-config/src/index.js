@@ -23,15 +23,21 @@ function runtimeArgs() {
   return [];
 }
 
-/** 当前 runtime 的 stdout 写出 */
-function writeStdout(text) {
+/**
+ * 当前 runtime 的 stdout 写出（完成式：resolve 前保证已冲刷——
+ * R2 阻塞-5：不等待写入完成就 exit 会截断大输出，协议侧按损坏 JSON 处理）
+ * @param {string} text
+ * @returns {Promise<void>}
+ */
+async function writeStdout(text) {
   if (typeof globalThis.Deno !== "undefined") {
-    globalThis.Deno.stdout.write(new TextEncoder().encode(text));
-  } else if (typeof globalThis.Bun !== "undefined") {
-    process.stdout.write(text);
-  } else {
-    process.stdout.write(text);
+    await globalThis.Deno.stdout.write(new TextEncoder().encode(text));
+    return;
   }
+  // Node / Bun：write 的回调在缓冲落盘后触发（背压时等待 drain）
+  await new Promise((resolve, reject) => {
+    process.stdout.write(text, (err) => (err ? reject(err) : resolve()));
+  });
 }
 
 /** 当前 runtime 的 stdin 全量读取 */
@@ -84,8 +90,11 @@ export function definePlugin(plugin) {
   const declareIdx = args.indexOf("--opendweb-declare");
   const hookIdx = args.indexOf("--opendweb-hook");
   if (declareIdx !== -1) {
-    writeStdout(JSON.stringify({ name: plugin.name, hooks: Object.keys(plugin.hooks ?? {}) }) + "\n");
-    runtimeExit(0);
+    // 写入完成后再退出（R2 阻塞-5：截断的声明会被 CLI 按协议损坏拒绝）
+    writeStdout(JSON.stringify({ name: plugin.name, hooks: Object.keys(plugin.hooks ?? {}) }) + "\n")
+      .then(() => runtimeExit(0))
+      .catch(() => runtimeExit(1));
+    return plugin;
   }
   if (hookIdx !== -1) {
     const hook = args[hookIdx + 1];
@@ -95,18 +104,23 @@ export function definePlugin(plugin) {
         const fn = plugin.hooks?.[hook];
         if (typeof fn !== "function") {
           runtimeExit(0);
+          return;
         }
         const result = await fn(payload);
-        writeStdout(JSON.stringify(result ?? null) + "\n");
+        await writeStdout(JSON.stringify(result ?? null) + "\n");
         runtimeExit(0);
       })
-      .catch((e) => {
-        // 钩子失败：stderr 报错 + 非零退出（CLI 的 invoke 捕获并归一化）
-        const msg = e?.message ?? String(e);
-        if (typeof globalThis.Deno !== "undefined") {
-          globalThis.Deno.stderr.write(new TextEncoder().encode(`${msg}\n`));
-        } else {
-          process.stderr.write(`${msg}\n`);
+      .catch(async (e) => {
+        // 钩子失败：stderr 报错（冲刷后退出）+ 非零退出码（CLI invoke 归一化）
+        const msg = `${e?.message ?? String(e)}\n`;
+        try {
+          if (typeof globalThis.Deno !== "undefined") {
+            await globalThis.Deno.stderr.write(new TextEncoder().encode(msg));
+          } else {
+            await new Promise((resolve) => process.stderr.write(msg, () => resolve()));
+          }
+        } catch {
+          /* stderr 冲刷失败不掩盖原错误 */
         }
         runtimeExit(1);
       });

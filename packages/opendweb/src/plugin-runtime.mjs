@@ -72,28 +72,45 @@ export function runCapture(cmd, args, { cwd, input, timeoutMs = 60000 } = {}) {
   });
 }
 
+/** 钩子调用结果：ok=true 时 result 为钩子返回值（可为 undefined） */
+export class HookOutcome {
+  /**
+   * @param {boolean} ok
+   * @param {unknown} [result]
+   * @param {string} [error]
+   */
+  constructor(ok, result, error) {
+    this.ok = ok;
+    this.result = result;
+    this.error = error;
+  }
+}
+
 /**
  * 加载声明的插件列表（配置清单序），产出统一适配器。
- * 重名 → 硬错误（编排歧义）。
- * @param {{ plugins: Array<string | {name: string, options?: object} | {file: string, options?: object}>, globs: string[], cwd: string, importModule?: (url: string) => Promise<unknown>, exec?: typeof runCapture, which?: (cmd: string) => string | null }} input
- * @returns {Promise<Array<{ name: string, kind: "npm" | "local", options: object, hooks: string[], invoke: (hook: string, payload: object) => Promise<{ ok: boolean, result?: any, error?: string }> }>>}
+ * 重名 → 硬错误（编排歧义）。本地插件的 file 路径相对 configDir 解析
+ * （R2 阻塞-3：spec 冻结「路径相对配置文件目录」），npm 候选仍从 cwd 解析。
+ * @param {{ plugins: Array<string | {name: string, options?: object} | {file: string, options?: object}>, globs: string[], cwd: string, configDir?: string, importModule?: (url: string) => Promise<unknown>, exec?: typeof runCapture, which?: (cmd: string) => string | null }} input
+ * @returns {Promise<Array<{ name: string, kind: "npm" | "local", options: object, hooks: string[], invoke: (hook: string, payload: object) => Promise<HookOutcome> }>>}
  */
 export async function loadDeclaredPlugins({
   plugins,
   globs,
   cwd,
+  configDir,
   importModule = (url) => import(url),
   exec = runCapture,
   which,
 }) {
-  /** @type {ReturnType<typeof loadDeclaredPlugins> extends Promise<infer T> ? T : never} */
+  /** @type {Awaited<ReturnType<typeof loadDeclaredPlugins>>} */
   const out = [];
   const seen = new Set();
+  const fileBase = configDir ?? cwd;
   for (const entry of plugins) {
     const normalized =
       typeof entry === "string" ? { name: entry, options: {} } : { options: {}, ...entry };
     if ("file" in normalized && normalized.file) {
-      const file = path.resolve(cwd, normalized.file);
+      const file = path.resolve(fileBase, normalized.file);
       const adapter = await makeLocalAdapter({ file, options: normalized.options ?? {}, exec });
       if (seen.has(adapter.name)) throw new CliExit(`duplicate plugin name in config: ${adapter.name}`, 2);
       seen.add(adapter.name);
@@ -138,11 +155,11 @@ export async function loadDeclaredPlugins({
       hooks,
       invoke: async (hook, payload) => {
         const fn = plugin.hooks?.[hook];
-        if (typeof fn !== "function") return { ok: true };
+        if (typeof fn !== "function") return new HookOutcome(true);
         try {
-          return { ok: true, result: await fn({ ...payload, options }) };
+          return new HookOutcome(true, await fn({ ...payload, options }));
         } catch (e) {
-          return { ok: false, error: e?.message ?? String(e) };
+          return new HookOutcome(false, undefined, e?.message ?? String(e));
         }
       },
     };
@@ -156,7 +173,7 @@ export async function loadDeclaredPlugins({
       options,
       hooks: declared.hooks,
       invoke: async (hook, payload) => {
-        if (!declared.hooks.includes(hook)) return { ok: true };
+        if (!declared.hooks.includes(hook)) return new HookOutcome(true);
         // ctx.options：调用方显式携带的 options 优先（测试/编排注入），
         // 否则用配置声明的 options——spread 覆灭 bug 的修正
         const res = await exec(declared.cmd, [...declared.args, file, "--opendweb-hook", hook], {
@@ -164,12 +181,21 @@ export async function loadDeclaredPlugins({
           input: JSON.stringify({ ...payload, options: payload.options ?? options }),
         });
         if (res.code !== 0) {
-          return { ok: false, error: res.stderr.trim() || `exited with code ${res.code}` };
+          return new HookOutcome(false, undefined, res.stderr.trim() || `exited with code ${res.code}`);
         }
+        // R2 阻塞-5：stdout 必须严格是单个 JSON 值（或空 = 成功无返回值）；
+        // 有输出但不可解析 = 协议损坏（截断/多行污染），按钩子失败处理——
+        // 静默吞掉会把截断的 preStart 覆写当成成功
+        const text = res.stdout.trim();
+        if (text === "") return new HookOutcome(true);
         try {
-          return { ok: true, result: JSON.parse(res.stdout || "null") };
-        } catch {
-          return { ok: true }; // 无 JSON 输出视为成功无返回值
+          return new HookOutcome(true, JSON.parse(text));
+        } catch (e) {
+          return new HookOutcome(
+            false,
+            undefined,
+            `hook output is not valid JSON (protocol corruption?): ${String(e.message)}; first 120 bytes: ${text.slice(0, 120)}`,
+          );
         }
       },
     };

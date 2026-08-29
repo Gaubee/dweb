@@ -16,6 +16,12 @@ export function decodeTunnelToken(token) {
     if (typeof parsed.a !== "string" || typeof parsed.t !== "string" || typeof parsed.s !== "string") {
       throw new Error("missing a/t/s fields");
     }
+    // a/t 会拼进 API URL 路径、s 进 Authorization 头——白名单字符集阻断
+    // 路径穿越/头注入（合法 CF 值均为 [A-Za-z0-9_-]）
+    const SAFE = /^[A-Za-z0-9_-]+$/;
+    if (!SAFE.test(parsed.a) || !SAFE.test(parsed.t) || !SAFE.test(parsed.s)) {
+      throw new Error("a/t/s fields contain characters outside [A-Za-z0-9_-]");
+    }
     return { accountTag: parsed.a, tunnelId: parsed.t, apiToken: parsed.s };
   } catch (e) {
     throw new Error(`not a valid TUNNEL_TOKEN (${e.message}); copy it from Zero Trust -> Networks -> Tunnels -> your tunnel -> install`);

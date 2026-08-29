@@ -9,15 +9,35 @@ import { runSetup, verifyExposure, planExposure } from "./wizard.js";
 /** 共生 cloudflared 进程句柄（进程内单例；preStop 清理） */
 let tunnelChild = null;
 
+/**
+ * spawn 的 error 事件在解释器不存在（ENOENT）等场景触发——没有监听器会
+ * 让未处理异常击穿整个 CLI。R2 阻塞-6：捕获并经 onError 降级。
+ * @returns {Promise<void>} resolve = 已开始运行；reject(Error) = 启动失败
+ */
 function spawnCloudflared(token) {
-  if (tunnelChild !== null) return;
-  tunnelChild = spawn("cloudflared", ["tunnel", "run"], {
-    env: { ...process.env, TUNNEL_TOKEN: token },
-    stdio: ["ignore", "inherit", "inherit"],
-    detached: false,
-  });
-  tunnelChild.on("exit", () => {
-    tunnelChild = null;
+  return new Promise((resolve, reject) => {
+    if (tunnelChild !== null) return resolve();
+    const child = spawn("cloudflared", ["tunnel", "run"], {
+      env: { ...process.env, TUNNEL_TOKEN: token },
+      stdio: ["ignore", "inherit", "inherit"],
+      detached: false,
+    });
+    let settled = false;
+    child.once("error", (e) => {
+      if (settled) return;
+      settled = true;
+      tunnelChild = null;
+      reject(new Error(`failed to start cloudflared (${e.message}); is it installed and on PATH?`));
+    });
+    child.once("spawn", () => {
+      if (settled) return;
+      settled = true;
+      tunnelChild = child;
+      child.once("exit", () => {
+        if (tunnelChild === child) tunnelChild = null;
+      });
+      resolve();
+    });
   });
 }
 
@@ -73,7 +93,9 @@ export default {
         if (!token) {
           throw new Error(`options.tunnel is on but ${tokenEnv} is not set`);
         }
-        spawnCloudflared(token);
+        // 失败（如 cloudflared 未安装）按 postReady 失败降级为 WARNING，
+        // 不得击穿 CLI（R2 阻塞-6）
+        await spawnCloudflared(token);
         lines.push("cf: cloudflared co-spawned (stops with the server)");
       }
 

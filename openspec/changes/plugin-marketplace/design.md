@@ -66,9 +66,10 @@ gatewayBind = "0.0.0.0:8787"
 publicGatewayUrl = "https://dweb.example.com"    # 与 flag 同名同规
 # relayBind / relayEnabled / trustProxy / publicRelayUrl ...
 
-plugins = ["cf"]                                  # 裸名简写 → marketplace 解析
+[[plugins]]                                       # TOML 主形态：表数组
+name = "cf"                                       # 裸名 → marketplace 解析
 
-[[plugins]]                                       # 表形式：带选项或本地文件
+[[plugins]]
 name = "frp"
 [plugins.options]                                 # 选项是数据（非闭包）；
 tokenEnv = "TUNNEL_TOKEN"                         # 秘密经 env 间接引用
@@ -76,6 +77,11 @@ tokenEnv = "TUNNEL_TOKEN"                         # 秘密经 env 间接引用
 [[plugins]]
 file = "opendweb.plugins/backup.ts"               # 本地插件文件（相对 config 目录）
 ```
+
+- TOML 约束：`plugins = ["cf", { name = "frp" }]` 数组简写（root 键，必须在
+  任何表之前）与 `[[plugins]]` 表形态是**同键的两种写法，不可混用**（TOML
+  重复键冲突）；混排需求统一用表形态或 inline table。JSON 格式无此限制
+  （数组元素天然混形）
 
 - 发现顺序：`./opendweb.config.toml` > `.json`；`--config <path>` 覆盖。
   两种格式**同一 zod schema**（解析后校验，杜绝格式间 schema 漂移）；

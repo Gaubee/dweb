@@ -91,6 +91,12 @@ export async function resolveAdaptive({
         `plugin package ${pkg} has an invalid opendweb-plugin manifest (${issues})`,
       );
     }
+    // R2 其他项：清单 name 必须与子命令名一致——否则装错包/名字劫持会静默成功
+    if (parsed.data.name !== name) {
+      throw new Error(
+        `plugin package ${pkg} declares name "${parsed.data.name}" but was invoked as "${name}"`,
+      );
+    }
     return { pkg, manifest: parsed.data, entryUrl: pathToFileURL(entry).href };
   }
   throw new PluginNotResolved(name, candidatesFor(globs, name));

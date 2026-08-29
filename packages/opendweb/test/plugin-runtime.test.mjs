@@ -130,3 +130,49 @@ test("unknown hook in local declaration is rejected at load time", async () => {
 test("HOOK_NAMES is exactly 3+1 (v1 freeze)", () => {
   assert.deepEqual(HOOK_NAMES, ["server.preStart", "server.postReady", "server.preStop", "setup"]);
 });
+
+test("local plugin file resolves relative to configDir, not cwd (R2 blocked-3)", async () => {
+  const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-cfgdir-"));
+  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-cwddir-"));
+  await fsp.copyFile(LOCAL_PLUGIN, path.join(configDir, "local-echo.mjs"));
+
+  const plugins = await loadDeclaredPlugins({
+    plugins: [{ file: "local-echo.mjs" }],
+    globs: DEFAULT_GLOBS,
+    cwd,
+    configDir,
+  });
+  assert.equal(plugins[0].name, "local-echo");
+
+  // 无 configDir 时回落到 cwd——文件不存在 → 声明失败（行为锚点）
+  await assert.rejects(
+    () => loadDeclaredPlugins({ plugins: [{ file: "local-echo.mjs" }], globs: DEFAULT_GLOBS, cwd }),
+    /failed to declare/,
+  );
+});
+
+test("local adapter: hook stdout that is not JSON is a protocol failure, not silent success (R2 blocked-5)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-corrupt-"));
+  const corrupt = path.join(dir, "corrupt.mjs");
+  await fsp.writeFile(
+    corrupt,
+    [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args.includes('--opendweb-declare')) {",
+      "  process.stdout.write(JSON.stringify({name:'corrupt',hooks:['server.postReady']})+'\\n');",
+      "  process.exit(0);",
+      "}",
+      "if (args.includes('--opendweb-hook')) {",
+      "  process.stdout.write('definitely not json\\n');",
+      "  process.exit(0);",
+      "}",
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  const plugins = await loadDeclaredPlugins({ plugins: [{ file: corrupt }], globs: DEFAULT_GLOBS, cwd: dir });
+  const r = await plugins[0].invoke("server.postReady", {});
+  assert.equal(r.ok, false);
+  assert.match(r.error, /not valid JSON/);
+  assert.match(r.error, /definitely not json/);
+});

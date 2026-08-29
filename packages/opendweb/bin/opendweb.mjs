@@ -1,9 +1,12 @@
 #!/usr/bin/env node
-// opendweb CLI — 顶层入口。server 命令启动自托管服务端（gateway: rendezvous + healthz +
-// services.json；另起 iroh relay）。用户面输出全 ASCII（design D1/D10）：横幅/帮助/错误均为英文。
+// opendweb CLI — 顶层入口（builtin 命令 + 自适应插件派发）。
+// server：启动自托管服务端（gateway: rendezvous + healthz + services.json +
+// iroh relay）；静态配置 opendweb.config.toml|.json（--config 覆盖），优先级
+// flag > env > config > default。marketplace/plugin/setup 管插件生命周期；
+// 其余首 token 走自适应解析（未安装自愈：get ?? add）。
 // 用法：
 //   opendweb server [--gateway <bind>] [--relay <bind>] [--no-relay] [--trust-proxy]
-//                   [--public-gateway <url>] [--public-relay <url>]
+//                   [--public-gateway <url>] [--public-relay <url>] [--config <path>]
 //   环境变量 DWEB_GATEWAY_BIND 同义；DWEB_PUBLIC_GATEWAY_URL / DWEB_PUBLIC_RELAY_URL
 //   为反代/隧道部署的公网入口公告（public-exposure）。
 import { createRequire } from "node:module";
@@ -19,17 +22,7 @@ import { dispatchPluginCommand, renderPluginHelp } from "../src/plugin-contract.
 import { pluginAdd, pluginRemove, pluginList } from "../src/plugin-registry.mjs";
 import { discoverConfig, loadConfigFile } from "../src/config-file.mjs";
 import { loadDeclaredPlugins, fireHook } from "../src/plugin-runtime.mjs";
-import { CliExit } from "../src/util.mjs";
-
-// 动态值 ASCII 纪律（D10）：UTF-8 字节小写 \xNN，控制字符同转义保一行一错误
-function asciiEscape(v) {
-  const s = String(v);
-  let out = "";
-  for (const b of Buffer.from(s, "utf8")) {
-    out += b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : `\\x${b.toString(16).padStart(2, "0")}`;
-  }
-  return out;
-}
+import { CliExit, asciiEscape } from "../src/util.mjs";
 
 const require = createRequire(import.meta.url);
 const PLATFORMS = ["darwin-arm64", "win32-x64"];
@@ -154,10 +147,27 @@ export function validatePublicUrl(value, label) {
 }
 
 /**
+ * bind 串校验（R2 阻塞-8：preStart 覆写与 flag/config 同形态）：显式
+ * host:port（支持 [ipv6]:port），host 非空、port 1-65535。返回 null = 合法。
+ * @param {unknown} value
+ * @param {string} label
+ * @returns {string | null}
+ */
+export function validateBind(value, label) {
+  if (typeof value !== "string" || value.length === 0) return `${label} must be a non-empty host:port string`;
+  const { host, port } = splitBind(value);
+  if (host.length === 0) return `${label}: ${value} (empty host)`;
+  if (port === undefined || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return `${label}: ${value} (expected host:port with port 1-65535)`;
+  }
+  if (!value.startsWith("[") && host.includes(":")) {
+    return `${label}: ${value} (bare IPv6 must use [addr]:port)`;
+  }
+  return null;
+}
+
+/**
  * 解析 server 子命令参数。优先级 flag > env > config file > default
- * （plugin-marketplace D4：config 层插入在 env 之后；configServer 由静态
- * 配置文件解析而来，schema 已校验类型）。--gateway 为 canonical；
- * 支持 "--opt value" 与 "--opt=value" 双形式；未知选项报错（退出码 2）。
  * （plugin-marketplace D4：config 层插入在 env 之后；configServer 由静态
  * 配置文件解析而来，schema 已校验类型）。--gateway 为 canonical；
  * 支持 "--opt value" 与 "--opt=value" 双形式；未知选项报错（退出码 2）。
@@ -345,18 +355,27 @@ function spawnInherit(cmd, args, { cwd } = {}) {
   });
 }
 
-async function runServer(rest) {
-  // --config <path>：静态配置的显式覆盖（非 server 选项，先剥离再解析）
+/**
+ * 从 argv 剥离 `--config <path>`（server/setup 共用的非业务选项）。
+ * @param {string[]} rest
+ * @returns {{ configFlag: string | undefined, argv: string[] }}
+ */
+function stripConfigFlag(rest) {
   let configFlag;
-  const serverArgv = [];
+  const argv = [];
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === "--config") {
       configFlag = rest[++i];
       if (configFlag === undefined) throw new CliExit("missing value for --config", 2);
       continue;
     }
-    serverArgv.push(rest[i]);
+    argv.push(rest[i]);
   }
+  return { configFlag, argv };
+}
+
+async function runServer(rest) {
+  const { configFlag, argv: serverArgv } = stripConfigFlag(rest);
   // 静态配置发现与解析（零执行；plugin-marketplace D4）
   const configPath = discoverConfig({
     cwd: process.cwd(),
@@ -375,13 +394,15 @@ async function runServer(rest) {
     process.exit(2);
   }
 
-  // 插件装载与 preStart（plugin-marketplace D5：失败阻断）
+  // 插件装载与 preStart（plugin-marketplace D5：失败阻断）。本地插件 file
+  // 路径相对配置文件目录解析（R2 阻塞-3）
   const plugins =
     config && config.plugins.length > 0
       ? await loadDeclaredPlugins({
           plugins: config.plugins,
           globs: await marketplaceGlobs(),
           cwd: process.cwd(),
+          configDir: path.dirname(configPath),
         })
       : [];
   const pre = await fireHook({
@@ -473,10 +494,12 @@ function applyServerOverrides(resolved, merged) {
   for (const [key, value] of Object.entries(merged)) {
     switch (key) {
       case "gatewayBind":
-      case "relayBind":
-        if (typeof value !== "string" || value.length === 0) throw new CliExit(`preStart override ${key} must be a non-empty string`, 2);
+      case "relayBind": {
+        const err = validateBind(value, `preStart override ${key}`);
+        if (err) throw new CliExit(err, 2);
         out[key] = value;
         break;
+      }
       case "relayEnabled":
       case "trustProxy":
         if (typeof value !== "boolean") throw new CliExit(`preStart override ${key} must be a boolean`, 2);
@@ -565,10 +588,11 @@ async function runPlugin(rest) {
   throw new CliExit(`unknown plugin subcommand: ${sub} (add | list | remove)`, 2);
 }
 
-/** `opendweb setup`：按配置清单序执行全部 setup 钩子并聚合（D5） */
+/** `opendweb setup [--config <path>]`：按配置清单序执行全部 setup 钩子并聚合（D5） */
 async function runSetup(rest) {
-  if (rest.length > 0) throw new CliExit(`setup takes no arguments (got ${rest[0]})`, 2);
-  const configPath = discoverConfig({ cwd: process.cwd(), existsSync: (p) => fs.existsSync(p) });
+  const { configFlag, argv } = stripConfigFlag(rest);
+  if (argv.length > 0) throw new CliExit(`setup takes no arguments (got ${argv[0]})`, 2);
+  const configPath = discoverConfig({ cwd: process.cwd(), explicit: configFlag, existsSync: (p) => fs.existsSync(p) });
   if (configPath === null) {
     console.log("no config file found; nothing to set up");
     return 0;
@@ -581,6 +605,7 @@ async function runSetup(rest) {
     plugins: config.plugins,
     globs: await marketplaceGlobs(),
     cwd: process.cwd(),
+    configDir: path.dirname(configPath),
   });
   const targets = plugins.filter((p) => p.hooks.includes("setup"));
   if (targets.length === 0) {
@@ -656,6 +681,13 @@ async function main() {
     console.log(HELP_TEXT);
     return;
   }
+  // R2 阻塞-4：config 为保留字——显式拒绝，防插件经 marketplace 接管造成歧义
+  if (command === "config") {
+    throw new CliExit(
+      '"config" is reserved; config files are auto-discovered as opendweb.config.toml|.json or passed via --config <path> to server/setup',
+      2,
+    );
+  }
   // 自适应：非 builtin 首 token → 插件解析（未安装时错误信息含安装指引）
   const code = await runAdaptive(command, rest);
   if (code > 0) process.exit(code);
@@ -679,9 +711,13 @@ Usage:
       Manage plugins explicitly. add/get install into the current project
       (detected package manager) and lock name@version in ~/.opendweb/plugins.json.
 
-  opendweb setup
+  opendweb setup [--config <path>]
       Run the setup hook of every plugin declared in the config file, in
       declaration order; non-zero exit if any fails.
+
+  opendweb config
+      Reserved word (no subcommands): config files are auto-discovered
+      (opendweb.config.toml|.json) or passed via --config to server/setup.
 
   opendweb <plugin-name> [command] [...]     (or: opendweb use <plugin-name> ...)
       Adaptive plugin dispatch. Non-builtin first tokens resolve via the

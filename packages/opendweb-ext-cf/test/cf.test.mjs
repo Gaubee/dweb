@@ -2,9 +2,12 @@
 // verify 断言逻辑（mock fetch）、API 错误路径。
 import test from "node:test";
 import assert from "node:assert/strict";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { decodeTunnelToken, buildIngress, pushIngress, routeDns } from "../src/cf-api.js";
-import { planExposure, renderConfigToml, verifyExposure } from "../src/wizard.js";
+import { planExposure, renderConfigToml, verifyExposure, runSetup } from "../src/wizard.js";
 
 const TOKEN = Buffer.from(JSON.stringify({ a: "acc123", t: "tun456", s: "sec789" })).toString("base64");
 
@@ -12,6 +15,16 @@ test("decodeTunnelToken: base64 {a,t,s}; garbage rejected with user-facing messa
   assert.deepEqual(decodeTunnelToken(TOKEN), { accountTag: "acc123", tunnelId: "tun456", apiToken: "sec789" });
   assert.throws(() => decodeTunnelToken("not-a-token"), /not a valid TUNNEL_TOKEN/);
   assert.throws(() => decodeTunnelToken(Buffer.from("{}").toString("base64")), /not a valid TUNNEL_TOKEN/);
+});
+
+test("decodeTunnelToken: a/t/s charset whitelist (URL path / header injection guard)", () => {
+  const mk = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
+  // a/t 拼进 API URL 路径——路径穿越必须拒绝
+  assert.throws(() => decodeTunnelToken(mk({ a: "../escape", t: "t", s: "s" })), /not a valid TUNNEL_TOKEN/);
+  assert.throws(() => decodeTunnelToken(mk({ a: "a", t: "t/evil", s: "s" })), /not a valid TUNNEL_TOKEN/);
+  // s 进 Authorization 头——CRLF 头注入必须拒绝
+  assert.throws(() => decodeTunnelToken(mk({ a: "a", t: "t", s: "s\r\nX-Evil: 1" })), /not a valid TUNNEL_TOKEN/);
+  assert.throws(() => decodeTunnelToken(mk({ a: "a b", t: "t", s: "s" })), /not a valid TUNNEL_TOKEN/);
 });
 
 test("buildIngress: dual hostname (default) and single-domain path routing", () => {
@@ -120,4 +133,130 @@ test("verifyExposure: asserts relay URL match; mismatch and disabled relay are f
     timeoutMs: 1000,
   });
   assert.match(disabled.error, /relay disabled/);
+});
+
+test("verifyExposure: every fetch carries an AbortSignal bounded by the remaining time (R2 blocked-7)", async () => {
+  const seen = [];
+  const manifest = { services: [{ name: "relay", enabled: true, url: "https://relay.dweb.example.com" }] };
+  const v = await verifyExposure({
+    fetchImpl: async (url, init) => {
+      seen.push({ url, init });
+      return new Response(JSON.stringify(manifest), { status: 200 });
+    },
+    publicGatewayUrl: "https://dweb.example.com",
+    expectedRelayUrl: "https://relay.dweb.example.com",
+    timeoutMs: 1000,
+  });
+  assert.equal(v.ok, true);
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].init?.signal instanceof AbortSignal, "fetch must receive an abort signal");
+});
+
+test("runSetup: existing config gets a complete merge fragment ([[plugins]] entry + tokenEnv included)", async () => {
+  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-merge-"));
+  const logs = [];
+  await runSetup({
+    token: TOKEN,
+    hostname: "dweb.example.com",
+    cwd,
+    skipVerify: true,
+    exists: () => true,
+    writeFile: async () => {
+      throw new Error("must not overwrite an existing config");
+    },
+    fetchImpl: async (url) => {
+      if (url.includes("/zones?")) return new Response(JSON.stringify({ result: [{ id: "zone1" }] }), { status: 200 });
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    },
+    log: (l) => logs.push(l),
+  });
+  const out = logs.join("\n");
+  assert.match(out, /already exists; merge these values manually/);
+  assert.match(out, /publicGatewayUrl = "https:\/\/dweb\.example\.com"/);
+  assert.match(out, /publicRelayUrl\s+= "https:\/\/relay\.dweb\.example\.com"/);
+  assert.match(out, /\[\[plugins\]\]/);
+  assert.match(out, /name = "cf"/);
+  assert.match(out, /tokenEnv = "TUNNEL_TOKEN"/);
+});
+
+test("postReady hook: missing cloudflared degrades to a hook failure, not a crash (R2 blocked-6)", async () => {
+  const plugin = (await import("../src/index.js")).default;
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.PATH = ""; // spawn 查不到解释器 → ENOENT error 事件
+  try {
+    await assert.rejects(
+      () => plugin.hooks["server.postReady"]({ options: { tunnel: true } }),
+      (e) => /cloudflared/.test(e.message) && /installed and on PATH/.test(e.message),
+    );
+  } finally {
+    process.env.PATH = prevPath;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
+});
+
+test("status command: read-only summary from config file + lock record (TOML and JSON variants)", async () => {
+  const cli = (await import("../src/cli.js")).default;
+  const prevHome = process.env.DWEB_HOME;
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-home-"));
+  process.env.DWEB_HOME = home;
+  try {
+    // 无配置：not found + plan unknown 也是 exit 0（盘点而非断言）
+    const emptyDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-status-"));
+    let lines = [];
+    let r = await cli.run({ command: "status", args: {}, log: (l) => lines.push(l), cwd: emptyDir });
+    assert.equal(r.exit, 0);
+    assert.match(lines.join("\n"), /config:   not found/);
+    assert.match(lines.join("\n"), /plan:     unknown/);
+
+    // TOML 配置 + 锁定记录
+    const tomlDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-status-toml-"));
+    await fsp.writeFile(
+      path.join(tomlDir, "opendweb.config.toml"),
+      [
+        "configVersion = 1",
+        "",
+        "[server]",
+        'publicGatewayUrl = "https://dweb.example.com"',
+        "",
+        "[[plugins]]",
+        'name = "cf"',
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await fsp.writeFile(
+      path.join(home, "plugins.json"),
+      JSON.stringify({ cf: { package: "@jixo/opendweb-ext-cf", version: "0.1.0" } }),
+      "utf8",
+    );
+    lines = [];
+    r = await cli.run({ command: "status", args: {}, log: (l) => lines.push(l), cwd: tomlDir });
+    assert.equal(r.exit, 0);
+    let out = lines.join("\n");
+    assert.match(out, /config:   opendweb\.config\.toml/);
+    assert.match(out, /gateway:  dweb\.example\.com \(https:\/\/dweb\.example\.com\)/);
+    assert.match(out, /relay:    relay\.dweb\.example\.com/);
+    assert.match(out, /plugin:   cf declared in the config/);
+    assert.match(out, /lock:     cf @jixo\/opendweb-ext-cf@0\.1\.0/);
+
+    // JSON 配置：无 cf 条目 → plugin 段提示缺失；--hostname 覆盖推导
+    const jsonDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-status-json-"));
+    await fsp.writeFile(
+      path.join(jsonDir, "opendweb.config.json"),
+      JSON.stringify({ configVersion: 1, server: { publicGatewayUrl: "https://json.example.com" }, plugins: [] }),
+      "utf8",
+    );
+    lines = [];
+    r = await cli.run({ command: "status", args: { hostname: "alt.example.org" }, log: (l) => lines.push(l), cwd: jsonDir });
+    assert.equal(r.exit, 0);
+    out = lines.join("\n");
+    assert.match(out, /config:   opendweb\.config\.json/);
+    assert.match(out, /gateway:  alt\.example\.org/);
+    assert.match(out, /plugin:   cf entry missing in the config/);
+  } finally {
+    if (prevHome === undefined) delete process.env.DWEB_HOME;
+    else process.env.DWEB_HOME = prevHome;
+  }
 });

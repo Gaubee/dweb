@@ -106,20 +106,3 @@ export async function loadConfigFile({
   }
   return parsed.data;
 }
-
-/**
- * 优先级合并辅助：flag > env > config > default。resolveServerArgs 已实现
- * flag > env > default；本函数把 config 值注入到该链的 env 之后。
- * 值形态：bind 为 string、开关为 boolean、URL 为 string（均已过 schema）。
- * @param {{ gatewayBind?: string, relayBind?: string, relayEnabled?: boolean, trustProxy?: boolean, publicGatewayUrl?: string, publicRelayUrl?: string }} server
- */
-export function configDefaults(server) {
-  return {
-    gatewayBind: server?.gatewayBind,
-    relayBind: server?.relayBind,
-    relayEnabled: server?.relayEnabled,
-    trustProxy: server?.trustProxy,
-    publicGatewayUrl: server?.publicGatewayUrl,
-    publicRelayUrl: server?.publicRelayUrl,
-  };
-}

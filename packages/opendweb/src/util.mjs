@@ -31,7 +31,7 @@ export async function readTextIfExists(fs, path) {
   try {
     return await fs.readFile(path, "utf8");
   } catch (e) {
-    if (/** @type {any} */ (e).code === "ENOENT") return null;
+    if (/** @type {NodeJS.ErrnoException} */ (e)?.code === "ENOENT") return null;
     throw e;
   }
 }
