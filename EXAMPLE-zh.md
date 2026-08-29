@@ -3,7 +3,7 @@
 [English version](EXAMPLE.md)
 
 本手册描述如何用已发布的 npm 包做端到端验证。每次发布新版本后按此流程复测。
-当前适用版本：**v0.3.0**（gateway 单一入口 + join 诊断 + invite 安全门）。
+当前适用版本：**v0.3.1**（gateway 单一入口 + join 诊断 + invite 安全门）。
 
 ## 架构速览
 
@@ -46,7 +46,7 @@ npx opendweb@0.2.0 server
 预期输出（纯 ASCII、vite 风格枚举本机 IP）：
 
 ```
-  * opendweb server v0.3.0
+  * opendweb server v0.3.1
   > Local:   http://localhost:8787
   > Network: http://192.168.x.x:8787
              http://10.x.x.x:8787
@@ -301,7 +301,7 @@ npx opendweb server       config set relay         config set relay
 
 ---
 
-## v0.2.0 → v0.3.0 变更摘要
+## v0.2.0 → v0.3.1 变更摘要
 
 - `relayStatus()` / `relay-*` 事件新增 **`activeUrl`**（配置序最小已连接 relay；事件携带跳变时刻快照副本）
 - server 新增公网入口覆盖：`--public-gateway` / `--public-relay` 与 `DWEB_PUBLIC_*_URL`（反代/隧道部署，compose.yaml 参考）

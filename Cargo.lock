@@ -921,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "dweb-client-sdk"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64",
  "dweb-fabric",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "dweb-fabric"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "dweb-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3657,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "spike-iroh"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "iroh",

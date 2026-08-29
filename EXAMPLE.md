@@ -2,7 +2,7 @@
 
 This guide walks you through testing dweb's published npm packages end to end. Follow it after every release to verify the full stack.
 
-**Current version: v0.3.0** | [中文版](EXAMPLE-zh.md)
+**Current version: v0.3.1** | [中文版](EXAMPLE-zh.md)
 
 ## What You'll Build
 
@@ -40,7 +40,7 @@ npx opendweb@0.2.0 server
 You'll see:
 
 ```
-  * opendweb server v0.3.0
+  * opendweb server v0.3.1
   > Local:   http://localhost:8787
   > Network: http://192.168.1.100:8787
 
