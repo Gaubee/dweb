@@ -2,6 +2,7 @@
 // `{name, hooks}` + 双适配器（npm 进程内直调 / 本地文件 shebang 子进程）
 // + 3+1 生命周期编排（preStart/postReady/preStop/setup）。
 import { spawn } from "node:child_process";
+import { accessSync, constants as fsConstants } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -39,6 +40,27 @@ export function parseShebang(firstLine) {
   return { cmd: tokens[0], args: tokens.slice(1) };
 }
 
+/**
+ * PATH 查找可执行文件（R2-M6：无 shebang .ts 的 runtime 探测在生产路径
+ * 生效——此前 which 未注入恒回落 node）。POSIX 语义；Windows 的 .cmd/.exe
+ * 解析是已知债务。
+ * @param {string} cmd
+ * @returns {string | null}
+ */
+export function defaultWhich(cmd) {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const p = path.join(dir, cmd);
+    try {
+      accessSync(p, fsConstants.X_OK);
+      return p;
+    } catch {
+      /* keep searching */
+    }
+  }
+  return null;
+}
+
 /** 执行子进程并收 stdout/stderr/退出码（超时兜底防本地插件挂死 CLI） */
 export function runCapture(cmd, args, { cwd, input, timeoutMs = 60000 } = {}) {
   return new Promise((resolve) => {
@@ -46,6 +68,9 @@ export function runCapture(cmd, args, { cwd, input, timeoutMs = 60000 } = {}) {
     let out = "";
     let err = "";
     let settled = false;
+    // R2-M5：子进程提前退出时写入端触发 EPIPE——没有监听器是未处理异常，
+    // 会击穿整个 CLI。结果语义由退出码/stderr 决定，这里只吞写入端错误。
+    child.stdin.on("error", () => {});
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
@@ -100,7 +125,7 @@ export async function loadDeclaredPlugins({
   configDir,
   importModule = (url) => import(url),
   exec = runCapture,
-  which,
+  which = defaultWhich,
 }) {
   /** @type {Awaited<ReturnType<typeof loadDeclaredPlugins>>} */
   const out = [];
@@ -268,7 +293,7 @@ async function declareLocalPlugin({ file, exec, which }) {
  * - preStart：收集覆写片段并合并（后到者覆盖，值经调用方校验），失败阻断
  * - postReady：失败降级 WARNING；结果可带 bannerLines（ASCII 追加横幅）
  * - preStop：尽力执行（失败仅 WARNING）
- * @param {{ plugins: Array<{name: string, hooks: string[], invoke: Function}>, hook: string, payload: object, stderr?: NodeJS.WriteStream }} input
+ * @param {{ plugins: Array<{name: string, hooks: string[], invoke: (hook: string, payload: object) => Promise<HookOutcome>}>, hook: string, payload: object, stderr?: NodeJS.WriteStream }} input
  * @returns {Promise<{ failures: Array<{name: string, error: string}>, merged: object, bannerLines: string[] }>}
  */
 export async function fireHook({ plugins, hook, payload, stderr = process.stderr }) {
@@ -283,13 +308,22 @@ export async function fireHook({ plugins, hook, payload, stderr = process.stderr
       continue;
     }
     const result = r.result;
-    if (result && typeof result === "object") {
-      if (result.server && typeof result.server === "object") {
-        Object.assign(merged, result.server);
+    if (result === undefined || result === null) continue;
+    // R2-Minor：钩子返回值只接受 object/null——字符串等非法形态按该插件
+    // 失败处理（不静默忽略，否则覆写片段丢失无从发现）
+    if (typeof result !== "object" || Array.isArray(result)) {
+      failures.push({ name: p.name, error: `hook result must be an object or null (got ${Array.isArray(result) ? "array" : typeof result})` });
+      continue;
+    }
+    if (result.server !== undefined && result.server !== null) {
+      if (typeof result.server !== "object" || Array.isArray(result.server)) {
+        failures.push({ name: p.name, error: "hook result.server must be a plain object of override keys" });
+        continue;
       }
-      if (Array.isArray(result.bannerLines)) {
-        bannerLines.push(...result.bannerLines.map((l) => asciiEscape(String(l))));
-      }
+      Object.assign(merged, result.server);
+    }
+    if (Array.isArray(result.bannerLines)) {
+      bannerLines.push(...result.bannerLines.map((l) => asciiEscape(String(l))));
     }
   }
   if (hook !== "server.postReady" && hook !== "server.preStop" && failures.length > 0) {

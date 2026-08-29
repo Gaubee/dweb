@@ -2,9 +2,8 @@
   "name": "@jixo/opendweb-ext-srclayout",
   "version": "3.1.4",
   "type": "module",
-  "description": "test fixture plugin whose entries live under src/ (findPackageRoot proof: dirname(entry) is NOT the package root)",
+  "description": "test fixture: entries under src/ AND exports-only (no . root export) — proves findPackageRoot walk-up and the ./opendweb-plugin fallback",
   "exports": {
-    ".": "./src/root.js",
     "./opendweb-plugin": "./src/plugin.js"
   }
 }

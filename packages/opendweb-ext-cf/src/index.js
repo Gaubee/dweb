@@ -11,10 +11,13 @@ let tunnelChild = null;
 
 /**
  * spawn 的 error 事件在解释器不存在（ENOENT）等场景触发——没有监听器会
- * 让未处理异常击穿整个 CLI。R2 阻塞-6：捕获并经 onError 降级。
- * @returns {Promise<void>} resolve = 已开始运行；reject(Error) = 启动失败
+ * 让未处理异常击穿整个 CLI。R2-M4：spawn 成功后还有启动健康窗口——
+ * cloudflared 带错 token/坏配置时会立刻退出（exit 7 等），若不观察就横幅
+ * "co-spawned" 是伪成功。窗口期内退出按启动失败处理。
+ * @param {number} [graceMs] 启动健康窗口（测试可注入）
+ * @returns {Promise<void>} resolve = 已运行超过健康窗口；reject(Error) = 启动失败
  */
-function spawnCloudflared(token) {
+function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRACE_MS) || 2000) {
   return new Promise((resolve, reject) => {
     if (tunnelChild !== null) return resolve();
     const child = spawn("cloudflared", ["tunnel", "run"], {
@@ -33,10 +36,20 @@ function spawnCloudflared(token) {
       if (settled) return;
       settled = true;
       tunnelChild = child;
+      const grace = setTimeout(() => {
+        child.removeListener("exit", onEarlyExit);
+        resolve();
+      }, graceMs);
+      grace.unref?.(); // 窗口计时不得阻止进程正常退出
+      const onEarlyExit = (code, signal) => {
+        clearTimeout(grace);
+        if (tunnelChild === child) tunnelChild = null;
+        reject(new Error(`cloudflared exited during startup (code ${code ?? signal}); check TUNNEL_TOKEN and the tunnel config`));
+      };
+      child.once("exit", onEarlyExit);
       child.once("exit", () => {
         if (tunnelChild === child) tunnelChild = null;
       });
-      resolve();
     });
   });
 }
@@ -73,6 +86,9 @@ export default {
         hostname,
         mode: ctx.options?.mode === "single" ? "single" : "dual",
         cwd: ctx.cwd ?? process.cwd(),
+        // R2-M2：`opendweb setup --config <path>` 时写用户所选文件（CLI 面
+        // 直接调用则回落 cwd 下的默认名）
+        configPath: ctx.configPath ?? undefined,
         tokenEnvName: tokenEnv,
         dryRun: Boolean(ctx.options?.dryRun),
         skipVerify: Boolean(ctx.options?.skipVerify),

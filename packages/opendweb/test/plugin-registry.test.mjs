@@ -41,12 +41,25 @@ test("readInstalledVersion: src/-layout exports package reports the real version
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-ver-"));
   await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");
   await fsp.cp(path.join(FIXTURES, "@jixo", "opendweb-ext-srclayout"), path.join(dir, "node_modules", "@jixo", "opendweb-ext-srclayout"), { recursive: true });
+  // 夹具为 exports-only（无 "." 根导出）：必须回退 ./opendweb-plugin 入口（R2-M1）
   const { version, path: pkgJsonPath } = readInstalledVersion("@jixo/opendweb-ext-srclayout", dir);
   assert.equal(version, "3.1.4");
   // mkdtemp 可能落在 /var 或 /private/var（macOS 符号链接）——用 realpath 对齐
   assert.equal(
     pkgJsonPath,
     path.join(fs.realpathSync(dir), "node_modules", "@jixo", "opendweb-ext-srclayout", "package.json"),
+  );
+});
+
+test("readInstalledVersion: entry resolving to a differently-named package is rejected (R2-M1)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-alias-"));
+  await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");
+  // 把声明为 opendweb-ext-srclayout 的包放进 opendweb-ext-cf 的位置——
+  // 解析锚定与包名不一致必须拒绝（防锁定记录张冠李戴）
+  await fsp.cp(path.join(FIXTURES, "@jixo", "opendweb-ext-srclayout"), path.join(dir, "node_modules", "@jixo", "opendweb-ext-cf"), { recursive: true });
+  assert.throws(
+    () => readInstalledVersion("@jixo/opendweb-ext-cf", dir),
+    (e) => e instanceof CliExit && /belongs to package @jixo\/opendweb-ext-srclayout/.test(e.message),
   );
 });
 

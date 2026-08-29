@@ -84,6 +84,26 @@ test("routeDns: idempotent on existing record (81057); zone failure prints manua
   );
 });
 
+test("routeDns: query params encoded; co.uk zones fall back to three labels (R2-M7)", async () => {
+  const seen = [];
+  const fetchImpl = async (url) => {
+    seen.push(String(url));
+    if (url.includes("/zones?")) {
+      // 末两段 co.uk 查不到 zone，末三段 example.co.uk 命中
+      const hit = url.includes("name=example.co.uk");
+      return new Response(JSON.stringify({ result: hit ? [{ id: "zone9" }] : [] }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  };
+  const done = await routeDns({ fetchImpl, accountTag: "a&b", tunnelId: "t", apiToken: "s", hostnames: ["www.example.co.uk"] });
+  assert.deepEqual(done, ["www.example.co.uk"]);
+  // 两次 zone 查询：先 co.uk 后 example.co.uk；account.id 必须被编码而非裸拼
+  assert.equal(seen.length, 3);
+  assert.match(seen[0], /name=co\.uk/);
+  assert.match(seen[1], /name=example\.co\.uk/);
+  assert.ok(seen.slice(0, 2).every((u) => u.includes("account.id=a%26b")), "accountTag must be URL-encoded");
+});
+
 test("planExposure: dual derives relay.<gateway>; single shares one host", () => {
   const dual = planExposure({ hostname: "Dweb.Example.COM" });
   assert.equal(dual.gatewayHost, "dweb.example.com"); // 归一小写
@@ -91,6 +111,39 @@ test("planExposure: dual derives relay.<gateway>; single shares one host", () =>
   assert.equal(dual.publicRelayUrl, "https://relay.dweb.example.com");
   const single = planExposure({ hostname: "dweb.example.com", mode: "single" });
   assert.equal(single.publicGatewayUrl, single.publicRelayUrl);
+});
+
+test("planExposure: hostname must be a DNS name — query-injection and junk rejected (R2-M7)", () => {
+  for (const bad of [
+    "foo.com&account.id=evil",
+    "not a host",
+    "localhost", // 单段不是可路由域名
+    "",
+    "dweb..example.com",
+    "-dweb.example.com",
+    "dweb.example.com:8443",
+  ]) {
+    assert.throws(() => planExposure({ hostname: bad }), /invalid hostname/, bad);
+  }
+});
+
+test("verifyExposure: strict deadline — signal-ignoring fetch cannot stall past timeoutMs (R2-M3)", async () => {
+  const t0 = Date.now();
+  const v = await verifyExposure({
+    // 永不 resolve 且无视 signal；附带 ref'd 定时器保活事件循环，
+    // 否则空循环会让测试运行器取消后续用例
+    fetchImpl: () => {
+      setTimeout(() => {}, 60000);
+      return new Promise(() => {});
+    },
+    publicGatewayUrl: "https://dweb.example.com",
+    expectedRelayUrl: "https://relay.dweb.example.com",
+    timeoutMs: 100,
+  });
+  const elapsed = Date.now() - t0;
+  assert.equal(v.ok, false);
+  assert.match(v.error, /not reachable within 100ms/);
+  assert.ok(elapsed < 1500, `should return near the deadline, took ${elapsed}ms`);
 });
 
 test("renderConfigToml: deterministic, loadable by the CLI schema (round-trip via smol-toml)", async () => {
@@ -177,6 +230,76 @@ test("runSetup: existing config gets a complete merge fragment ([[plugins]] entr
   assert.match(out, /\[\[plugins\]\]/);
   assert.match(out, /name = "cf"/);
   assert.match(out, /tokenEnv = "TUNNEL_TOKEN"/);
+});
+
+test("runSetup: explicit configPath targets the chosen file, not cwd default (R2-M2)", async () => {
+  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-cfgpath-"));
+  const target = path.join(cwd, "custom", "dir", "cfg.toml");
+  const writes = [];
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  await runSetup({
+    token: TOKEN,
+    hostname: "dweb.example.com",
+    cwd,
+    configPath: target,
+    skipVerify: true,
+    exists: () => false,
+    writeFile: async (p, content) => writes.push({ p, content }),
+    fetchImpl: async (url) => {
+      if (url.includes("/zones?")) return new Response(JSON.stringify({ result: [{ id: "zone1" }] }), { status: 200 });
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    },
+    log: () => {},
+  });
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].p, target);
+  assert.match(writes[0].content, /name = "cf"/);
+
+  // 已存在时：merge 片段指向所选文件（相对 cwd 展示），不误写
+  const logs = [];
+  await runSetup({
+    token: TOKEN,
+    hostname: "dweb.example.com",
+    cwd,
+    configPath: target,
+    skipVerify: true,
+    exists: () => true,
+    writeFile: async () => {
+      throw new Error("must not overwrite");
+    },
+    fetchImpl: async (url) => {
+      if (url.includes("/zones?")) return new Response(JSON.stringify({ result: [{ id: "zone1" }] }), { status: 200 });
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    },
+    log: (l) => logs.push(l),
+  });
+  assert.match(logs.join("\n"), /custom\/dir\/cfg\.toml already exists; merge these values manually/);
+});
+
+test("postReady hook: cloudflared exiting during the startup window is a failure, not a fake success (R2-M4)", async () => {
+  const plugin = (await import("../src/index.js")).default;
+  const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
+  const fake = path.join(binDir, "cloudflared");
+  await fsp.writeFile(fake, "#!/bin/sh\nexit 7\n", "utf8");
+  const { chmodSync } = await import("node:fs");
+  chmodSync(fake, 0o755);
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
+  process.env.PATH = binDir;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.DWEB_CF_SPAWN_GRACE_MS = "300";
+  try {
+    await assert.rejects(
+      () => plugin.hooks["server.postReady"]({ options: { tunnel: true } }),
+      (e) => /cloudflared exited during startup \(code 7\)/.test(e.message),
+    );
+  } finally {
+    process.env.PATH = prevPath;
+    process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
 });
 
 test("postReady hook: missing cloudflared degrades to a hook failure, not a crash (R2 blocked-6)", async () => {

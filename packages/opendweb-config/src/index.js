@@ -81,7 +81,7 @@ function runtimeExit(code) {
 /**
  * 声明本地插件并挂接子进程协议。非协议调用（无 --opendweb-* 参数）时为
  * 纯导出（可被直接 import 测试）。
- * @template {Record<string, (ctx: any) => Promise<any> | any>} H
+ * @template {Record<string, (ctx: unknown) => unknown>} H
  * @param {{ name: string, hooks: H }} plugin
  * @returns {{ name: string, hooks: H }}
  */

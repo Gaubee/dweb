@@ -76,21 +76,29 @@ export async function pushIngress({ fetchImpl = fetch, apiBase = CF_API_BASE, ac
 /**
  * DNS 路由（best-effort）：查 zone → 建 CNAME <host> → <tunnelId>.cfargotunnel.com。
  * TUNNEL_TOKEN 的 api token 不一定有 DNS 权限——失败时抛错并提示手工路径。
+ * R2-M7：query 经 URLSearchParams 构造（值里疑似 query 的字符一律编码）；
+ * zone 名先试末两段、再试末三段（example.co.uk 这类公共后缀）。
  * @param {{ fetchImpl?: typeof fetch, apiBase?: string, accountTag: string, tunnelId: string, apiToken: string, hostnames: string[] }} input
  */
 export async function routeDns({ fetchImpl = fetch, apiBase = CF_API_BASE, accountTag, tunnelId, apiToken, hostnames }) {
   const results = [];
   for (const host of hostnames) {
-    // zone = 末两段（朴素近似；复杂域走 API 过滤）
     const labels = host.split(".");
-    const zoneName = labels.slice(-2).join(".");
-    const zoneRes = await fetchImpl(`${apiBase}/zones?name=${zoneName}&account.id=${accountTag}`, {
-      headers: { Authorization: `Bearer ${apiToken}` },
-    });
-    const zoneBody = await zoneRes.json().catch(() => ({}));
-    const zoneId = zoneBody?.result?.[0]?.id;
+    const zoneCandidates = [labels.slice(-2).join("."), labels.slice(-3).join(".")];
+    let zoneId = null;
+    let lastZoneErr = "";
+    for (const zoneName of [...new Set(zoneCandidates)]) {
+      const qs = new URLSearchParams({ name: zoneName, "account.id": accountTag });
+      const zoneRes = await fetchImpl(`${apiBase}/zones?${qs}`, {
+        headers: { Authorization: `Bearer ${apiToken}` },
+      });
+      const zoneBody = await zoneRes.json().catch(() => ({}));
+      zoneId = zoneBody?.result?.[0]?.id ?? null;
+      if (zoneId) break;
+      lastZoneErr = `zone lookup for ${zoneName} returned no zone`;
+    }
     if (!zoneId) {
-      throw new Error(`cannot resolve zone for ${host} (token may lack Zone:Read); create CNAME ${host} -> ${tunnelId}.cfargotunnel.com manually`);
+      throw new Error(`cannot resolve zone for ${host} (${lastZoneErr || "token may lack Zone:Read"}); create CNAME ${host} -> ${tunnelId}.cfargotunnel.com manually`);
     }
     const cnameRes = await fetchImpl(`${apiBase}/zones/${zoneId}/dns_records`, {
       method: "POST",

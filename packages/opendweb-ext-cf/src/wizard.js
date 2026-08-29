@@ -8,10 +8,19 @@ import { decodeTunnelToken, buildIngress, pushIngress, routeDns } from "./cf-api
 
 /**
  * 解析向导输入 → 目标形态（纯函数，测试锚点）。
+ * hostname 先过 DNS 形态校验（R2-M7：`foo.com&account.id=evil` 这类输入
+ * 会原样进入公网 URL 与 API query，必须在入口拒绝）。
  * @param {{ hostname: string, mode?: "dual" | "single" }} input
  */
 export function planExposure({ hostname, mode = "dual" }) {
-  const gatewayHost = hostname.toLowerCase();
+  const raw = String(hostname ?? "").trim().toLowerCase();
+  // 每段：字母数字开头/结尾，中间可含 -；至少两段（域名，非裸 TLD/localhost）
+  const LABEL = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+  const labels = raw.split(".");
+  if (labels.length < 2 || labels.length > 10 || !labels.every((l) => LABEL.test(l))) {
+    throw new Error(`invalid hostname: ${JSON.stringify(hostname ?? "")} (expected a DNS name like dweb.example.com)`);
+  }
+  const gatewayHost = raw;
   const relayHost = `relay.${gatewayHost}`;
   return {
     mode,
@@ -49,21 +58,33 @@ export function renderConfigToml({ plan, tokenEnv, gatewayBind = "0.0.0.0:8787",
 
 /**
  * 端到端自检：经公网入口拉 /services.json，断言公告的 relay URL 与期望一致。
+ * R2-M3：deadline 严格——单次 fetch 的 AbortSignal 取剩余毫秒（下限 1ms，
+ * 不再垫到 1s）、轮询 sleep 不超出 deadline，并对不尊重 signal 的实现加
+ * Promise.race 兜底，保证整个函数在 timeoutMs 附近必然返回。
  * @param {{ fetchImpl?: typeof fetch, publicGatewayUrl: string, expectedRelayUrl: string, timeoutMs?: number }} input
  * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
 export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expectedRelayUrl, timeoutMs = 30000 }) {
   const deadline = Date.now() + timeoutMs;
+  const url = `${publicGatewayUrl.replace(/\/+$/, "")}/services.json`;
   let lastError = "";
+  const raceRemaining = (p) =>
+    Promise.race([
+      p,
+      new Promise((_, reject) => {
+        const left = deadline - Date.now();
+        const t = setTimeout(() => reject(new Error(`deadline exceeded (${timeoutMs}ms)`)), Math.max(1, left));
+        t.unref?.();
+      }),
+    ]);
   while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
     try {
-      // R2 阻塞-7：单次 fetch 受剩余时间约束——悬挂的连接会让 await 永不
-      // 返回，while 的 deadline 检查也就永不发生（postReady 整体挂死）
-      const res = await fetchImpl(`${publicGatewayUrl.replace(/\/+$/, "")}/services.json`, {
-        signal: AbortSignal.timeout(Math.max(1000, deadline - Date.now())),
-      });
+      const res = await raceRemaining(
+        fetchImpl(url, { signal: AbortSignal.timeout(Math.max(1, remaining)) }),
+      );
       if (res.ok) {
-        const manifest = await res.json();
+        const manifest = await raceRemaining(res.json());
         const relayEntry = (manifest.services ?? []).find((s) => s.name === "relay");
         if (relayEntry?.enabled !== true) {
           return { ok: false, error: "public services.json reports relay disabled" };
@@ -75,9 +96,10 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
       }
       lastError = `HTTP ${res.status}`;
     } catch (e) {
-      lastError = e.message;
+      lastError = e?.message ?? String(e);
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    const left = deadline - Date.now();
+    if (left > 0) await new Promise((r) => setTimeout(r, Math.min(1000, left)));
   }
   return { ok: false, error: `public gateway not reachable within ${timeoutMs}ms (${lastError})` };
 }
@@ -93,6 +115,7 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
 export async function runSetup(input) {
   const {
     token, hostname, mode = "dual", cwd,
+    configPath = null,
     tokenEnvName = "TUNNEL_TOKEN",
     dryRun = false, skipVerify = false,
     fetchImpl = fetch,
@@ -135,9 +158,10 @@ export async function runSetup(input) {
     log(`WARNING: ${e.message}`);
   }
 
-  const configPath = path.join(cwd, "opendweb.config.toml");
-  if (exists(configPath)) {
-    log("opendweb.config.toml already exists; merge these values manually:");
+  // R2-M2：目标文件 = 显式 configPath（`opendweb setup --config`）或 cwd 默认名
+  const targetConfigPath = configPath ?? path.join(cwd, "opendweb.config.toml");
+  if (exists(targetConfigPath)) {
+    log(`${relativeLabel(cwd, targetConfigPath)} already exists; merge these values manually:`);
     log(`  [server]`);
     log(`  publicGatewayUrl = ${JSON.stringify(plan.publicGatewayUrl)}`);
     log(`  publicRelayUrl   = ${JSON.stringify(plan.publicRelayUrl)}`);
@@ -146,8 +170,8 @@ export async function runSetup(input) {
     log(`  [plugins.options]`);
     log(`  tokenEnv = ${JSON.stringify(tokenEnvName)}`);
   } else {
-    await writeFile(configPath, renderConfigToml({ plan, tokenEnv: tokenEnvName }));
-    log(`wrote ${configPath}`);
+    await writeFile(targetConfigPath, renderConfigToml({ plan, tokenEnv: tokenEnvName }));
+    log(`wrote ${targetConfigPath}`);
   }
 
   if (!skipVerify) {
@@ -167,4 +191,8 @@ async function defaultWriteFile(p, content) {
 }
 function defaultExists(p) {
   return defaultExistsImpl(p);
+}
+/** 相对 cwd 展示路径（同目录则裸文件名，否则原样绝对路径） */
+function relativeLabel(cwd, p) {
+  return p.startsWith(`${cwd}${path.sep}`) ? p.slice(cwd.length + 1) : p;
 }

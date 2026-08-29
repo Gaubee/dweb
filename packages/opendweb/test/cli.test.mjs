@@ -709,7 +709,9 @@ async function fakePmShim(srcDir) {
       'pkg=""',
       'for a in "$@"; do case "$a" in -*) ;; *) pkg="$a";; esac; done',
       '[ -z "$pkg" ] && exit 1',
+      'echo "fake-pm: $pkg (src $DWEB_FAKE_PM_SRC/$pkg)" >&2',
       'src="$DWEB_FAKE_PM_SRC/$pkg"',
+      '[ -d "$src" ] || { echo "fake-pm: fixture $src missing (shim ran; real npm would differ)" >&2; exit 9; }',
       'dst="node_modules/$pkg"',
       'mkdir -p "$(dirname "$dst")"',
       'cp -R "$src" "$dst" || exit 1',
@@ -864,6 +866,38 @@ test("setup e2e: --config <path> works and local plugin file resolves relative t
   const missing = await runCli(["setup", "--config"], env);
   assert.equal(missing.code, 2);
   assert.match(missing.err, /missing value for --config/);
+});
+
+test("setup e2e: plugins receive configPath/configDir matching the explicit --config (R2-M2)", async () => {
+  const env = await pluginProjectEnv();
+  const cfgDir = path.join(env.dir, "custom");
+  await fsp.mkdir(cfgDir, { recursive: true });
+  await fsp.copyFile(path.join(FIXTURES_DIR, "cfg-assert.mjs"), path.join(cfgDir, "cfg-assert.mjs"));
+  await fsp.writeFile(
+    path.join(cfgDir, "cfg.toml"),
+    ['configVersion = 1', "", "[[plugins]]", 'file = "cfg-assert.mjs"'].join("\n"),
+    "utf8",
+  );
+  const r = await new Promise((resolve) => {
+    const child = spawn(NODE, [CLI, "setup", "--config", "custom/cfg.toml"], {
+      cwd: env.dir,
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        DWEB_HOME: env.home,
+        NO_COLOR: "1",
+        CFG_ASSERT_EXPECT: "custom/cfg.toml",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("exit", (c) => resolve({ code: c ?? 0, out, err }));
+  });
+  assert.equal(r.code, 0, `stderr: ${r.err}`);
+  assert.match(r.out, /setup ok: cfg-assert/);
 });
 
 test("validateBind: host:port form with port range (R2 blocked-8, preStart override same-rule validation)", () => {

@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseShebang, runCapture, loadDeclaredPlugins, fireHook, HOOK_NAMES } from "../src/plugin-runtime.mjs";
+import { parseShebang, runCapture, loadDeclaredPlugins, fireHook, defaultWhich, HOOK_NAMES } from "../src/plugin-runtime.mjs";
 import { DEFAULT_GLOBS } from "../src/marketplace.mjs";
 import { CliExit } from "../src/util.mjs";
 
@@ -129,6 +129,68 @@ test("unknown hook in local declaration is rejected at load time", async () => {
 
 test("HOOK_NAMES is exactly 3+1 (v1 freeze)", () => {
   assert.deepEqual(HOOK_NAMES, ["server.preStart", "server.postReady", "server.preStop", "setup"]);
+});
+
+test("runCapture: child exiting early with large stdin does not crash the CLI (EPIPE guard, R2-M5)", async () => {
+  const r = await runCapture(process.execPath, ["-e", "process.exit(0)"], {
+    input: "x".repeat(10 * 1024 * 1024),
+    timeoutMs: 10000,
+  });
+  assert.equal(r.code, 0);
+});
+
+test("defaultWhich: finds node on PATH; misses unknown commands (R2-M6)", () => {
+  const node = defaultWhich("node");
+  assert.ok(typeof node === "string" && node.length > 0);
+  assert.equal(defaultWhich("definitely-not-a-command-zzz9"), null);
+});
+
+test("no-shebang .ts honors the injected which (runtime probing is live, R2-M6)", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-ts-"));
+  const file = path.join(dir, "plugin.ts");
+  await fsp.writeFile(
+    file,
+    [
+      "// 无 shebang 的 .ts：declareLocalPlugin 应按 which 探测解释器（注入 bun -> node 可执行文件）",
+      "const args = process.argv.slice(2);",
+      "if (args.includes('--opendweb-declare')) {",
+      "  process.stdout.write(JSON.stringify({ name: 'ts-probe', hooks: ['server.postReady'] }) + '\\n');",
+      "}",
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  const plugins = await loadDeclaredPlugins({
+    plugins: [{ file: "plugin.ts" }],
+    globs: DEFAULT_GLOBS,
+    cwd: dir,
+    which: (cmd) => (cmd === "bun" ? process.execPath : null),
+  });
+  assert.equal(plugins[0].name, "ts-probe");
+});
+
+test("fireHook: non-plain-object hook results and result.server become plugin failures (R2-Minor)", async () => {
+  const mkPlugin = (name, result) => ({
+    name,
+    hooks: ["server.preStart"],
+    invoke: async () => ({ ok: true, result }),
+  });
+  const captured = [];
+  const r = await fireHook({
+    plugins: [
+      mkPlugin("str-result", "oops"),
+      mkPlugin("array-result", [1, 2]),
+      mkPlugin("bad-server", { server: "not-an-object" }),
+      mkPlugin("good", { server: { trustProxy: true }, bannerLines: ["ok"] }),
+    ],
+    hook: "server.preStart",
+    payload: {},
+    stderr: { write: (s) => captured.push(s) },
+  });
+  assert.equal(r.failures.length, 3);
+  assert.match(r.failures.map((f) => f.error).join(" "), /must be an object or null/);
+  assert.match(r.failures.map((f) => f.error).join(" "), /result\.server must be a plain object/);
+  assert.deepEqual(r.merged, { trustProxy: true }); // good 插件的覆写仍生效
+  assert.deepEqual(r.bannerLines, ["ok"]);
 });
 
 test("local plugin file resolves relative to configDir, not cwd (R2 blocked-3)", async () => {

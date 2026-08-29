@@ -85,13 +85,32 @@ export function findPackageRoot(entry) {
   }
 }
 
-/** 安装后读取包真实版本（安装成功的实证，也用于锁定展示；exports 安全） */
+/**
+ * 安装后读取包真实版本（安装成功的实证，也用于锁定展示；exports 安全）。
+ * R2-M1：合法包可以只暴露 `./opendweb-plugin`（无 "." 根导出）——先试包根
+ * 入口，不可解析则回退插件的 ./opendweb-plugin 入口，再从入口向上找包根。
+ * 同时校验 package.json 的 name 与请求包一致（防解析锚定到别的包）。
+ * @param {string} pkg
+ * @param {string} cwd
+ * @returns {{ version: string, path: string }}
+ */
 export function readInstalledVersion(pkg, cwd) {
   const req = createRequire(path.join(cwd, "package.json"));
-  const entry = req.resolve(pkg); // 包根入口（exports["."]）
+  let entry;
+  try {
+    entry = req.resolve(pkg); // exports["."]（或无 exports 的 main）
+  } catch {
+    entry = req.resolve(`${pkg}/opendweb-plugin`); // exports-only 包
+  }
   const pkgDir = findPackageRoot(entry);
   const pkgJsonPath = path.join(pkgDir, "package.json");
   const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+  if (typeof pkgJson.name === "string" && pkgJson.name !== pkg) {
+    throw new CliExit(
+      `resolved entry for ${pkg} belongs to package ${pkgJson.name} (${pkgJsonPath})`,
+      1,
+    );
+  }
   return { version: String(pkgJson.version ?? "unknown"), path: pkgJsonPath };
 }
 

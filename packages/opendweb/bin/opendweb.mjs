@@ -585,7 +585,7 @@ async function runPlugin(rest) {
     console.log(`removed: ${name} (${pkg})`);
     return 0;
   }
-  throw new CliExit(`unknown plugin subcommand: ${sub} (add | list | remove)`, 2);
+  throw new CliExit(`unknown plugin subcommand: ${sub} (add | get | list | remove)`, 2);
 }
 
 /** `opendweb setup [--config <path>]`：按配置清单序执行全部 setup 钩子并聚合（D5） */
@@ -614,7 +614,14 @@ async function runSetup(rest) {
   }
   let failed = false;
   for (const p of targets) {
-    const r = await p.invoke("setup", { server: config.server ?? {}, cwd: process.cwd() });
+    // configPath/configDir（R2-M2）：显式 --config 时插件必须知道目标文件，
+    // 否则如 cf 向导会写错位置（固定写 cwd 下的默认名）
+    const r = await p.invoke("setup", {
+      server: config.server ?? {},
+      cwd: process.cwd(),
+      configPath,
+      configDir: path.dirname(configPath),
+    });
     if (r.ok) {
       console.log(`setup ok: ${asciiEscape(p.name)}`);
     } else {
