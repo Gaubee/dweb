@@ -48,3 +48,28 @@
 - [x] 5.1 docker/compose.yaml：dweb（无 published ports，仅 expose）+ cloudflared
       sidecar（TUNNEL_TOKEN）；`docker compose config` 语法验证通过
 - [x] 5.2 README 部署章节：反代/隧道通用要点 + CF 单域名路径分流/双主机名拓扑 + env 表增补
+
+## 6. Codex 复核闭环（R2，2026-08-29，gpt-5.6-terra xhigh）
+
+首轮评分 5.5/10、3×P1 + 2×P2。修复（与并发会话的 R2/R3 修复叠加）：
+
+- [x] 6.1 P1-1 端口校验绕过：`Uri::port_u16()` 对 `:65536`/尾随 `:`/非数字端口
+      静默返回 None——改为从 authority 原文显式提取端口段并校验 1-65535；
+      回归单测 `validate_public_url_rejects_degenerate_ports`
+- [x] 6.2 P1-3 scheme 大小写分裂：http::Uri 将 scheme 归一为小写，原实现
+      「校验通过（小写）vs services.rs starts_with 防御（原串大写）→ relay 禁用」
+      ——`validate_public_url` 改为校验 + **canonical 重建**（scheme 小写、
+      尾随 / 剥除、无默认端口伪造），公告值与校验值同源；CLI 侧
+      `normalizePublicUrl` 同规（scheme 大小写不敏感、host 限 ASCII
+      字母/数字/./-，拒绝空白与 unicode）
+- [x] 6.3 P1-2 CLI 伪成功：readiness 门（banner 前置 healthz 就绪探测，
+      30s 超时）+ 子进程退出码保留传播 + wrapper stderr 实时转发与尾部留存
+      （`stderrTail()`）；端口冲突 e2e 验证（relay 口冲突 → 无横幅、
+      stderr 转发、退出码 1）
+- [x] 6.4 P2-1 fixtures 原样冻结：旧 4 例 note 还原为归档原文（仅追加
+      public-* 用例）
+- [ ] 6.5 P2-2 范围混入（README 英文化等 hardening-backlog 内容混入提交
+      c5f93e2/cddf3b9）：**非本 change 工作区产物**（外部会话提交），
+      拆分提交的裁决留给 Owner
+- 验证：cargo 35/35（fmt clean）· server-binary 7/7 · opendweb 19/19 ·
+  example 25/25；darwin 二进制已重打包

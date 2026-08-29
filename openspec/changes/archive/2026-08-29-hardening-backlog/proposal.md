@@ -26,6 +26,10 @@ README 主体中文与 EXAMPLE.md 英文不一致（npm 受众混乱）。
 
 - 加 TTL / 容量上限（当前无界 HashMap）
 - 冻结 learned 地址与 custom relay 候选的优先级语义
+- 裁决（R2，2026-08-29）：实现取**纯容量 FIFO**（per-endpoint 1024 / 全局
+  65536，插入序淘汰），**不实现 TTL**——容量已界定内存上界，TTL 引入时钟
+  依赖与测试复杂度、收益低于成本；spec delta（known-addrs-boundary）与实现
+  一致
 
 ### 4. detached connect task 生命周期（fabric）
 
@@ -64,5 +68,10 @@ README 主体中文与 EXAMPLE.md 英文不一致（npm 受众混乱）。
 
 - **涉及代码**：`.github/workflows/`、`README.md`、`crates/dweb-fabric`、
   `packages/client-sdk`、`packages/opendweb`
-- **无破坏性变更**（纯加固与文档）
+- **破坏性变更声明（R2 修订）**：
+  - Rust 公共 API：`FabricConfig.relay_ca_tls: Option<iroh_relay::tls::CaTlsConfig>`
+    收窄为自有枚举 `relay_tls_trust: RelayTlsTrust`（默认 PlatformRoot）——
+    下游 Rust 调用方需同步迁移（仓库政策：代码层不做向下兼容胶水；
+    JS/npm 面无破坏）。`N0Default + CustomPem` 组合构造期拒绝
+  - `RelayStatusSnapshot` 新增 `active_url` 字段（新增面，非破坏）
 - **不做**：新功能（Automerge、移动端）——独立 change

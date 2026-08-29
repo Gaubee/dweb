@@ -40,7 +40,7 @@ SDK SHALL 提供 `invite()` 返回邀请令牌字符串、`join(token)` 兑换�
 
 ### Requirement: 会话与事件
 
-SDK SHALL 提供事件订阅覆盖 peer 连接/断开、名册更新与消息收发，并新增 `relay-online`/`relay-offline` 事件——事件对象为判别联合，relay 事件 SHALL **必携带**快照同构 payload（mode、urls、online、lastError；禁用模式不产生）。`on(cb)` SHALL 返回取消订阅函数。SDK SHALL 提供 `relayStatus()` 快照：`{ mode: "disabled"|"custom"|"n0", urls: string[], online: boolean | null, lastError: string | null }`——`online` 在 relay 禁用模式 SHALL 为 `null`（而非 false）；`lastError` 为脱敏的最近连接错误类别（不含 URL 凭证段）。消费方 SHALL 以快照为初始事实、事件承载后续跳变（文档明示，避免初始事件竞态）。
+SDK SHALL 提供事件订阅覆盖 peer 连接/断开、名册更新与消息收发，并新增 `relay-online`/`relay-offline` 事件——事件对象为判别联合，relay 事件 SHALL **必携带**快照同构 payload（mode、urls、online、lastError、activeUrl；禁用模式不产生；事件携带**跳变时刻**的完整快照副本，不事后读共享可变快照）。`on(cb)` SHALL 返回取消订阅函数。SDK SHALL 提供 `relayStatus()` 快照：`{ mode: "disabled"|"custom"|"n0", urls: string[], online: boolean | null, lastError: string | null, activeUrl: string | null }`——`online` 在 relay 禁用模式 SHALL 为 `null`（而非 false）；`lastError` 为脱敏的最近连接错误类别（不含 URL 凭证段）；`activeUrl` 为配置序最小的已连接 relay URL（`online !== true` 或 disabled 时为 null；`urls`/`activeUrl` 为配置原样字符串，内核不做尾斜杠规范化改写）。消费方 SHALL 以快照为初始事实、事件承载后续跳变（文档明示，避免初始事件竞态）。
 
 #### Scenario: 事件订阅生效
 
@@ -80,7 +80,7 @@ SDK SHALL 提供事件订阅覆盖 peer 连接/断开、名册更新与消息收
 #### Scenario: n0 模式的 relay 状态
 
 - **WHEN** relay 配置为 n0 模式时调用 `relayStatus()`
-- **THEN** 返回 `mode: "n0"`、`urls: ["https://relay.iroh.network"]`、online 为实际连接状态
+- **THEN** 返回 `mode: "n0"`、`urls` 为 iroh 上游默认 relay 列表（4 个区域节点，排序冻结；v0.3 起与实际拨号一致）、online 为实际连接状态
 
 #### Scenario: 禁用模式的 relay 状态
 
