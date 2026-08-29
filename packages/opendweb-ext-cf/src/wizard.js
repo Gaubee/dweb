@@ -64,10 +64,11 @@ export function renderConfigToml({ plan, tokenEnv, gatewayBind = "0.0.0.0:8787",
  * R2-M3：deadline 严格——单次 fetch 的 AbortSignal 取剩余毫秒（下限 1ms，
  * 不再垫到 1s）、轮询 sleep 不超出 deadline，并对不尊重 signal 的实现加
  * Promise.race 兜底，保证整个函数在 timeoutMs 附近必然返回。
- * @param {{ fetchImpl?: typeof fetch, publicGatewayUrl: string, expectedRelayUrl: string, timeoutMs?: number }} input
+ * onProgress：每轮等待前回调一次（交互引导的等待反馈）；非交互调用省略。
+ * @param {{ fetchImpl?: typeof fetch, publicGatewayUrl: string, expectedRelayUrl: string, timeoutMs?: number, onProgress?: (info: { elapsedMs: number, lastError: string }) => void }} input
  * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
-export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expectedRelayUrl, timeoutMs = 30000 }) {
+export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expectedRelayUrl, timeoutMs = 30000, onProgress }) {
   const deadline = Date.now() + timeoutMs;
   const url = `${publicGatewayUrl.replace(/\/+$/, "")}/services.json`;
   let lastError = "";
@@ -102,6 +103,7 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
       lastError = e?.message ?? String(e);
     }
     const left = deadline - Date.now();
+    if (onProgress) onProgress({ elapsedMs: timeoutMs - left, lastError });
     if (left > 0) await new Promise((r) => setTimeout(r, Math.min(1000, left)));
   }
   return { ok: false, error: `public gateway not reachable within ${timeoutMs}ms (${lastError})` };
@@ -109,10 +111,11 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
 
 /**
  * 完整 setup 流程（命令/钩子共享）。逐步报告；任一步失败抛错。
- * @param {{ token: string, hostname: string, mode?: "dual"|"single", cwd: string, tokenEnvName?: string,
- *           dryRun?: boolean, skipVerify?: boolean, fetchImpl?: typeof fetch,
+ * verifyProgress 透传给 verifyExposure 的 onProgress（交互等待反馈）。
+ * @param {{ token: string, hostname: string, mode?: "dual"|"single", cwd: string, configPath?: string,
+ *           tokenEnvName?: string, dryRun?: boolean, skipVerify?: boolean, fetchImpl?: typeof fetch,
  *           writeFile?: (p: string, content: string) => Promise<void>, exists?: (p: string) => boolean,
- *           log?: (line: string) => void }} input
+ *           log?: (line: string) => void, verifyProgress?: (info: { elapsedMs: number, lastError: string }) => void }} input
  * @returns {Promise<{ plan: ReturnType<typeof planExposure> }>}
  */
 export async function runSetup(input) {
@@ -125,6 +128,7 @@ export async function runSetup(input) {
     writeFile = defaultWriteFile,
     exists = defaultExists,
     log = () => {},
+    verifyProgress,
   } = input;
   const plan = planExposure({ hostname, mode });
   // dry-run 容忍不可解码 token（占位符）：dry-run 的意义是零前置条件预览
@@ -179,7 +183,12 @@ export async function runSetup(input) {
 
   if (!skipVerify) {
     log("verifying end-to-end via the public gateway...");
-    const v = await verifyExposure({ fetchImpl, publicGatewayUrl: plan.publicGatewayUrl, expectedRelayUrl: plan.publicRelayUrl });
+    const v = await verifyExposure({
+      fetchImpl,
+      publicGatewayUrl: plan.publicGatewayUrl,
+      expectedRelayUrl: plan.publicRelayUrl,
+      onProgress: verifyProgress,
+    });
     if (!v.ok) throw new Error(`verification failed: ${v.error} (is cloudflared running for this tunnel?)`);
     log("verification ok: services.json advertises the expected relay URL");
   }

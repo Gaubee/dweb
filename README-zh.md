@@ -147,7 +147,9 @@ plugin add|get`。
 
 ```bash
 opendweb plugin add cf          # 安装进当前项目（探测包管理器），锁定 name@version
-opendweb cf setup --hostname dweb.example.com   # 向导：API 推 ingress、路由 DNS、
+opendweb cf setup               # 交互引导（终端）：逐项询问 token/hostname/mode，
+                                # 预览计划后 apply / dry-run / abort 三选一
+opendweb cf setup --hostname dweb.example.com   # 非交互：API 推 ingress、路由 DNS、
                                                 # 写 opendweb.config.toml、端到端自检
 opendweb cf plan --hostname dweb.example.com    # 零副作用预览（setup 亦有 --dry-run）
 opendweb marketplace add "npm:@your-org/opendweb-ext-*"   # 追加候选 globs（仅 npm:）

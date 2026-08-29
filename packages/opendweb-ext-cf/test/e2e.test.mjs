@@ -53,7 +53,7 @@ test("cf plan/verify dispatch through the real CLI (adaptive resolution finds @j
   // 派发路径；这里验证 --help 零执行）
   const help = await runCli(["cf", "--help"], e);
   assert.equal(help.code, 0);
-  assert.match(help.out, /opendweb cf setup --hostname <string>/);
+  assert.match(help.out, /opendweb cf setup \[[^\]]*--hostname <string>[^\]]*\]/);
   assert.match(help.out, /wire a Cloudflare Tunnel/);
 });
 
@@ -92,6 +92,43 @@ file = ${JSON.stringify(path.join(REPO, "opendweb/test/fixtures/local-echo.mjs")
   assert.equal(r.code, 0, `stderr: ${r.err}\nstdout: ${r.out}`);
   assert.match(r.out, /setup ok: cf/);
   assert.match(r.out, /setup ok: local-echo/);
+});
+
+test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero network)", async () => {
+  const e = await env();
+  const child = spawn(NODE, [CLI, "cf", "setup", "--interactive"], {
+    cwd: e.dir,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  // 管道预置全部应答：粘贴 token（遮蔽）→ hostname → dual → dry-run
+  child.stdin.write("piped-token\n");
+  child.stdin.write("dweb.example.com\n");
+  child.stdin.write("1\n");
+  child.stdin.write("d\n");
+  child.stdin.end();
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (err += d));
+  const code = await new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0)));
+  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  assert.match(out, /interactive wizard/);
+  assert.match(out, /plan:/);
+  assert.match(out, /gateway\s+dweb\.example\.com/);
+  assert.match(out, /dry-run: would PUT ingress config/);
+  assert.match(out, /setup ok \(dry-run\)/);
+  // 遮蔽：管道模式无回显，粘贴的 token 不得出现在输出
+  assert.ok(!out.includes("piped-token"), "token must not be echoed");
+  // dry-run 零副作用：不写配置文件
+  assert.equal(await fsp.stat(path.join(e.dir, "opendweb.config.toml")).then(() => true).catch(() => false), false);
+});
+
+test("cf setup --help: wizard flag is part of the zero-exec usage", async () => {
+  const e = await env();
+  const help = await runCli(["cf", "setup", "--help"], e);
+  assert.equal(help.code, 0, help.err);
+  assert.match(help.out, /--interactive/);
 });
 
 test("cf status: read-only dispatch through the real CLI (spec scenario)", async () => {

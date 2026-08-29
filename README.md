@@ -165,7 +165,9 @@ Vendor and workflow integrations are plugins — the CLI core stays vendor-neutr
 
 ```bash
 opendweb plugin add cf          # install into the current project (detected pm), lock name@version
-opendweb cf setup --hostname dweb.example.com   # wizard: push ingress via CF API, route DNS,
+opendweb cf setup               # interactive wizard (terminal): asks for token/hostname/mode,
+                                # previews the plan, then apply / dry-run / abort
+opendweb cf setup --hostname dweb.example.com   # non-interactive: push ingress via CF API, route DNS,
                                                 # write opendweb.config.toml, verify end-to-end
 opendweb cf plan --hostname dweb.example.com    # zero-side-effect preview (also --dry-run on setup)
 opendweb marketplace add "npm:@your-org/opendweb-ext-*"   # more candidate globs (npm: only)

@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runSetup, verifyExposure, planExposure } from "./wizard.js";
+import { runInteractiveSetup } from "./tui.mjs";
 
 export default {
   name: "cf",
@@ -12,7 +13,7 @@ export default {
   commands: [
     {
       name: "setup",
-      description: "wire a Cloudflare Tunnel to this server: push ingress via API, route DNS, write opendweb.config.toml, verify end-to-end",
+      description: "wire a Cloudflare Tunnel to this server: push ingress via API, route DNS, write opendweb.config.toml, verify end-to-end; run without --hostname on a terminal for the guided wizard",
       args: {
         type: "object",
         properties: {
@@ -21,8 +22,8 @@ export default {
           mode: { type: "string" },
           "dry-run": { type: "boolean" },
           "skip-verify": { type: "boolean" },
+          interactive: { type: "boolean" },
         },
-        required: ["hostname"],
       },
     },
     {
@@ -79,6 +80,22 @@ export default {
     }
     if (command === "setup") {
       const tokenEnv = args["token-env"] ?? "TUNNEL_TOKEN";
+      // 引导模式（TUI）：显式 --interactive，或终端下缺 --hostname 自动进入
+      if (wantsInteractive(args, process.stdin.isTTY === true)) {
+        const config = readConfigState(cwd);
+        const suggested = args.hostname ?? hostnameFromUrl(config?.publicGatewayUrl);
+        return runInteractiveSetup({
+          cwd,
+          tokenEnvName: tokenEnv,
+          suggestedHostname: suggested ?? undefined,
+          suggestedMode: mode,
+          suggestedAction: args["dry-run"] ? "dry" : "apply",
+          skipVerify: Boolean(args["skip-verify"]),
+        });
+      }
+      if (!args.hostname) {
+        throw new Error(`--hostname is required (or pass --interactive / run from a terminal for the guided wizard)`);
+      }
       const token = process.env[tokenEnv];
       if (!token && !args["dry-run"]) {
         throw new Error(`missing ${tokenEnv} in the environment; copy the tunnel token from Zero Trust -> Networks -> Tunnels`);
@@ -98,6 +115,17 @@ export default {
     return { exit: 2 };
   },
 };
+
+/**
+ * setup 引导模式的进入条件：显式 --interactive 恒进（管道/脚本可驱动）；
+ * 否则仅当「终端 && 缺 --hostname」时自动进入（裸 `opendweb cf setup` 即引导）。
+ * @param {{ interactive?: boolean, hostname?: string }} args
+ * @param {boolean} isTTY
+ * @returns {boolean}
+ */
+export function wantsInteractive(args, isTTY) {
+  return args.interactive === true || (!args.hostname && isTTY);
+}
 
 /**
  * status 命令：hostname 取 --hostname 或配置文件 server.publicGatewayUrl，
