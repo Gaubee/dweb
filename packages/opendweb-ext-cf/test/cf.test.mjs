@@ -452,6 +452,60 @@ test("postReady hook: preStop cancels a pending startup and reaps its child (R4)
   }
 });
 
+test("postReady hook: preStop before the spawn event still reaps the child (R5 negative)", { skip: process.platform === "win32" }, async () => {
+  const plugin = (await import("../src/index.js")).default;
+  const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
+  const spawnLog = path.join(binDir, "spawns.log");
+  const fake = path.join(binDir, "cloudflared");
+  await fsp.writeFile(fake, "#!/bin/sh\ntrap '' INT\necho $$ > \"$DWEB_CF_SPAWN_LOG\"\nexec /bin/sleep 30\n", "utf8");
+  const { chmodSync } = await import("node:fs");
+  const { execFileSync } = await import("node:child_process");
+  chmodSync(fake, 0o755);
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
+  const prevSpawnLog = process.env.DWEB_CF_SPAWN_LOG;
+  process.env.PATH = binDir;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.DWEB_CF_SPAWN_GRACE_MS = "10000";
+  process.env.DWEB_CF_SPAWN_LOG = spawnLog;
+  let stopped = null;
+  try {
+    const postReady = plugin.hooks["server.postReady"]({ options: { tunnel: true } });
+    stopped = assert.rejects(postReady, /startup was stopped before it became healthy/);
+    // 立即停止：spawn 事件几乎必然尚未派发（child.pid 未就绪）——stopChild
+    // 必须把信号推迟到 spawn 之后，且 preStop 只在子进程终态事件后才 resolve
+    // （resolve 本身就是回收证明；INT 被 trap 吞掉时最长 5s 由 SIGKILL 兜底）
+    await plugin.hooks["server.preStop"]();
+    await stopped;
+    // 可选观测：若 pid 记录来得及写出（SIGINT 晚于 echo），确认进程已死；
+    // SIGINT 早于 echo 时子进程被直接杀死——同样已终态（preStop 已等到）
+    let pid = "";
+    try {
+      pid = (await fsp.readFile(spawnLog, "utf8")).trim();
+    } catch { /* log not written: child died before echo — also reaped */ }
+    if (/^\d+$/.test(pid)) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.throws(
+        () => execFileSync("/bin/sh", ["-c", `kill -0 ${Number(pid)} 2>/dev/null`]),
+        "child must be reaped even when preStop preceded its spawn event",
+      );
+    }
+  } finally {
+    await plugin.hooks["server.preStop"]().catch(() => {});
+    await stopped?.catch(() => {});
+    try {
+      execFileSync("/bin/sh", ["-c", `kill -9 $(cat ${JSON.stringify(spawnLog)} 2>/dev/null) 2>/dev/null || true`]);
+    } catch { /* best effort */ }
+    process.env.PATH = prevPath;
+    process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    if (prevSpawnLog === undefined) delete process.env.DWEB_CF_SPAWN_LOG;
+    else process.env.DWEB_CF_SPAWN_LOG = prevSpawnLog;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
+});
+
 test("postReady hook: missing cloudflared degrades to a hook failure, not a crash (R2 blocked-6)", async () => {
   const plugin = (await import("../src/index.js")).default;
   const prevPath = process.env.PATH;

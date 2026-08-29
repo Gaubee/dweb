@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { resolveAdaptive, resolvePluginEntry, BUILTIN_COMMANDS } from "../src/plugin-resolve.mjs";
+import { resolveAdaptive, resolvePluginEntry, BUILTIN_COMMANDS, PluginNotResolved } from "../src/plugin-resolve.mjs";
 import { parseCommandArgs, dispatchPluginCommand, renderPluginHelp, PluginManifestSchema } from "../src/plugin-contract.mjs";
 import { candidatesFor, DEFAULT_GLOBS } from "../src/marketplace.mjs";
 import { CliExit } from "../src/util.mjs";
@@ -52,6 +52,51 @@ test("resolvePluginEntry: same-process miss followed by install falls back to pa
   assert.ok(entry?.endsWith("plugin.js"), entry ?? "null");
   const resolved = await resolveAdaptive({ name: "echo", globs: DEFAULT_GLOBS, cwd: dir });
   assert.equal(resolved.pkg, pkg);
+});
+
+test("resolvePluginEntry: CLI face never falls back to the package root export (R5-B1)", async () => {
+  const dir = await projectWith();
+  // 仅导出 "."（根导出恰好是合规清单）：CLI 面只认 ./opendweb-plugin，
+  // 不得让未声明 CLI 面的包进入自适应派发（冻结 spec）
+  const pkgDir = path.join(dir, "node_modules", "opendweb-rootface");
+  await fsp.mkdir(pkgDir, { recursive: true });
+  await fsp.writeFile(
+    path.join(pkgDir, "package.json"),
+    JSON.stringify({ name: "opendweb-rootface", version: "1.0.0", type: "module", exports: { ".": "./plugin.js" } }),
+  );
+  await fsp.writeFile(
+    path.join(pkgDir, "plugin.js"),
+    'export default { name: "rootface", apiVersion: 1, commands: [{ name: "hello", description: "d", args: { type: "object", properties: {}, required: [] } }], run: async () => ({ exit: 0 }) };',
+  );
+  assert.equal(resolvePluginEntry("opendweb-rootface", dir), null);
+  await assert.rejects(
+    () => resolveAdaptive({ name: "rootface", globs: DEFAULT_GLOBS, cwd: dir }),
+    (e) => e instanceof PluginNotResolved,
+  );
+});
+
+test("resolvePluginEntry: opendweb-plugin symlink escaping the package is rejected (R5-B2)", async () => {
+  const dir = await projectWith();
+  const pkgDir = path.join(dir, "node_modules", "opendweb-escape");
+  await fsp.mkdir(pkgDir, { recursive: true });
+  await fsp.writeFile(
+    path.join(pkgDir, "package.json"),
+    JSON.stringify({ name: "opendweb-escape", version: "1.0.0", type: "module", exports: { "./opendweb-plugin": "./link.mjs" } }),
+  );
+  // 包外目标（项目根下）：若被错误接受并导入，清单 name="evil" 会触发
+  // manifest 名不匹配硬错误——用它区分「拒绝解析」与「错误接受」
+  await fsp.writeFile(
+    path.join(dir, "outside.mjs"),
+    'export default { name: "evil", apiVersion: 1, commands: [], run: async () => ({ exit: 0 }) };',
+  );
+  await fsp.symlink(path.join(dir, "outside.mjs"), path.join(pkgDir, "link.mjs"));
+  assert.equal(resolvePluginEntry("opendweb-escape", dir), null);
+  // 不得 import 包外文件：PluginNotResolved（而非 manifest 硬错误）证明
+  // 越界入口从未被加载
+  await assert.rejects(
+    () => resolveAdaptive({ name: "escape", globs: DEFAULT_GLOBS, cwd: dir }),
+    (e) => e instanceof PluginNotResolved,
+  );
 });
 
 test("resolveAdaptive: declaration order wins; unresolvable candidates are skipped", async () => {

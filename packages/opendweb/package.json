@@ -12,11 +12,13 @@
     "zod": "^4.5.2"
   },
   "devDependencies": {
+    "@types/node": "22",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   },
   "scripts": {
-    "test": "node --test --test-force-exit --test-concurrency=1 test/*.test.mjs"
+    "checkjs": "tsc --allowJs --checkJs --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --esModuleInterop --skipLibCheck --types node src/*.mjs",
+    "test": "npm run checkjs && node --test --test-force-exit --test-concurrency=1 test/*.test.mjs"
   },
   "repository": {
     "type": "git",

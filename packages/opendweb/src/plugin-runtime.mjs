@@ -60,7 +60,12 @@ export function defaultWhich(cmd) {
   return null;
 }
 
-/** 执行子进程并收 stdout/stderr/退出码（超时兜底防本地插件挂死 CLI） */
+/**
+ * 执行子进程并收 stdout/stderr/退出码（超时兜底防本地插件挂死 CLI）。
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {{ cwd?: string, input?: string, timeoutMs?: number }} [opts]
+ */
 export function runCapture(cmd, args, { cwd, input, timeoutMs = 60000 } = {}) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
@@ -171,7 +176,7 @@ export async function loadDeclaredPlugins({
     const hooks = Object.keys(plugin.hooks ?? {}).filter((h) => HOOK_NAMES.includes(h));
     return {
       name: plugin.name,
-      kind: "npm",
+      kind: /** @type {"npm"} */ ("npm"),
       options,
       hooks,
       invoke: async (hook, payload) => {
@@ -190,7 +195,7 @@ export async function loadDeclaredPlugins({
     const declared = await declareLocalPlugin({ file, exec, which });
     return {
       name: declared.name,
-      kind: "local",
+      kind: /** @type {"local"} */ ("local"),
       options,
       hooks: declared.hooks,
       invoke: async (hook, payload) => {
@@ -284,7 +289,11 @@ async function declareLocalPlugin({ file, exec, which }) {
   return { name: declared.name, hooks: declared.hooks, cmd, args };
 }
 
-/** 严格 plain object 判定（Object.prototype 或 null 原型；拒 Date/Map 等） */
+/**
+ * 严格 plain object 判定（Object.prototype 或 null 原型；拒 Date/Map 等）。
+ * @param {unknown} v
+ * @returns {v is Record<string, unknown>}
+ */
 function isPlainObject(v) {
   if (v === null || typeof v !== "object") return false;
   const proto = Object.getPrototypeOf(v);

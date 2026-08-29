@@ -112,7 +112,10 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
       // 恰在判定与 once("exit") 之间退出，会形成无声伪成功窗口。
       const active = { child, watchdog: null };
       const watchdog = () => {
-        if (tunnelChild === active) tunnelChild = null;
+        // 仅当前活跃记录才告警+清理（R5-Minor：promote 前的窄窗退出已由
+        // startup exit listener 归一为启动失败，不得再叠一条 WARNING）
+        if (tunnelChild !== active) return;
+        tunnelChild = null;
         console.error(`WARNING: cloudflared exited (${exitLabel()}); the public tunnel is down`);
       };
       active.watchdog = watchdog;

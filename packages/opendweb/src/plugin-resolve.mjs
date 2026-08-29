@@ -43,15 +43,17 @@ export class PluginNotResolved extends Error {
 }
 
 /**
- * 在 cwd 的项目上下文解析插件的 ./opendweb-plugin 入口绝对路径。
+ * 在 cwd 的项目上下文解析插件的 ./opendweb-plugin 入口绝对路径（CLI 面：
+ * 冻结 spec 只认该子路径导出——包根 "." 导出属于 config 面，不得混入，
+ * 否则未声明 CLI 面的包会进入自适应派发，R5-B1）。
  * 用 createRequire(cwd/package.json) 拿到用户项目的解析语义（npm/pnpm 布局
- * 均适用）；解析不到返回 null。
+ * 均适用）；解析不到或越界返回 null。
  * @param {string} pkg
  * @param {string} cwd
  * @returns {string | null}
  */
 export function resolvePluginEntry(pkg, cwd) {
-  return resolvePackageEntry(pkg, cwd, ["./opendweb-plugin", "."]);
+  return resolvePackageEntry(pkg, cwd, ["./opendweb-plugin"]);
 }
 
 /**
@@ -79,12 +81,51 @@ function resolvePackageEntry(pkg, cwd, exportPaths) {
   for (const exportPath of exportPaths) {
     const specifier = exportPath === "." ? pkg : pkg + exportPath.slice(1);
     try {
-      return req.resolve(specifier);
+      // R5-B2：解析结果必须过真实路径 containment——req.resolve 默认跟随
+      // 符号链接，入口指向包外（symlink 逃逸）或包名不符一律拒绝，且不再
+      // 尝试该候选的其它入口（包本身不可信）
+      return containedEntry(pkg, req.resolve(specifier));
     } catch {
       // Try every valid entry for this candidate before falling back to fs.
     }
   }
   return resolvePackageEntryFromFs(pkg, cwd, exportPaths);
+}
+
+/**
+ * 统一的真实路径 containment（R5-B2）：入口真实路径必须落在「声明了本包名
+ * 的真实包根」之内——从 realpath(entry) 向上找到的第一个 name===pkg 的
+ * package.json 即包根（向上查找的结构保证包含关系）；走到文件系统根都没
+ * 找到 = 入口逃出了该包，拒绝。
+ * @param {string} pkg
+ * @param {string} resolved
+ * @returns {string | null}
+ */
+function containedEntry(pkg, resolved) {
+  let entryReal;
+  try {
+    entryReal = realpathSync(resolved);
+  } catch {
+    return null;
+  }
+  let dir = path.dirname(entryReal);
+  for (;;) {
+    const meta = readPackageMeta(path.join(dir, "package.json"));
+    if (meta !== null && meta.name === pkg) return entryReal;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/** @param {string} p @returns {Record<string, unknown> | null} */
+function readPackageMeta(p) {
+  try {
+    const parsed = JSON.parse(readFileSync(p, "utf8"));
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -174,6 +215,8 @@ function isRecord(value) {
 /**
  * Export targets must stay inside the package. Legacy main also gets common
  * extension and index probing used by packages without an exports map.
+ * R5-B2：词法候选先取真实路径（existingFile 内部 realpath），再对真实路径
+ * 判包含——先词法判包含会被指向包外的符号链接绕过。
  * @param {string} packageDir
  * @param {string | null} target
  * @param {boolean} legacyMain
@@ -183,9 +226,15 @@ function resolvePackageFile(packageDir, target, legacyMain) {
   if (typeof target !== "string" || target.length === 0) return null;
   if (!legacyMain && !target.startsWith("./")) return null;
   const candidate = path.resolve(packageDir, target);
-  if (!isWithinPackage(packageDir, candidate)) return null;
+  const real = legacyMain ? probeLegacyEntry(candidate) : existingFile(candidate);
+  if (real === null) return null;
+  return isWithinPackage(packageDir, real) ? real : null;
+}
+
+/** legacy main 的扩展名与 index 探测（结果一律取真实路径） */
+function probeLegacyEntry(candidate) {
   const exact = existingFile(candidate);
-  if (exact !== null || !legacyMain) return exact;
+  if (exact !== null) return exact;
   for (const suffix of [".js", ".mjs", ".cjs"]) {
     const withSuffix = existingFile(candidate + suffix);
     if (withSuffix !== null) return withSuffix;
@@ -230,7 +279,8 @@ export async function resolveAdaptive({
     if (entry === null) {
       continue;
     }
-    const mod = await importModule(pathToFileURL(entry).href);
+    const imported = await importModule(pathToFileURL(entry).href);
+    const mod = /** @type {Record<string, unknown>} */ (imported);
     const parsed = PluginManifestSchema.safeParse(mod?.default ?? mod);
     if (!parsed.success) {
       const issues = parsed.error.issues
