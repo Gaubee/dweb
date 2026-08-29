@@ -63,3 +63,15 @@
       Packages 表与仓库布局增补
 - [x] 4.2 全量门禁：opendweb 56/56 · opendweb-config 4/4 · opendweb-ext-cf
       11/11 · server-binary 7/7 + tsc clean（测试文件按资源纪律串行）
+
+## 5. 自愈安装（Owner 第四轮决策，2026-08-29：opendweb cf 即 get cf ?? add cf）
+
+- [x] 5.1 PluginNotResolved 类型化（携带候选序列）；runAdaptive 捕获后取首个
+      候选（声明序 = 官方 scoped 优先）自愈安装并重试解析一次；安装输出可见
+      （继承 stdio + installed: name (pkg@version)）
+- [x] 5.2 DWEB_NO_AUTO_INSTALL=1 逃生阀（显式安装语义 + 手动指引 + 零安装痕迹）
+- [x] 5.3 `plugin get` 作为 add 同义命令
+- [x] 5.4 e2e（fake-pm PATH shim，无网络）：自愈安装全链路（安装输出 + 锁定
+      记录 + 派发成功）、NO_AUTO_INSTALL 语义、get 别名
+- [x] 5.5 文档同步：design D2 / proposal / spec delta（两 Scenario 重写）/
+      README EN+zh；opendweb 59/59

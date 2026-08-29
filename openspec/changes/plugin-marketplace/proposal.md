@@ -17,8 +17,9 @@ Owner 决策（2026-08-29，三轮收敛）：以**自适应子命令 + npm mark
 - `opendweb <name> ...` / `opendweb use <name> ...`：非 builtin 首 token 按 marketplace
   声明序解析候选包（`*` → `<name>`），`import("$PKG/opendweb-plugin")` 后以
   zod `safeParse` 校验插件清单再派发；builtin 关键字恒优先
-- `opendweb plugin add/remove/list`：显式安装与版本锁定；**无隐式 auto-install**
-  （未安装时报错并打印精确安装命令）
+- `opendweb plugin add|get/remove/list`：显式安装与版本锁定；
+  **自适应调用自愈安装**（Owner 第四轮决策：`opendweb cf` 即 `get cf ?? add cf`，
+  取首个候选 = 官方 scoped 优先；`DWEB_NO_AUTO_INSTALL=1` 关闭）
 - 源语法仅 `npm:`（Owner 决策：不考虑 `github:`/`https://`）
 
 ### 2. 静态配置编排（TOML 为主，JSON 兼容）
@@ -45,7 +46,7 @@ Owner 决策（2026-08-29，三轮收敛）：以**自适应子命令 + npm mark
 
 - 编排层任何代码能力（条件逻辑属于插件文件；选项只能是数据）
 - 插件包自动注册钩子（钩子由插件对象自带；编排只决定「谁在场、什么顺序」）
-- `github:` / `https:` 源、隐式 auto-install、子进程 RPC 插件隔离
+- `github:` / `https:` 源、子进程 RPC 插件隔离
 - Rust server 侧任何插件化（内核保持中立）
 
 ## Decisions（Owner，2026-08-29，三轮）

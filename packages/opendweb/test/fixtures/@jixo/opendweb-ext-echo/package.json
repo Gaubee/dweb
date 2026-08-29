@@ -1,0 +1,10 @@
+{
+  "name": "@jixo/opendweb-ext-echo",
+  "version": "1.2.3",
+  "type": "module",
+  "description": "test fixture plugin under the official scoped glob (auto-install candidate #1)",
+  "exports": {
+    ".": "./root.js",
+    "./opendweb-plugin": "./plugin.js"
+  }
+}

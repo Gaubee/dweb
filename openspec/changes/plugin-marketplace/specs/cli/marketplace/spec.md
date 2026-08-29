@@ -25,19 +25,26 @@ CLI SHALL 提供 `opendweb marketplace add|list|remove` 维护候选包名 globs
 的 `*` 替换为该 token 生成候选包名，依次尝试加载其 `opendweb-plugin` 子路径
 导出；`opendweb use <name> ...` SHALL 为显式等价形，不携带额外语义。首个
 import 成功且契约校验通过的候选胜出；**import 成功但清单校验失败 MUST 视为
-硬错误**（不得静默跳到下一候选）。全部候选不可解析时 MUST 报错并打印精确的
-`opendweb plugin add <name>` 安装命令；CLI MUST NOT 隐式安装任何包。builtin
-子命令关键字恒优先于自适应解析。
+硬错误**（不得静默跳到下一候选）。全部候选不可解析时 MUST 自愈安装：取首个
+候选（声明序即安全梯度——官方 scoped 优先）经用户项目的包管理器安装（过程与
+name@version 对用户可见），随后重试解析一次；重试仍失败 MUST 硬错误。设置
+`DWEB_NO_AUTO_INSTALL=1` 时 MUST 跳过自愈并报错打印精确的
+`opendweb plugin add <name>` 手动指引。builtin 子命令关键字恒优先于自适应解析。
 
 #### Scenario: 零配置调用已安装插件
 
 - **WHEN** `@jixo/opendweb-ext-cf` 已安装且 `opendweb cf status` 执行
 - **THEN** 候选按声明序解析到该包并派发 status 命令
 
-#### Scenario: 未安装插件指引安装
+#### Scenario: 未安装插件自愈安装（get ?? add）
 
-- **WHEN** 无任何候选可解析 `opendweb frp setup`
-- **THEN** 非零退出，错误信息包含 `opendweb plugin add frp`
+- **WHEN** 无任何候选可解析 `opendweb echo hello` 且未设置 DWEB_NO_AUTO_INSTALL
+- **THEN** CLI 以首个候选（声明序）经用户包管理器安装，输出 installed: name (pkg@version) 与锁定记录，随后重试解析并正常派发
+
+#### Scenario: 自愈关闭时保留手动指引
+
+- **WHEN** `DWEB_NO_AUTO_INSTALL=1` 且无任何候选可解析 `opendweb frp setup`
+- **THEN** 非零退出，错误信息包含 `opendweb plugin add frp`，且不产生任何安装痕迹
 
 #### Scenario: 清单不合规为硬错误
 
@@ -66,7 +73,8 @@ Schema 声明）。CLI SHALL 依据 args 声明统一完成参数解析、校验
 
 ### Requirement: 插件安装管理
 
-CLI SHALL 提供 `opendweb plugin add|remove|list`：add 展示精确 name@version
+CLI SHALL 提供 `opendweb plugin add|get|list|remove`（get 为 add 的同义命令）：
+add/get 展示精确 name@version
 并锁定于用户配置目录；list 展示已安装与锁定版本；remove 卸除锁定记录。
 
 #### Scenario: 安装锁定

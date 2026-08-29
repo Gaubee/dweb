@@ -161,7 +161,7 @@ Direct hole-punching never goes through the tunnel (iroh QUIC peer-to-peer); the
 
 ## Plugins
 
-Vendor and workflow integrations are plugins — the CLI core stays vendor-neutral by construction. Any non-builtin first token dispatches adaptively: `opendweb <name> ...` resolves the marketplace candidate globs (default `npm:@jixo/opendweb-ext-*` then `npm:opendweb-*`) to an installed package's `./opendweb-plugin` export. Nothing is auto-installed: a missing plugin fails with the exact `opendweb plugin add` command.
+Vendor and workflow integrations are plugins — the CLI core stays vendor-neutral by construction. Any non-builtin first token dispatches adaptively: `opendweb <name> ...` resolves the marketplace candidate globs (default `npm:@jixo/opendweb-ext-*` then `npm:opendweb-*`) to an installed package's `./opendweb-plugin` export. Missing plugins are fetched automatically on first use (`get ?? add`): the first candidate wins, so official scoped packages are preferred over unscoped community names; the install runs through your project's package manager and prints the locked name@version. Set `DWEB_NO_AUTO_INSTALL=1` to require explicit `opendweb plugin add|get`.
 
 ```bash
 opendweb plugin add cf          # install into the current project (detected pm), lock name@version

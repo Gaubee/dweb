@@ -14,7 +14,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { loadMarketplace, marketplaceAdd, marketplaceRemove } from "../src/marketplace.mjs";
-import { resolveAdaptive, wantsPluginHelp } from "../src/plugin-resolve.mjs";
+import { resolveAdaptive, wantsPluginHelp, PluginNotResolved } from "../src/plugin-resolve.mjs";
 import { dispatchPluginCommand, renderPluginHelp } from "../src/plugin-contract.mjs";
 import { pluginAdd, pluginRemove, pluginList } from "../src/plugin-registry.mjs";
 import { discoverConfig, loadConfigFile } from "../src/config-file.mjs";
@@ -537,8 +537,8 @@ async function runPlugin(rest) {
     for (const r of records) console.log(`${r.name}  ${r.package}@${r.version}`);
     return 0;
   }
-  if (sub === "add") {
-    if (!name) throw new CliExit("usage: opendweb plugin add <name>", 2);
+  if (sub === "add" || sub === "get") {
+    if (!name) throw new CliExit("usage: opendweb plugin add|get <name>", 2);
     const { pkg, version } = await pluginAdd({
       name,
       globs: await marketplaceGlobs(),
@@ -600,13 +600,34 @@ async function runSetup(rest) {
   return failed ? 1 : 0;
 }
 
-/** 自适应插件调用：解析 → help 零执行 / 命令派发（D2/D3） */
+/**
+ * 自适应插件调用：解析 → help 零执行 / 命令派发（D2/D3）。
+ * 自愈安装（Owner 决策 2026-08-29 第四轮）：`opendweb cf` 即 get cf ?? add cf
+ * ——全部候选未安装时自动取首个候选（声明序 = 官方 scoped 优先）安装并重试
+ * 一次；安装输出可见（继承 stdio）。DWEB_NO_AUTO_INSTALL=1 关闭自愈，回退为
+ * 手动指引（CI/确定性环境的逃生阀）。
+ */
 async function runAdaptive(name, rest) {
-  const { manifest } = await resolveAdaptive({
-    name,
-    globs: await marketplaceGlobs(),
-    cwd: process.cwd(),
-  });
+  const globs = await marketplaceGlobs();
+  let resolved;
+  try {
+    resolved = await resolveAdaptive({ name, globs, cwd: process.cwd() });
+  } catch (e) {
+    if (!(e instanceof PluginNotResolved) || process.env.DWEB_NO_AUTO_INSTALL === "1") throw e;
+    const lockPath = path.join(dwebHome(), "plugins.json");
+    const { pkg, version } = await pluginAdd({
+      name,
+      globs,
+      cwd: process.cwd(),
+      lockPath,
+      existsSync: (p) => fs.existsSync(p),
+      run: spawnInherit,
+    });
+    console.log(`installed: ${name} (${pkg}@${version})`);
+    // 安装成功后重试解析一次；仍失败（布局异常等）→ resolveAdaptive 硬错误
+    resolved = await resolveAdaptive({ name, globs, cwd: process.cwd() });
+  }
+  const { manifest } = resolved;
   const [command, ...argv] = rest;
   if (command === undefined || wantsPluginHelp({ argv: rest })) {
     console.log(renderPluginHelp({ name, manifest }));
@@ -654,9 +675,9 @@ Usage:
       Manage plugin candidate globs. Default: npm:@jixo/opendweb-ext-*,
       npm:opendweb-* (declaration order = resolution order; npm: only).
 
-  opendweb plugin add|list|remove <name>
-      Install plugins into the current project (detected package manager)
-      and lock name@version in ~/.opendweb/plugins.json.
+  opendweb plugin add|get|list|remove <name>
+      Manage plugins explicitly. add/get install into the current project
+      (detected package manager) and lock name@version in ~/.opendweb/plugins.json.
 
   opendweb setup
       Run the setup hook of every plugin declared in the config file, in
@@ -665,7 +686,9 @@ Usage:
   opendweb <plugin-name> [command] [...]     (or: opendweb use <plugin-name> ...)
       Adaptive plugin dispatch. Non-builtin first tokens resolve via the
       marketplace globs to an installed package's ./opendweb-plugin export.
-      Not installed? The error prints the exact plugin add command.
+      Missing plugins are fetched automatically on first use (get ?? add;
+      first candidate wins, so official scoped packages are preferred);
+      set DWEB_NO_AUTO_INSTALL=1 to require explicit installation.
 
 Environment:
   DWEB_GATEWAY_BIND         gateway listen address

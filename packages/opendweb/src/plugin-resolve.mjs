@@ -23,6 +23,25 @@ export const BUILTIN_COMMANDS = new Set([
 ]);
 
 /**
+ * 全部候选不可解析（= 未安装）。携带候选序列供调用方自愈安装
+ * （Owner 决策：`opendweb cf` 自动做 get cf ?? add cf——取首个候选，
+ * 即声明序里官方 scoped 优先的安全梯度）。
+ */
+export class PluginNotResolved extends Error {
+  /**
+   * @param {string} name
+   * @param {string[]} candidates 已展开的候选包名（声明序）
+   */
+  constructor(name, candidates) {
+    super(
+      `no plugin found for "${name}" (tried: ${candidates.join(", ")}); install one with: opendweb plugin add ${name}`,
+    );
+    this.name = "PluginNotResolved";
+    this.candidates = candidates;
+  }
+}
+
+/**
  * 在 cwd 的项目上下文解析插件的 ./opendweb-plugin 入口绝对路径。
  * 用 createRequire(cwd/package.json) 拿到用户项目的解析语义（npm/pnpm 布局
  * 均适用）；解析不到返回 null。
@@ -56,12 +75,9 @@ export async function resolveAdaptive({
   importModule = (url) => import(url),
   resolveEntry = resolvePluginEntry,
 }) {
-  /** @type {string[]} */
-  const tried = [];
   for (const pkg of candidatesFor(globs, name)) {
     const entry = resolveEntry(pkg, cwd);
     if (entry === null) {
-      tried.push(pkg);
       continue;
     }
     const mod = await importModule(pathToFileURL(entry).href);
@@ -77,9 +93,7 @@ export async function resolveAdaptive({
     }
     return { pkg, manifest: parsed.data, entryUrl: pathToFileURL(entry).href };
   }
-  throw new Error(
-    `no plugin found for "${name}" (tried: ${tried.join(", ")}); install one with: opendweb plugin add ${name}`,
-  );
+  throw new PluginNotResolved(name, candidatesFor(globs, name));
 }
 
 /**

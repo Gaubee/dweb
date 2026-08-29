@@ -18,7 +18,10 @@ opendweb cf setup --token X
         └─ 逐个尝试 import("$PKG/opendweb-plugin")（Node 解析，本地已安装优先）
            └─ 首个 import 成功且 safeParse 通过者胜出
               └─ 校验失败 ≠ 跳过（同名包清单不合规属硬错误，避免静默漏配）
-全部候选不可解析 → 报错 + 打印精确的 plugin add 命令（无隐式安装）
+全部候选不可解析 → 自愈安装（Owner 第四轮决策：opendweb cf 即 get cf ?? add cf）
+  取首个候选（声明序 = 官方 scoped 优先的安全梯度）经用户包管理器安装（输出可见，
+  继承 stdio）→ 重试解析一次；仍失败 → 硬错误
+DWEB_NO_AUTO_INSTALL=1 关闭自愈 → 显式安装语义（错误附 plugin add 指引；CI 逃生阀）
 builtin 关键字恒优先；opendweb use <name> 为显式等价形（纯转发，无附加语义）
 ```
 

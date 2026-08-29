@@ -561,11 +561,15 @@ async function pluginProjectEnv() {
 }
 
 /** 以指定 cwd/DWEB_HOME 跑 CLI 子进程，收集 stdout/stderr/退出码 */
-function runCli(args, { dir, home }) {
+function runCli(args, envObj, extraEnv = {}) {
+  return runCliWithEnv(args, envObj, extraEnv);
+}
+
+function runCliWithEnv(args, { dir, home }, extraEnv = {}) {
   return new Promise((resolve) => {
     const child = spawn(NODE, [CLI, ...args], {
       cwd: dir,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: home, NO_COLOR: "1" },
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: home, NO_COLOR: "1", ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -587,9 +591,11 @@ test("adaptive e2e: opendweb echo hello dispatches through marketplace resolutio
   assert.equal(use.out, "hello bob\n");
 });
 
-test("adaptive e2e: not-installed plugin prints install guidance, exit non-zero", async () => {
+test("adaptive e2e: not-installed plugin prints install guidance (DWEB_NO_AUTO_INSTALL), exit non-zero", async () => {
   const env = await pluginProjectEnv();
-  const r = await runCli(["frp", "setup"], env);
+  // 默认语义已改为自愈安装（走真实包管理器，测试不可联网）——本用例固定
+  // 显式安装语义；自愈路径由 fake-pm shim 用例覆盖
+  const r = await runCliWithEnv(["frp", "setup"], env, { DWEB_NO_AUTO_INSTALL: "1" });
   assert.notEqual(r.code, 0);
   assert.match(r.err, /opendweb plugin add frp/);
 });
@@ -682,4 +688,119 @@ test("help mentions new commands (marketplace/plugin/setup)", async () => {
   assert.match(out, /opendweb plugin/);
   assert.match(out, /opendweb setup/);
   assert.match(out, /opendweb <plugin-name>/);
+});
+
+// ---------------------------------------------------------------------------
+// 自愈安装 e2e（Owner 决策第四轮：opendweb cf 即 get cf ?? add cf）
+// ---------------------------------------------------------------------------
+
+import { chmodSync } from "node:fs";
+
+/** 造一个假 npm shim（无网络安装）：复制 DWEB_FAKE_PM_SRC/<pkg> 到 ./node_modules/<pkg> */
+async function fakePmShim(srcDir) {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-pm-"));
+  const script = path.join(dir, "npm");
+  await fsp.writeFile(
+    script,
+    [
+      "#!/bin/sh",
+      '# fake package manager (test shim): copy fixture package into node_modules',
+      'pkg=""',
+      'for a in "$@"; do case "$a" in -*) ;; *) pkg="$a";; esac; done',
+      '[ -z "$pkg" ] && exit 1',
+      'src="$DWEB_FAKE_PM_SRC/$pkg"',
+      'dst="node_modules/$pkg"',
+      'mkdir -p "$(dirname "$dst")"',
+      'cp -R "$src" "$dst" || exit 1',
+      "exit 0",
+    ].join("\n"),
+    "utf8",
+  );
+  chmodSync(script, 0o755);
+  return { dir, srcDir };
+}
+
+test("adaptive e2e: missing plugin is auto-installed on first use (get ?? add, scoped candidate first)", async () => {
+  const env = await pluginProjectEnv();
+  // 自愈场景要求「未安装」：移除预装的无 scope echo，迫使走首个候选（scoped）
+  await fsp.rm(path.join(env.dir, "node_modules", "opendweb-echo"), { recursive: true, force: true });
+  const shim = await fakePmShim(FIXTURES_DIR); // DWEB_FAKE_PM_SRC=fixtures：$SRC/@jixo/opendweb-ext-echo
+  const child = spawn(NODE, [CLI, "echo", "hello", "--name", "ada"], {
+    cwd: env.dir,
+    env: {
+      PATH: `${shim.dir}:${process.env.PATH}`,
+      HOME: process.env.HOME,
+      DWEB_HOME: env.home,
+      DWEB_FAKE_PM_SRC: shim.srcDir,
+      NO_COLOR: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (err += d));
+  const code = await new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0)));
+  assert.equal(code, 0, `stderr: ${err}`);
+  assert.match(out, /installed: echo \(@jixo\/opendweb-ext-echo@1\.2\.3\)/);
+  assert.match(out, /hello ada/);
+  // 安装后写入锁定记录
+  const lock = JSON.parse(await fsp.readFile(path.join(env.home, "plugins.json"), "utf8"));
+  assert.deepEqual(lock.echo, { package: "@jixo/opendweb-ext-echo", version: "1.2.3" });
+});
+
+test("adaptive e2e: DWEB_NO_AUTO_INSTALL=1 keeps explicit-install semantics (manual guidance)", async () => {
+  const env = await pluginProjectEnv();
+  await fsp.rm(path.join(env.dir, "node_modules", "opendweb-echo"), { recursive: true, force: true });
+  const r = await new Promise((resolve) => {
+    const child = spawn(NODE, [CLI, "echo", "hello", "--name", "ada"], {
+      cwd: env.dir,
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        DWEB_HOME: env.home,
+        DWEB_NO_AUTO_INSTALL: "1",
+        NO_COLOR: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("exit", (c) => resolve({ code: c ?? 0, out, err }));
+  });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /opendweb plugin add echo/);
+  // 自愈关闭时不得有任何安装痕迹
+  assert.equal(
+    await fsp.stat(path.join(env.dir, "node_modules", "@jixo")).then(() => true).catch(() => false),
+    false,
+    "nothing installed",
+  );
+});
+
+test("plugin e2e: get is an alias of add", async () => {
+  const env = await pluginProjectEnv();
+  const shim = await fakePmShim(FIXTURES_DIR);
+  const r = await new Promise((resolve) => {
+    const child = spawn(NODE, [CLI, "plugin", "get", "echo"], {
+      cwd: env.dir,
+      env: {
+        PATH: `${shim.dir}:${process.env.PATH}`,
+        HOME: process.env.HOME,
+        DWEB_HOME: env.home,
+        DWEB_FAKE_PM_SRC: shim.srcDir,
+        NO_COLOR: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("exit", (c) => resolve({ code: c ?? 0, out, err }));
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /installed: echo \(@jixo\/opendweb-ext-echo@1\.2\.3\)/);
 });

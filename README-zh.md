@@ -140,8 +140,10 @@ cd docker && TUNNEL_TOKEN=... \
 供应商与工作流集成均为插件——CLI 内核在结构上保持厂商中立。任意非 builtin
 首 token 都走自适应派发：`opendweb <name> ...` 按 marketplace 候选 globs
 （默认 `npm:@jixo/opendweb-ext-*`、`npm:opendweb-*`）解析到已安装包的
-`./opendweb-plugin` 导出。不做隐式安装：插件缺失时报错并打印精确的
-`opendweb plugin add` 命令。
+`./opendweb-plugin` 导出。插件缺失时**自愈安装**（get ?? add）：取首个候选
+（声明序，官方 scoped 优先于无 scope 社区名），经你项目的包管理器安装并打印
+锁定的 name@version。设 `DWEB_NO_AUTO_INSTALL=1` 可要求显式 `opendweb
+plugin add|get`。
 
 ```bash
 opendweb plugin add cf          # 安装进当前项目（探测包管理器），锁定 name@version
