@@ -5,30 +5,36 @@
 
 ## 1. 自适应子命令 + marketplace（CLI 核心）
 
-- [ ] 1.1 `~/.opendweb/marketplace.json` 读写与默认值（`npm:@jixo/opendweb-ext-*, npm:opendweb-*`）
-- [ ] 1.2 `opendweb marketplace add/list/remove`（npm: 源语法校验，未知协议报错）
-- [ ] 1.3 自适应解析：非 builtin 首 token → 候选生成 → `import("$PKG/opendweb-plugin")`
+- [x] 1.1 `~/.opendweb/marketplace.json` 读写与默认值（`npm:@jixo/opendweb-ext-*, npm:opendweb-*`）
+- [x] 1.2 `opendweb marketplace add/list/remove`（npm: 源语法校验，未知协议报错）
+- [x] 1.3 自适应解析：非 builtin 首 token → 候选生成 → `import("$PKG/opendweb-plugin")`
       → safeParse → 派发；全部不可解析时报错 + 精确 plugin add 命令
-- [ ] 1.4 插件 CLI 面契约 zod schema（name/apiVersion=1/commands[args JSON Schema]）+
+- [x] 1.4 插件 CLI 面契约 zod schema（name/apiVersion=1/commands[args JSON Schema 子集]）+
       执行包装器（错误归一化、ASCII logger、退出码映射）；`opendweb <name> --help` 零执行生成
-- [ ] 1.5 `opendweb plugin add/remove/list`（name@version 锁定于 ~/.opendweb/plugins.json）
-- [ ] 1.6 单测：解析顺序、builtin 优先、清单不合规=硬错误、锁定与卸载
+- [x] 1.5 `opendweb plugin add/remove/list`（包管理器探测安装 + name@version 锁定
+      ~/.opendweb/plugins.json；安装/卸载经继承 stdio 的用户包管理器）
+- [x] 1.6 单测：解析顺序、builtin 优先、清单不合规=硬错误、锁定与卸载、候选展开
 
 ## 2. 静态配置 + 插件文件 + 生命周期
 
-- [ ] 2.1 TOML/JSON 双格式发现与解析（smol-toml；toml > json，--config 覆盖），
+- [x] 2.1 TOML/JSON 双格式发现与解析（smol-toml；toml > json，--config 覆盖），
       同一 zod schema 校验（configVersion/server/plugins 三形态）；静态报错不执行
-- [ ] 2.2 优先级 flag > env > config > default 接入 resolveServerArgs 链；
+- [x] 2.2 优先级 flag > env > config > default 接入 resolveServerArgs（第三参注入）；
       无插件时零 runtime 依赖（纯静态路径）
-- [ ] 2.3 插件统一对象契约 `{name, hooks}` + 双适配器：
-      npm 包（进程内 import 直调）/ 本地文件（shebang 执行器 + 无参声明 +
-      `--opendweb-hook` 回调协议，stdin payload / stdout 结果）
-- [ ] 2.4 `@jixo/opendweb-config` helper 包：definePlugin（runtime 无关 ESM，
-      检测 Deno/Bun/process）封装本地插件子进程协议
-- [ ] 2.5 3+1 钩子挂点：preStart（覆写片段，失败阻断）/ postReady（readiness
-      门后，失败 WARNING）/ preStop（尽力）；`opendweb setup` 聚合编排
-- [ ] 2.6 单测：schema 双格式一致性、优先级矩阵、双适配器等价性（npm 与本地
-      同钩子同权）、失败语义矩阵、setup 聚合退出码
+- [x] 2.3 插件统一对象契约 `{name, hooks}` + 双适配器：
+      npm 包（进程内 import 包根导出直调）/ 本地文件（shebang 执行器 + `--opendweb-declare`
+      声明 + `--opendweb-hook` 回调协议，stdin payload / stdout 结果）
+- [x] 2.4 `@jixo/opendweb-config` helper 包：definePlugin（runtime 无关 ESM，
+      检测 Deno/Bun/process）封装本地插件子进程协议（三种调用形态有测试）
+- [x] 2.5 3+1 钩子挂点：preStart（覆写片段经同规校验合并，失败阻断）/ postReady
+      （readiness 门后，失败 WARNING + bannerLines 扩展）/ preStop（尽力）；
+      `opendweb setup` 聚合编排（任一失败非零 + 逐插件状态）
+- [x] 2.6 单测：schema 双格式一致性、优先级矩阵、双适配器等价性（npm 与本地
+      同钩子同权）、失败语义矩阵、setup 聚合退出码、shebang 解析（含 env -S）
+- [x] 2.7 e2e（子进程级）：自适应派发/未安装指引/坏清单硬错误/help 零执行/
+      marketplace 事务/setup 编排（成功与失败聚合）
+- [x] 2.8 顺手恢复被 70e61ab 意外回退的三处 R3 修复（CLI canonical 端口
+      `:00001→:1`、括号 IPv6 严格校验、stderr 不回放）+ 共享向量回归锚点测试
 
 ## 3. 首个消费者：@jixo/opendweb-ext-cf
 

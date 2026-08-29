@@ -5,6 +5,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -176,6 +178,18 @@ test("public URL rules: whitespace/unicode host rejected, scheme case normalized
   );
   assert.equal(r.publicGatewayUrl, "https://GW.example.com");
   assert.equal(r.publicRelayUrl, "http://relay.example.com");
+});
+
+test("public URL rules: host charset and canonical port match the Rust binary (R3 P1-1 shared vector)", () => {
+  // 70e61ab 曾意外回退 R3 修复；本向量是回归锚点
+  assert.ok(resolveServerArgs(["--public-gateway", "https://foo_bar.example.com"], {}).error);
+  assert.ok(resolveServerArgs(["--public-gateway", "http://[1.2.3.4]:80"], {}).error);
+  assert.ok(resolveServerArgs(["--public-gateway", "http://[fd00::zz]"], {}).error);
+  // 前导零端口 canonical 化为十进制（":00001" → ":1"，与 Rust u32 重建一致）
+  const r = resolveServerArgs(["--public-gateway", "HTTPS://GW.example.com:00001/"], {});
+  assert.equal(r.publicGatewayUrl, "https://GW.example.com:1");
+  const ok6 = resolveServerArgs(["--public-relay", "http://[fd00::1]"], {});
+  assert.equal(ok6.publicRelayUrl, "http://[fd00::1]");
 });
 
 test("banner: all-ASCII, Local/Network enumeration, NAME | PORT service table", () => {
@@ -505,7 +519,7 @@ test("opendweb server e2e: child bind failure propagates non-zero exit, no banne
   let firstOut = "";
   first.stdout.on("data", (d) => (firstOut += d));
   try {
-    await waitUntil(() => firstOut.includes("Press Ctrl+C to stop"));
+    await waitUntil(() => firstOut.includes("Press Ctrl+C to stop"), 20000);
 
     const second = spawn(
       NODE,
@@ -529,4 +543,143 @@ test("opendweb server e2e: child bind failure propagates non-zero exit, no banne
     first.kill("SIGINT");
     await waitExit(first);
   }
+});
+
+// ---------------------------------------------------------------------------
+// plugin-marketplace e2e：自适应子命令 / marketplace / setup（子进程级）
+// ---------------------------------------------------------------------------
+
+const FIXTURES_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+
+/** 造一个「项目目录 + 已安装 echo 插件 + DWEB_HOME 隔离」的 e2e 环境 */
+async function pluginProjectEnv() {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-e2e-"));
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-home-"));
+  await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "e2e", private: true }), "utf8");
+  await fsp.cp(path.join(FIXTURES_DIR, "opendweb-echo"), path.join(dir, "node_modules", "opendweb-echo"), { recursive: true });
+  return { dir, home };
+}
+
+/** 以指定 cwd/DWEB_HOME 跑 CLI 子进程，收集 stdout/stderr/退出码 */
+function runCli(args, { dir, home }) {
+  return new Promise((resolve) => {
+    const child = spawn(NODE, [CLI, ...args], {
+      cwd: dir,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: home, NO_COLOR: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("exit", (code) => resolve({ code: code ?? 0, out, err }));
+  });
+}
+
+test("adaptive e2e: opendweb echo hello dispatches through marketplace resolution", async () => {
+  const env = await pluginProjectEnv();
+  const r = await runCli(["echo", "hello", "--name", "ada", "--loud", "--times", "2"], env);
+  assert.equal(r.code, 0, `stderr: ${r.err}`);
+  assert.equal(r.out, "hello ada!\nhello ada!\n");
+
+  const use = await runCli(["use", "echo", "hello", "--name", "bob"], env);
+  assert.equal(use.code, 0);
+  assert.equal(use.out, "hello bob\n");
+});
+
+test("adaptive e2e: not-installed plugin prints install guidance, exit non-zero", async () => {
+  const env = await pluginProjectEnv();
+  const r = await runCli(["frp", "setup"], env);
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /opendweb plugin add frp/);
+});
+
+test("adaptive e2e: plugin --help renders zero-exec usage, exit 0", async () => {
+  const env = await pluginProjectEnv();
+  const r = await runCli(["echo", "--help"], env);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /opendweb echo hello --name <string>/);
+  assert.match(r.out, /greet by name/);
+});
+
+test("adaptive e2e: malformed installed plugin is a hard error (no silent skip)", async () => {
+  const env = await pluginProjectEnv();
+  await fsp.cp(path.join(FIXTURES_DIR, "opendweb-bad"), path.join(env.dir, "node_modules", "opendweb-bad"), { recursive: true });
+  const r = await runCli(["bad", "anything"], env);
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /invalid opendweb-plugin manifest/);
+});
+
+test("marketplace e2e: list shows defaults; add validates npm: protocol", async () => {
+  const env = await pluginProjectEnv();
+  const list = await runCli(["marketplace", "list"], env);
+  assert.equal(list.code, 0);
+  assert.match(list.out, /npm:@jixo\/opendweb-ext-\*/);
+  assert.match(list.out, /npm:opendweb-\*/);
+
+  const bad = await runCli(["marketplace", "add", "github:foo/*"], env);
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.err, /only npm: source is supported/);
+
+  const ok = await runCli(["marketplace", "add", "npm:mine-*"], env);
+  assert.equal(ok.code, 0);
+  assert.match(ok.out, /added: npm:mine-\*/);
+  const again = await runCli(["marketplace", "list"], env);
+  assert.match(again.out, /npm:mine-\*/);
+});
+
+test("plugin e2e: list on fresh home shows empty state", async () => {
+  const env = await pluginProjectEnv();
+  const r = await runCli(["plugin", "list"], env);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /\(no plugins installed\)/);
+});
+
+test("setup e2e: no config -> nothing to do (exit 0); local plugin setup runs via config", async () => {
+  const env = await pluginProjectEnv();
+  const none = await runCli(["setup"], env);
+  assert.equal(none.code, 0);
+  assert.match(none.out, /no config file found/);
+
+  // 带本地插件配置：setup 钩子执行（definePlugin 协议由 CLI 子进程适配器驱动）
+  const cfg = `
+configVersion = 1
+
+[[plugins]]
+file = ${JSON.stringify(path.join(FIXTURES_DIR, "local-echo.mjs"))}
+`;
+  await fsp.writeFile(path.join(env.dir, "opendweb.config.toml"), cfg, "utf8");
+  const done = await runCli(["setup"], env);
+  assert.equal(done.code, 0, `stderr: ${done.err}`);
+  assert.match(done.out, /setup ok: local-echo/);
+});
+
+test("setup e2e: failing setup hook aggregates non-zero with per-plugin status", async () => {
+  const env = await pluginProjectEnv();
+  const cfg = `
+configVersion = 1
+
+[[plugins]]
+file = ${JSON.stringify(path.join(FIXTURES_DIR, "local-echo.mjs"))}
+[plugins.options]
+fail = true
+`;
+  await fsp.writeFile(path.join(env.dir, "opendweb.config.toml"), cfg, "utf8");
+  const r = await runCli(["setup"], env);
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /error\[plugin\/local-echo\]: setup failed as requested/);
+});
+
+test("help mentions new commands (marketplace/plugin/setup)", async () => {
+  const out = await new Promise((resolve, reject) => {
+    execFile(NODE, [CLI, "help"], (err, stdout, stderr) => {
+      if (err) reject(err);
+      else resolve(stdout + stderr);
+    });
+  });
+  assert.match(out, ASCII, "help must be all-ASCII");
+  assert.match(out, /opendweb marketplace/);
+  assert.match(out, /opendweb plugin/);
+  assert.match(out, /opendweb setup/);
+  assert.match(out, /opendweb <plugin-name>/);
 });

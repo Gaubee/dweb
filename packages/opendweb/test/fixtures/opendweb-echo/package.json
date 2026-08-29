@@ -1,0 +1,10 @@
+{
+  "name": "opendweb-echo",
+  "version": "1.2.3",
+  "type": "module",
+  "description": "test fixture plugin (CLI face manifest)",
+  "exports": {
+    ".": "./root.js",
+    "./opendweb-plugin": "./plugin.js"
+  }
+}

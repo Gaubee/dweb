@@ -7,14 +7,16 @@
     "opendweb": "./bin/opendweb.mjs"
   },
   "dependencies": {
-    "@jixo/opendweb-server-binary": "workspace:*"
+    "@jixo/opendweb-server-binary": "workspace:*",
+    "smol-toml": "^1.8.0",
+    "zod": "^4.5.2"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   },
   "scripts": {
-    "test": "node --test --test-force-exit"
+    "test": "node --test --test-force-exit --test-concurrency=1 test/*.test.mjs"
   },
   "repository": {
     "type": "git",
