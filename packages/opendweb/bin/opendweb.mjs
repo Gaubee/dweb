@@ -19,7 +19,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadMarketplace, marketplaceAdd, marketplaceRemove } from "../src/marketplace.mjs";
 import { resolveAdaptive, wantsPluginHelp, PluginNotResolved } from "../src/plugin-resolve.mjs";
 import { dispatchPluginCommand, renderPluginHelp } from "../src/plugin-contract.mjs";
-import { pluginAdd, pluginRemove, pluginList, pluginUpdate, latestVersion, loadLockfile } from "../src/plugin-registry.mjs";
+import { pluginAdd, pluginRemove, pluginList, pluginUpdate, latestVersion, loadLockfile, readInstalledVersion } from "../src/plugin-registry.mjs";
 import { discoverConfig, loadConfigFile } from "../src/config-file.mjs";
 import { loadDeclaredPlugins, fireHook } from "../src/plugin-runtime.mjs";
 import { CliExit, asciiEscape } from "../src/util.mjs";
@@ -783,11 +783,13 @@ async function runAdaptive(name, rest) {
   const lockPath = path.join(dwebHome(), "plugins.json");
   const lockRecords = await loadLockfile(lockPath);
   const lockResolved = lockRecords[name]?.package ?? null;
+  let installPathTaken = false;
   let resolved;
   try {
     resolved = await resolveAdaptive({ name, globs, cwd: process.cwd(), lockResolved });
   } catch (e) {
     if (!(e instanceof PluginNotResolved) || process.env.DWEB_NO_AUTO_INSTALL === "1") throw e;
+    installPathTaken = true;
     const lockPath = path.join(dwebHome(), "plugins.json");
     const { pkg, version } = await pluginAdd({
       alias: name,
@@ -802,6 +804,17 @@ async function runAdaptive(name, rest) {
     console.log(`installed: ${name} (${pkg}@${version})`);
     // 安装成功后重试解析一次；仍失败（布局异常等）→ resolveAdaptive 硬错误
     resolved = await resolveAdaptive({ name, globs, cwd: process.cwd() });
+  }
+  if (lockResolved === null && !installPathTaken) {
+    // 孤儿插件（磁盘可解析但无锁定记录）：能跑但版本粘滞、list 不可见、
+    // update 无从升级——提示补锁，不改行为（2026-08-30 用户实测撞上的状态）
+    let diskVersion = "";
+    try {
+      diskVersion = `@${readInstalledVersion(resolved.pkg, process.cwd()).version} `;
+    } catch { /* 版本读不出不影响提示 */ }
+    console.log(
+      `note: ${name} resolved an unlocked ${resolved.pkg} ${diskVersion}from disk; run "plugin install ${name}" to lock it and stay up to date`,
+    );
   }
   const { manifest } = resolved;
   const [command, ...argv] = rest;

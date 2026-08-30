@@ -231,7 +231,14 @@ export async function latestVersion(pkg, fetchImpl = fetch) {
 export async function pluginUpdate({ alias, lockPath, cwd, existsSync, run, fetchImpl = fetch, latest }) {
   const records = await loadLockfile(lockPath);
   const rec = records[alias];
-  if (!rec) throw new CliExit(`plugin not installed: ${alias}`, 2);
+  if (!rec) {
+    // 孤儿状态指引：磁盘上可能有可解析的旧副本（resolver 命中即用、
+    // 版本粘滞），lock 补记后 update 才有语义
+    throw new CliExit(
+      `plugin not locked: ${alias} ("plugin install ${alias}" installs the latest and locks it)`,
+      2,
+    );
+  }
   const latestV = latest ?? (await latestVersion(rec.package, fetchImpl));
   if (latestV === rec.version) {
     return { pkg: rec.package, version: rec.version, upToDate: true, latest: latestV };

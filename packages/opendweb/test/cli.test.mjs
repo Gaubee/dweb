@@ -585,11 +585,13 @@ test("adaptive e2e: opendweb echo hello dispatches through marketplace resolutio
   const env = await pluginProjectEnv();
   const r = await runCli(["echo", "hello", "--name", "ada", "--loud", "--times", "2"], env);
   assert.equal(r.code, 0, `stderr: ${r.err}`);
-  assert.equal(r.out, "hello ada!\nhello ada!\n");
+  // 孤儿提示（fixture 从磁盘解析、无锁定记录）是预期行为：一行 note + 命令输出
+  assert.match(r.out, /^note: echo resolved an unlocked opendweb-echo @1\.2\.3 from disk; run "plugin install echo" to lock it and stay up to date\n/);
+  assert.equal(r.out.split("\n").slice(1).join("\n"), "hello ada!\nhello ada!\n");
 
   const use = await runCli(["use", "echo", "hello", "--name", "bob"], env);
   assert.equal(use.code, 0);
-  assert.equal(use.out, "hello bob\n");
+  assert.equal(use.out.split("\n").slice(1).join("\n"), "hello bob\n");
 });
 
 test("adaptive e2e: not-installed plugin prints install guidance (DWEB_NO_AUTO_INSTALL), exit non-zero", async () => {

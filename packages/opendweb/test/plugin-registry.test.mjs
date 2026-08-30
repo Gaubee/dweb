@@ -218,7 +218,7 @@ test("pluginUpdate: unknown alias is a hard error; latest lookup failure surface
   const lockPath = path.join(dir, "plugins.json");
   await assert.rejects(
     pluginUpdate({ alias: "nope", lockPath, cwd: dir, existsSync: fs.existsSync, run: async () => ({ code: 0, stderr: "" }) }),
-    (e) => e instanceof CliExit && /plugin not installed: nope/.test(e.message),
+    (e) => e instanceof CliExit && /plugin not locked: nope/.test(e.message),
   );
   await saveLockfileForTest(lockPath, { cf: { package: PKG, version: "3.1.4" } });
   await assert.rejects(
