@@ -126,12 +126,14 @@ test("runInteractiveSetup: collect -> preview -> apply; runSetup receives resolv
   assert.equal(calls[0].hostname, "dweb.example.com");
   assert.equal(calls[0].mode, "dual");
   assert.equal(calls[0].dryRun, false);
-  // 计划预览进 note（标题 plan）
-  assert.equal(fk.calls.note.length, 1);
-  assert.match(fk.calls.note[0].body, /gateway\s+dweb\.example\.com/);
-  assert.match(fk.calls.note[0].body, /steps:/);
+  // note[0] 是 token 教程（2026-08-31 实测反馈），note[1] 才是计划预览
+  assert.equal(fk.calls.note.length, 2);
+  assert.match(fk.calls.note[0].body, /HTTP \+ localhost:8787/);
+  assert.match(fk.calls.note[0].body, /Create a tunnel/);
+  assert.match(fk.calls.note[1].body, /gateway\s+dweb\.example\.com/);
+  assert.match(fk.calls.note[1].body, /steps:/);
   // 结构性换行保留给 @clack 排版（不被 sanitize 成 \x0a 字面量）
-  assert.ok(fk.calls.note[0].body.includes("\n"), "note body keeps structural newlines");
+  assert.ok(fk.calls.note[1].body.includes("\n"), "note body keeps structural newlines");
   // 成功收尾
   assert.match(fk.calls.outro.join("\n"), /setup ok \(applied\)/);
   assert.match(fk.calls.log.join("\n"), /config set relay https:\/\/dweb\.example\.com/);
@@ -331,7 +333,7 @@ test("runInteractiveSetup: plan preview escapes dynamic paths but keeps layout n
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
-  const body = fk.calls.note[0].body;
+  const body = fk.calls.note[1].body; // note[0] = token 教程
   // 结构换行保留；动态路径中的 ESC 被逐项转义为 \xNN 字面量
   assert.ok(body.includes("\n"), "layout newlines survive");
   assert.ok(body.includes("\\x1b"), "control chars in dynamic values are escaped");
@@ -445,10 +447,10 @@ test("mode step: zone at the gateway itself keeps dual as the recommended mode",
   assert.equal(modeSel.initialValue, "dual");
 });
 
-test("mode step: zone lookup failure degrades to the generic recommendation", async () => {
+test("mode step: zone lookup failure falls back to the label-count heuristic", async () => {
   const fk = fakeClack([
     A.select("env"),
-    A.text("dweb.example.com"),
+    A.text("dweb.example.com"), // 3 段 -> 启发式 single 建议
     A.select("dual"),
     A.select("apply"),
   ]);
@@ -466,16 +468,16 @@ test("mode step: zone lookup failure degrades to the generic recommendation", as
   });
   assert.equal(r.exit, 0);
   const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
-  assert.equal(modeSel.options.find((o) => o.value === "dual").hint, "recommended");
-  assert.equal(modeSel.options.find((o) => o.value === "single").hint, undefined);
-  assert.equal(modeSel.initialValue, "dual");
+  assert.match(modeSel.options.find((o) => o.value === "dual").hint, /caution: relay\.dweb\.example\.com is likely a 2nd-level/);
+  assert.match(modeSel.options.find((o) => o.value === "single").hint, /recommended for dweb\.example\.com/);
+  assert.equal(modeSel.initialValue, "single");
 });
 
-test("mode step: an invalid token degrades to the generic recommendation without crashing", async () => {
+test("mode step: an invalid token falls back to the heuristic (deep hostname -> single)", async () => {
   const fk = fakeClack([
     A.select("env"),
-    A.text("dweb.example.com"),
-    A.select("dual"),
+    A.text("gaubee.tweb.xin"),
+    A.select("single"),
     A.select("apply"),
   ]);
   const { impl } = mockRunSetup();
@@ -490,5 +492,27 @@ test("mode step: an invalid token degrades to the generic recommendation without
   });
   assert.equal(r.exit, 0);
   const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
-  assert.equal(modeSel.options.find((o) => o.value === "dual").hint, "recommended");
+  assert.match(modeSel.options.find((o) => o.value === "dual").hint, /caution: relay\.gaubee\.tweb\.xin/);
+  assert.equal(modeSel.initialValue, "single");
+});
+
+// 无 fetchImpl（向导最低环境）同样走启发式：zone apex 域名 -> dual recommended
+test("mode step: no fetch wiring keeps dual recommended for a zone-apex hostname", async () => {
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("tweb.xin"), // 2 段
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const { impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: { TUNNEL_TOKEN: "t" },
+    clack: fk,
+    runSetupImpl: impl,
+  });
+  assert.equal(r.exit, 0);
+  const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
+  assert.match(modeSel.options.find((o) => o.value === "dual").hint, /recommended/);
+  assert.equal(modeSel.initialValue, "dual");
 });

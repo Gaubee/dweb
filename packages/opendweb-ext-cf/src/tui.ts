@@ -73,6 +73,27 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
   try {
     ui.intro("cf setup - interactive wizard");
 
+    // 0) 教程 note（2026-08-30 用户实测反馈：CF 网页向导的「服务」表单 URL
+    // 必填（placeholder localhost:8080），不教正确值用户会被卡住）：服务指
+    // cloudflared 把流量转发到哪——gateway 端口 8787；网页里这条路由之后
+    // 会被本工具经 API 推送的最终配置覆盖，所以填对只是省事、不填也行
+    if (!forceDryRun) {
+      ui.note(
+        [
+          "how to get a tunnel token (Cloudflare Zero Trust):",
+          "  1. Zero Trust -> Networks -> Tunnels -> Create a tunnel (connector)",
+          "  2. name it anything (e.g. opendweb)",
+          "  3. the wizard offers a public-hostname / service route:",
+          "     - you may skip that step, or",
+          "     - if the service URL form is required, enter HTTP + localhost:8787",
+          "       (the opendweb gateway port; any route you create here is later",
+          "       rewritten by this tool via the Cloudflare API)",
+          "  4. finish and copy the token shown with the connector install command",
+        ].join("\n"),
+        "token tutorial",
+      );
+    }
+
     // 1) token：dry-run 不需要（与非交互 --dry-run 的占位语义一致）
     let token = forceDryRun ? "dry-run-token" : env[tokenEnvName];
     if (!forceDryRun) {
@@ -93,12 +114,6 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
         });
       }
       if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
-      // 教程提示（2026-08-30 用户实测反馈）：CF 网页向导创建连接器时会引导
-      // 配置「服务/Public Hostname」——token 模式（remote-managed）下该步可
-      // 跳过或随意填写：apply 时经 API 推送最终 ingress，网页配置会被覆盖
-      ui.log.message(
-        "note: the connector wizard's public-hostname/service step is optional - this tool pushes the final routing via the Cloudflare API",
-      );
     }
 
     // 2) hostname：库 validate 即时重问（planExposure 的 DNS 形态校验即权威）。
@@ -124,7 +139,9 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
     // 与一级子域（*.zone）：dual 的 relay.<gateway> 相对 zone 深两级的场景
     // （如 gateway=a.b.example.com、zone=example.com）不在免费证书内，选 dual
     // 会让 relay 端 HTTPS 握手失败——此时建议 single（或 ACM/Total TLS）。
-    // 查询失败（token 无 Zone:Read 等）静默降级为通用文案，不阻塞向导。
+    // zone 查询失败（TUNNEL_TOKEN 内嵌 token 通常无 Zone:Read，实测必现）时
+    // 按段数启发式：>=3 段的 gateway 其 relay 多半是二级子域——宁可误荐
+    // single（永远可用）也不能继续无差别推荐 dual（2026-08-31 用户实测）。
     let modeHints: { dual: string; single: string; dualRecommended: boolean } | null = null;
     if (!forceDryRun && fetchImpl !== undefined && token !== undefined) {
       try {
@@ -156,7 +173,23 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
                 };
         }
       } catch {
-        // zone 不可知（权限/网络）：不做建议，保持通用选项
+        // 查询异常（网络/解码）：落入下方段数启发式
+      }
+    }
+    if (modeHints === null && !forceDryRun) {
+      const labels = hostname.split(".").filter(Boolean).length;
+      if (labels >= 3) {
+        modeHints = {
+          dual: `caution: relay.${hostname} is likely a 2nd-level subdomain (beyond the free Universal SSL cert; needs ACM/Total TLS unless your zone is itself multi-label)`,
+          single: `recommended for ${hostname} - stays on one hostname covered by the free Universal SSL cert (zone depth could not be confirmed)`,
+          dualRecommended: false,
+        };
+      } else {
+        modeHints = {
+          dual: "recommended - relay.<gateway> is a first-level subdomain of your zone, covered by the free Universal SSL cert",
+          single: "one hostname, /relay and /ping path routing",
+          dualRecommended: true,
+        };
       }
     }
     const dualHint = modeHints === null ? "recommended" : modeHints.dual;
