@@ -44,9 +44,11 @@ let tunnelPending: StartupState | null = null; // 已 spawn 但仍在健康窗�
 let tunnelChild: ActiveTunnel | null = null; // 当前活跃记录 { child, watchdog }，供 preStop 摘除本 child 的观察器
 let tunnelStopAll: Promise<void> | null = null; // 进行中的全程停止 Promise（并发 preStop 共享，R6-Major）
 
-/** 退出标签（exit 快照优先 code，其次 signal），watchdog 与悬挂清理共用 */
+/** 退出标签（区分正常退出码与信号终止），watchdog 与悬挂清理共用 */
 function exitLabelOf(child: ChildProcess): string {
-  return `code ${child.exitCode ?? child.signalCode}`;
+  if (child.exitCode !== null) return `code ${child.exitCode}`;
+  if (child.signalCode !== null) return `signal ${child.signalCode}`;
+  return "code unknown";
 }
 
 /**
