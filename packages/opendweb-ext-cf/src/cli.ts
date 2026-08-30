@@ -137,6 +137,7 @@ export default {
       }
       await runSetup({
         token: token ?? "dry-run-token",
+        ...(str(args, "api-token") !== undefined ? { apiToken: str(args, "api-token") } : {}),
         hostname,
         mode,
         cwd,

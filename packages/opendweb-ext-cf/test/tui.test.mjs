@@ -121,7 +121,7 @@ test("runInteractiveSetup: collect -> preview -> apply; runSetup receives resolv
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "env-token" },
+    env: { TUNNEL_TOKEN: "env-token", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
   });
@@ -154,7 +154,7 @@ test("runInteractiveSetup: empty hostname falls back to the suggested default va
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     suggestedHostname: "suggested.example.com",
     clack: fk,
     runSetupImpl: impl,
@@ -175,7 +175,7 @@ test("runInteractiveSetup: abort keeps exit 0 and never runs setup", async () =>
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
   });
@@ -191,7 +191,7 @@ test("runInteractiveSetup: clack cancel (Ctrl+C) maps to abort semantics", async
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
   });
@@ -210,7 +210,7 @@ test("runInteractiveSetup: dry choice runs the same flow as dry-run", async () =
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
   });
@@ -271,6 +271,7 @@ const RAW_TOKEN = `eyJ${"A1b2c3D4e5".repeat(18)}`;
 test("runInteractiveSetup: a pasted bare token passes validation and echoes a head/tail summary", async () => {
   const fk = fakeClack([
     A.password(`  ${RAW_TOKEN}  `), // 前后空白自动 trim
+    A.password("unit-test-api-token-0123456789abcdef0123456789"),
     A.text("dweb.example.com"),
     A.select("dual"),
     A.select("apply"),
@@ -287,6 +288,7 @@ test("runInteractiveSetup: a pasted bare token passes validation and echoes a he
 test("runInteractiveSetup: pasting the full install command extracts the token (2026-08-31 Owner)", async () => {
   const fk = fakeClack([
     A.password(`sudo cloudflared service install ${RAW_TOKEN}`),
+    A.password("unit-test-api-token-0123456789abcdef0123456789"),
     A.text("dweb.example.com"),
     A.select("dual"),
     A.select("apply"),
@@ -302,6 +304,7 @@ test("runInteractiveSetup: non-token input is re-asked with an explanation", asy
     A.password("sudo cloudflared service install"), // 无 token：拒
     A.password("hello"),                             // 非 eyJ 形态：拒
     A.password(RAW_TOKEN),                           // 合法：过
+    A.password("unit-test-api-token-0123456789abcdef0123456789"),
     A.text("dweb.example.com"),
     A.select("dual"),
     A.select("apply"),
@@ -310,8 +313,9 @@ test("runInteractiveSetup: non-token input is re-asked with an explanation", asy
   const r = await runInteractiveSetup({ cwd: "/proj", env: {}, clack: fk, runSetupImpl: impl });
   assert.equal(r.exit, 0);
   assert.equal(calls[0].token, RAW_TOKEN);
-  // validate 的两次拒绝确实发生（fake 的重问循环消耗了 3 个 password 应答）
-  assert.equal(fk.calls.password.length, 1, "one prompt instance, re-asked in place");
+  // validate 的两次拒绝确实发生（fake 的重问循环原地消耗应答）；
+  // 两个 password 实例 = token 收集 + apiToken 收集
+  assert.equal(fk.calls.password.length, 2, "token + api-token prompt instances");
 });
 
 test("runInteractiveSetup: invalid hostname is re-asked until it validates", async () => {
@@ -326,7 +330,7 @@ test("runInteractiveSetup: invalid hostname is re-asked until it validates", asy
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
   });
@@ -344,7 +348,7 @@ test("runInteractiveSetup: failures rethrow for dispatcher normalization (P1-2)"
   await assert.rejects(
     () => runInteractiveSetup({
       cwd: "/proj",
-      env: { TUNNEL_TOKEN: "t" },
+      env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
       clack: fk,
       runSetupImpl: async () => {
         throw new Error("boom from cloudflare api");
@@ -364,7 +368,7 @@ test("runInteractiveSetup: plan preview escapes dynamic paths but keeps layout n
   const { impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/pr\x1boj", // 控制字符进 cwd（targetConfig 的动态源）
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
   });
@@ -390,7 +394,7 @@ test("runInteractiveSetup: verifyProgress drives the spinner; log lines stop it"
   };
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: async (input) => {
       input.verifyProgress({ elapsedMs: 1000, lastError: "HTTP 526" });
@@ -436,7 +440,7 @@ test("mode step: zone lookup recommends single when relay.<gateway> is beyond th
   const fetches = [];
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: ZONE_TOKEN },
+    env: { TUNNEL_TOKEN: ZONE_TOKEN, CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
     fetchImpl: async (url) => {
@@ -469,7 +473,7 @@ test("mode step: zone at the gateway itself keeps dual as the recommended mode",
   const { impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: ZONE_TOKEN },
+    env: { TUNNEL_TOKEN: ZONE_TOKEN, CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
     fetchImpl: async () => new Response(JSON.stringify({ result: [{ id: "zone1" }] }), { status: 200 }),
@@ -493,7 +497,7 @@ test("mode step: zone lookup failure falls back to the label-count heuristic", a
   const { calls } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: ZONE_TOKEN },
+    env: { TUNNEL_TOKEN: ZONE_TOKEN, CF_API_TOKEN: "unit-test-api-token" },
     suggestedMode: "dual",
     clack: fk,
     runSetupImpl: async (input) => {
@@ -519,7 +523,7 @@ test("mode step: an invalid token falls back to the heuristic (deep hostname -> 
   const { impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "not-a-jwt-shape" },
+    env: { TUNNEL_TOKEN: "not-a-jwt-shape", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
     fetchImpl: async () => {
@@ -543,7 +547,7 @@ test("mode step: no fetch wiring keeps dual recommended for a zone-apex hostname
   const { impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
+    env: { TUNNEL_TOKEN: "t", CF_API_TOKEN: "unit-test-api-token" },
     clack: fk,
     runSetupImpl: impl,
   });

@@ -142,7 +142,15 @@ export async function verifyExposure({
 }
 
 export interface RunSetupOptions {
+  /** TUNNEL_TOKEN：连接器 token（解码出 account/tunnel id；运行 cloudflared 用） */
   token: string;
+  /**
+   * 管理 API token（CF_API_TOKEN，2026-08-31 实测 401 修正）：connector
+   * token 无 REST API 权限——PUT configurations / DNS 记录需要独立创建的
+   * API Token（Account/Cloudflare Tunnel/Edit + Zone/DNS/Edit）。缺省回落
+   * 环境变量 CF_API_TOKEN；dry-run 不需要。
+   */
+  apiToken?: string | undefined;
   hostname: string;
   mode?: ExposureMode;
   cwd: string;
@@ -165,6 +173,7 @@ export interface RunSetupOptions {
 export async function runSetup(input: RunSetupOptions): Promise<{ plan: ExposurePlan }> {
   const {
     token,
+    apiToken,
     hostname,
     mode = "dual",
     cwd,
@@ -179,6 +188,16 @@ export async function runSetup(input: RunSetupOptions): Promise<{ plan: Exposure
     verifyProgress,
   } = input;
   const plan = planExposure({ hostname, mode });
+  // 管理 token：connector token（TUNNEL_TOKEN）无 REST 权限，API 推送必须
+  // 用独立创建的 API Token；缺失时给出可照做的创建指引
+  const managementToken = apiToken ?? process.env.CF_API_TOKEN ?? "";
+  if (!dryRun && managementToken === "") {
+    throw new Error(
+      "missing CF_API_TOKEN: create one at dash.cloudflare.com -> My Profile -> API Tokens -> Create Token " +
+        "(Custom Token: Account / Cloudflare Tunnel / Edit, plus Zone / DNS / Edit for your zone), " +
+        "then export CF_API_TOKEN or pass --api-token",
+    );
+  }
   // dry-run 容忍不可解码 token（占位符）：dry-run 的意义是零前置条件预览
   let creds;
   if (dryRun) {
@@ -209,13 +228,15 @@ export async function runSetup(input: RunSetupOptions): Promise<{ plan: Exposure
     return { plan };
   }
 
-  await pushIngress({ fetchImpl, ...creds, ingress });
+  await pushIngress({ fetchImpl, accountTag: creds.accountTag, tunnelId: creds.tunnelId, apiToken: managementToken, ingress });
   log(`ingress pushed (${ingress.ingress.length} rules)`);
 
   try {
     await routeDns({
       fetchImpl,
-      ...creds,
+      accountTag: creds.accountTag,
+      tunnelId: creds.tunnelId,
+      apiToken: managementToken,
       hostnames: plan.mode === "single" ? [plan.gatewayHost] : [plan.relayHost, plan.gatewayHost],
     });
     log(`dns routed (CNAME -> ${creds.tunnelId}.cfargotunnel.com)`);

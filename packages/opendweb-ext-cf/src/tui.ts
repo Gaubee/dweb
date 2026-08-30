@@ -89,6 +89,11 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
           "       (the opendweb gateway port; any route you create here is later",
           "       rewritten by this tool via the Cloudflare API)",
           "  4. finish and copy the token shown with the connector install command",
+          "",
+          "also create a management API token (needed to push routing via API;",
+          "the connector token above cannot call the API):",
+          "  dash.cloudflare.com -> My Profile -> API Tokens -> Create Token -> Custom:",
+          "  Account / Cloudflare Tunnel / Edit  +  Zone / DNS / Edit (your zone)",
         ].join("\n"),
         "token tutorial",
       );
@@ -114,6 +119,7 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
       return extracted;
     };
     let token = forceDryRun ? "dry-run-token" : env[tokenEnvName];
+    let apiToken: string | undefined;
     if (!forceDryRun) {
       if (token) {
         const choice = await ui.select({
@@ -132,6 +138,25 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
         );
       }
       if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
+
+      // 1b) 管理 API token：connector token 无 REST 权限（PUT configurations
+      // 实测 401）——apply 必须有独立 API Token；dry-run 不需要
+      const envApiToken = env.CF_API_TOKEN;
+      if (envApiToken && envApiToken.trim() !== "") {
+        apiToken = envApiToken.trim();
+        ui.log.message(`api token: ${tokenSummary(apiToken)} (CF_API_TOKEN)`);
+      } else {
+        apiToken = (await ui.password({
+          message: "management API token (CF_API_TOKEN; create at My Profile -> API Tokens - Tunnel Edit + DNS Edit)",
+          validate: (v) => {
+            if (v === undefined || v.trim().length < 40) {
+              return "paste the API token (the long string shown once at creation, >=40 chars)";
+            }
+            return undefined;
+          },
+        })).trim();
+        ui.log.message(`api token: ${tokenSummary(apiToken)}`);
+      }
     }
 
     // 2) hostname：库 validate 即时重问（planExposure 的 DNS 形态校验即权威）。
@@ -279,6 +304,7 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
     if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
     const result = await runSetupImpl({
       token,
+      ...(apiToken !== undefined ? { apiToken } : {}),
       hostname,
       mode,
       cwd,

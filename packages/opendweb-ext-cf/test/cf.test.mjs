@@ -64,6 +64,53 @@ test("pushIngress: PUT configurations; API error surfaces code+message", async (
   );
 });
 
+// 2026-08-31 线上 401 修正：connector token（TUNNEL_TOKEN 的 s 字段）无 REST
+// 权限——runSetup 推送必须用独立管理 token；缺失时报可照做的创建指引
+test("runSetup: apply without a management API token fails with creation guidance (401 fix)", async () => {
+  const prev = process.env.CF_API_TOKEN;
+  delete process.env.CF_API_TOKEN;
+  try {
+    await assert.rejects(
+      () =>
+        runSetup({
+          token: TOKEN,
+          apiToken: undefined,
+          hostname: "dweb.example.com",
+          cwd: "/tmp",
+          skipVerify: true,
+          exists: () => false,
+          writeFile: async () => {},
+          fetchImpl: async () => {
+            throw new Error("fetch must not be reached without a management token");
+          },
+          log: () => {},
+        }),
+      /missing CF_API_TOKEN.*API Tokens.*Tunnel \/ Edit.*DNS \/ Edit/s,
+    );
+    // 显式 apiToken 时 Authorization 头用它（不是 connector 的 s 字段）
+    const seen = [];
+    await runSetup({
+      token: TOKEN,
+      apiToken: "mgmt-token",
+      hostname: "dweb.example.com",
+      cwd: "/tmp",
+      skipVerify: true,
+      exists: () => false,
+      writeFile: async () => {},
+      fetchImpl: async (url, init) => {
+        seen.push({ url: String(url), auth: init?.headers?.Authorization });
+        if (String(url).includes("/zones?")) return new Response(JSON.stringify({ result: [{ id: "z1" }] }), { status: 200 });
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      },
+      log: () => {},
+    });
+    assert.ok(seen.every((r) => r.auth === "Bearer mgmt-token"), `all API calls use the management token: ${JSON.stringify(seen)}`);
+    assert.ok(seen.some((r) => r.url.includes("/configurations")), "ingress push happened");
+  } finally {
+    if (prev !== undefined) process.env.CF_API_TOKEN = prev;
+  }
+});
+
 test("routeDns: idempotent on existing record (81057); zone failure prints manual CNAME path", async () => {
   const zoneFetch = async (url) =>
     new Response(JSON.stringify({ result: [{ id: "zone1" }] }), { status: 200 });
@@ -222,6 +269,7 @@ test("runSetup: existing config gets a complete merge fragment ([[plugins]] entr
   const logs = [];
   await runSetup({
     token: TOKEN,
+    apiToken: "unit-test-api-token",
     hostname: "dweb.example.com",
     cwd,
     skipVerify: true,
@@ -251,6 +299,7 @@ test("runSetup: explicit configPath targets the chosen file, not cwd default (R2
   await fsp.mkdir(path.dirname(target), { recursive: true });
   await runSetup({
     token: TOKEN,
+    apiToken: "unit-test-api-token",
     hostname: "dweb.example.com",
     cwd,
     configPath: target,
@@ -271,6 +320,7 @@ test("runSetup: explicit configPath targets the chosen file, not cwd default (R2
   const logs = [];
   await runSetup({
     token: TOKEN,
+    apiToken: "unit-test-api-token",
     hostname: "dweb.example.com",
     cwd,
     configPath: target,

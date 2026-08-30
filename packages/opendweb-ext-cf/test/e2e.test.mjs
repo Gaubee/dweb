@@ -42,7 +42,13 @@ async function driveWizard(child, steps, outSoFar) {
       if (Date.now() > deadline) throw new Error(`wizard step not rendered: ${step.expect}`);
       await new Promise((r) => setTimeout(r, 100));
     }
-    child.stdin.write(step.send);
+    // prompt 建立窗口（上一应答提交 -> 下一个 prompt 挂起）内整串写入会丢
+    // 首字符（@clack 已知行为）：稍候后逐字符慢发，保证 keypress 逐个入列
+    await new Promise((r) => setTimeout(r, 150));
+    for (const ch of step.send) {
+      child.stdin.write(ch);
+      await new Promise((r) => setTimeout(r, 5));
+    }
   }
   child.stdin.end();
 }
@@ -154,6 +160,7 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
   const driven = driveWizard(child, [
     // validate 只放行 eyJ 形态（2026-08-31 粘贴宽容度）——用合法形态驱动
     { expect: /tunnel token/, send: `eyJ${"A1b2c3D4e5".repeat(18)}\r` },
+    { expect: /management API token/, send: "e2e-api-token-0123456789abcdef0123456789\r" },
     { expect: /gateway hostname/, send: "dweb.example.com\r" },
     { expect: /routing mode/, send: "\r" },
     { expect: /apply this plan/, send: "\x1b[B\r" },
@@ -251,6 +258,7 @@ test("cf setup --interactive: TOML config prefills tokenEnv/hostname/mode (flag 
   // -> action select 下移到 dry-run
   const driven = driveWizard(child, [
     { expect: /detected CUSTOM_TOK_ENV/, send: "\r" },
+    { expect: /management API token/, send: "e2e-api-token-0123456789abcdef0123456789\r" },
     { expect: /gateway hostname/, send: "\r" },
     { expect: /routing mode/, send: "\r" },
     { expect: /apply this plan/, send: "\x1b[B\r" },
@@ -287,6 +295,7 @@ test("cf setup --interactive: JSON config prefill loses to explicit flags", asyn
   child.stderr.on("data", (d) => (err += d));
   const driven = driveWizard(child, [
     { expect: /detected TUNNEL_TOKEN/, send: "\r" }, // flag 覆盖 JSON_TOK_ENV
+    { expect: /management API token/, send: "e2e-api-token-0123456789abcdef0123456789\r" },
     { expect: /gateway hostname/, send: "\r" },      // flag hostname 为默认值
     { expect: /routing mode/, send: "\r" },          // flag dual 覆盖 config single
     { expect: /apply this plan/, send: "\x1b[B\r" },
