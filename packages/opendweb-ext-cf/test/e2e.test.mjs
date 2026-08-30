@@ -26,6 +26,29 @@ async function env() {
   return { dir, home };
 }
 
+/**
+ * 有界等待子进程退出（P1-3 的 watchdog，R2 收尾：正常退出即 clearTimeout，
+ * 超时 timer 亦 unref——不留 30s 残留 timer 拖住测试进程）。
+ * @returns {Promise<number | "timeout">}
+ */
+function exitWithDeadline(child, ms = 30000) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve("timeout");
+    }, ms);
+    timer.unref();
+  });
+  return Promise.race([
+    new Promise((resolve) => child.on("exit", (c) => {
+      clearTimeout(timer);
+      resolve(c ?? 0);
+    })),
+    timeout,
+  ]);
+}
+
 function runCli(args, { dir, home }) {
   return new Promise((resolve) => {
     const child = spawn(NODE, [CLI, ...args], {
@@ -112,13 +135,7 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
   // P1-3：有界等待——挂起时 kill 子进程并带已采集输出失败（不留僵尸门禁）
-  const code = await Promise.race([
-    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
-    new Promise((resolve) => setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve("timeout");
-    }, 30000)),
-  ]);
+  const code = await exitWithDeadline(child);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}\nstderr: ${err}`);
   assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /interactive wizard/);
@@ -152,13 +169,7 @@ test("cf setup --interactive --dry-run: y still runs dry-run only; unicode cwd s
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
-  const code = await Promise.race([
-    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
-    new Promise((resolve) => setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve("timeout");
-    }, 30000)),
-  ]);
+  const code = await exitWithDeadline(child);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
   assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /dry-run\? \(nothing will be pushed\)/);
@@ -212,10 +223,7 @@ test("cf setup --interactive: TOML config prefills tokenEnv/hostname/mode (flag 
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
-  const code = await Promise.race([
-    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
-    new Promise((resolve) => setTimeout(() => { child.kill("SIGKILL"); resolve("timeout"); }, 30000)),
-  ]);
+  const code = await exitWithDeadline(child);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
   assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /detected CUSTOM_TOK_ENV in the environment/); // tokenEnv 预填
@@ -249,10 +257,7 @@ test("cf setup --interactive: JSON config prefill loses to explicit flags", asyn
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
-  const code = await Promise.race([
-    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
-    new Promise((resolve) => setTimeout(() => { child.kill("SIGKILL"); resolve("timeout"); }, 30000)),
-  ]);
+  const code = await exitWithDeadline(child);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
   assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /detected TUNNEL_TOKEN in the environment/);
