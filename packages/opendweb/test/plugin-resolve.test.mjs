@@ -239,3 +239,40 @@ test("PluginManifestSchema.safeParse catches missing commands / bad name shape",
   assert.equal(PluginManifestSchema.safeParse({ name: "x", apiVersion: 1, commands: [], run: () => {} }).success, false);
   assert.equal(PluginManifestSchema.safeParse({ name: "Bad_Name", apiVersion: 1, commands: [{ name: "c" }], run: () => {} }).success, false);
 });
+
+// 2026-08-30 alias 体系：plugins.json 的 alias -> package 记录是信任锚——
+// 自定义 alias（manifest.name != alias）必须经 lockResolved 解析成功，
+// 且该信任路径不得放宽 glob 寻址路径的 name 一致性校验。
+test("resolveAdaptive: a locked alias resolves its package without the manifest-name match; glob path keeps it strict", async () => {
+  const fakeEntry = "/nowhere/pkg/entry.mjs";
+  const manifest = {
+    default: {
+      name: "cf",
+      apiVersion: 1,
+      commands: [{ name: "setup", description: "d", args: { type: "object", properties: {}, required: [] } }],
+      run: async () => ({ exit: 0 }),
+    },
+  };
+  const imported = async () => manifest;
+  // lock 信任路径：manifest.name("cf") != 调用名("mycf") 仍解析成功
+  const viaLock = await resolveAdaptive({
+    name: "mycf",
+    globs: ["npm:@jixo/opendweb-ext-*"],
+    cwd: "/proj",
+    lockResolved: "@jixo/opendweb-ext-cf",
+    importModule: imported,
+    resolveEntry: (pkg) => (pkg === "@jixo/opendweb-ext-cf" ? fakeEntry : null),
+  });
+  assert.equal(viaLock.pkg, "@jixo/opendweb-ext-cf");
+  // glob 寻址路径：manifest.name 与调用名不一致仍是硬错误（防名字劫持）
+  await assert.rejects(
+    resolveAdaptive({
+      name: "mycf",
+      globs: ["npm:@jixo/opendweb-ext-*"],
+      cwd: "/proj",
+      importModule: imported,
+      resolveEntry: () => fakeEntry,
+    }),
+    /declares name "cf" but was invoked as "mycf"/,
+  );
+});

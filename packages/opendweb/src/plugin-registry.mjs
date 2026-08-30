@@ -134,14 +134,20 @@ export function readInstalledVersion(pkg, cwd) {
 }
 
 /**
- * `opendweb plugin add|get <name>`：解析首个候选 → 包管理器安装 → 读取真实
- * 版本 → 锁定。任一步失败 → 非零退出（不写锁定）。
- * @param {{ name: string, globs: string[], cwd: string, lockPath: string, existsSync: (p: string) => boolean, run: (cmd: string, args: string[], opts: object) => Promise<{ code: number, stderr: string }> }} input
- * @returns {Promise<{ pkg: string, version: string }>}
+ * `opendweb plugin add|install [alias] [--name <pkg>] [--alias <alias>] [--force]`：
+ * 寻址（alias -> 首个 marketplace 候选；--name 显式包名则直用，alias 默认取
+ * 包全名）→ 包管理器安装 → 读取真实版本 → 以 alias 为键锁定。任一步失败 →
+ * 非零退出（不写锁定）。非 --force 且 alias 已锁定 → skipped 提示（幂等）。
+ * @param {{ alias: string, pkgName?: string, globs: string[], cwd: string, lockPath: string, existsSync: (p: string) => boolean, run: (cmd: string, args: string[], opts: object) => Promise<{ code: number, stderr: string }>, force?: boolean }} input
+ * @returns {Promise<{ pkg: string, version: string, skipped?: boolean }>}
  */
-export async function pluginAdd({ name, globs, cwd, lockPath, existsSync, run }) {
-  const candidate = candidatesFor(globs, name)[0];
-  if (!candidate) throw new CliExit(`no marketplace glob resolves "${name}"`, 2);
+export async function pluginAdd({ alias, pkgName, globs, cwd, lockPath, existsSync, run, force = false }) {
+  const candidate = pkgName ?? candidatesFor(globs, alias)[0];
+  if (!candidate) throw new CliExit(`no marketplace glob resolves "${alias}"`, 2);
+  const records = await loadLockfile(lockPath);
+  if (!force && records[alias]) {
+    return { pkg: records[alias].package, version: records[alias].version, skipped: true };
+  }
   const pm = detectPackageManager(cwd, existsSync);
   const [cmd, args] = installCommand(pm, candidate);
   const res = await run(cmd, args, { cwd });
@@ -154,8 +160,7 @@ export async function pluginAdd({ name, globs, cwd, lockPath, existsSync, run })
   } catch {
     throw new CliExit(`plugin installed but its package.json is unreadable (${candidate})`, 1);
   }
-  const records = await loadLockfile(lockPath);
-  records[name] = { package: candidate, version };
+  records[alias] = { package: candidate, version };
   await saveLockfile(lockPath, records);
   return { pkg: candidate, version };
 }
@@ -179,8 +184,71 @@ export async function pluginRemove({ name, cwd, lockPath, existsSync, run }) {
   return { pkg: rec.package };
 }
 
-/** `opendweb plugin list` */
-export async function pluginList(lockPath) {
+/**
+ * `opendweb plugin list [--full]`：alias -> { package, version, path }
+ * （path 需传 cwd 解析，未装/不可解析为 null）
+ * @param {string} lockPath
+ * @param {{ cwd?: string }} [opts]
+ */
+export async function pluginList(lockPath, opts = {}) {
+  const cwd = opts.cwd;
   const records = await loadLockfile(lockPath);
-  return Object.entries(records).map(([name, rec]) => ({ name, ...rec }));
+  return Object.entries(records).map(([alias, rec]) => ({
+    alias,
+    package: rec.package,
+    version: rec.version,
+    path: cwd === undefined ? null : installedPath(rec.package, cwd),
+  }));
+}
+
+/** 已装插件的包根 package.json 路径（不可解析返回 null，不抛错） */
+function installedPath(pkg, cwd) {
+  try {
+    return readInstalledVersion(pkg, cwd).path;
+  } catch {
+    return null;
+  }
+}
+
+/** npm registry 的 dist-tags latest（HTTP 元数据直读，不依赖包管理器 CLI） */
+export async function latestVersion(pkg, fetchImpl = fetch) {
+  const res = await fetchImpl(`https://registry.npmjs.org/${pkg}/latest`);
+  if (!res.ok) throw new CliExit(`registry lookup failed for ${pkg} (HTTP ${res.status})`, 1);
+  const body = await res.json();
+  if (typeof body?.version !== "string") {
+    throw new CliExit(`registry metadata for ${pkg} has no version`, 1);
+  }
+  return body.version;
+}
+
+/**
+ * `opendweb plugin update <alias>`：registry 最新版 → 包管理器安装 pkg@latest
+ * → 重读实际版本 → 更新锁定。已是最新 → upToDate（不动 lock）。
+ * latest 可由批量流程预查传入（省一次 registry 往返）。
+ * @param {{ alias: string, lockPath: string, cwd: string, existsSync: (p: string) => boolean, run: (cmd: string, args: string[], opts: object) => Promise<{ code: number, stderr: string }>, fetchImpl?: typeof fetch, latest?: string }} input
+ * @returns {Promise<{ pkg: string, version: string, upToDate: boolean, latest: string }>}
+ */
+export async function pluginUpdate({ alias, lockPath, cwd, existsSync, run, fetchImpl = fetch, latest }) {
+  const records = await loadLockfile(lockPath);
+  const rec = records[alias];
+  if (!rec) throw new CliExit(`plugin not installed: ${alias}`, 2);
+  const latestV = latest ?? (await latestVersion(rec.package, fetchImpl));
+  if (latestV === rec.version) {
+    return { pkg: rec.package, version: rec.version, upToDate: true, latest: latestV };
+  }
+  const pm = detectPackageManager(cwd, existsSync);
+  const [cmd, args] = installCommand(pm, `${rec.package}@${latestV}`);
+  const res = await run(cmd, args, { cwd });
+  if (res.code !== 0) {
+    throw new CliExit(`plugin update failed (${cmd} ${args.join(" ")}):\n${asciiEscape(res.stderr)}`, 1);
+  }
+  let version;
+  try {
+    version = readInstalledVersion(rec.package, cwd).version;
+  } catch {
+    throw new CliExit(`plugin updated but its package.json is unreadable (${rec.package})`, 1);
+  }
+  records[alias] = { package: rec.package, version };
+  await saveLockfile(lockPath, records);
+  return { pkg: rec.package, version, upToDate: false, latest: latestV };
 }

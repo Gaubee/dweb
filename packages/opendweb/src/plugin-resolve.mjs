@@ -260,7 +260,10 @@ function existingFile(candidate) {
 
 /**
  * 自适应解析：返回首个可加载且契约合规的插件。
- * @param {{ name: string, globs: string[], cwd: string, importModule?: (url: string) => Promise<unknown>, resolveEntry?: typeof resolvePluginEntry }} input
+ * lockResolved（plugins.json 的 alias -> package 记录）非空时候选只有该包，
+ * 且跳过 manifest.name === name 校验——信任锚由 plugin add 时的显式锁定建立
+ * （--name/--alias 安装的 manifest.name 是包的注册名，不必等于自定义 alias）。
+ * @param {{ name: string, globs: string[], cwd: string, lockResolved?: string | null, importModule?: (url: string) => Promise<unknown>, resolveEntry?: typeof resolvePluginEntry }} input
  * @returns {Promise<{ pkg: string, manifest: import("zod").infer<typeof PluginManifestSchema>, entryUrl: string }>}
  * @throws {Error} 全部不可解析（message 含安装指引）或加载后硬失败
  */
@@ -268,10 +271,12 @@ export async function resolveAdaptive({
   name,
   globs,
   cwd,
+  lockResolved = null,
   importModule = (url) => import(url),
   resolveEntry = resolvePluginEntry,
 }) {
-  for (const pkg of candidatesFor(globs, name)) {
+  const candidates = lockResolved !== null ? [lockResolved] : candidatesFor(globs, name);
+  for (const pkg of candidates) {
     const entry = resolveEntry(pkg, cwd);
     if (entry === null) {
       continue;
@@ -289,7 +294,8 @@ export async function resolveAdaptive({
       );
     }
     // R2 其他项：清单 name 必须与子命令名一致——否则装错包/名字劫持会静默成功
-    if (parsed.data.name !== name) {
+    // （lockResolved 信任路径除外，见函数头注）
+    if (lockResolved === null && parsed.data.name !== name) {
       throw new Error(
         `plugin package ${pkg} declares name "${parsed.data.name}" but was invoked as "${name}"`,
       );

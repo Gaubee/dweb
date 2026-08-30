@@ -19,7 +19,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadMarketplace, marketplaceAdd, marketplaceRemove } from "../src/marketplace.mjs";
 import { resolveAdaptive, wantsPluginHelp, PluginNotResolved } from "../src/plugin-resolve.mjs";
 import { dispatchPluginCommand, renderPluginHelp } from "../src/plugin-contract.mjs";
-import { pluginAdd, pluginRemove, pluginList } from "../src/plugin-registry.mjs";
+import { pluginAdd, pluginRemove, pluginList, pluginUpdate, latestVersion, loadLockfile } from "../src/plugin-registry.mjs";
 import { discoverConfig, loadConfigFile } from "../src/config-file.mjs";
 import { loadDeclaredPlugins, fireHook } from "../src/plugin-runtime.mjs";
 import { CliExit, asciiEscape } from "../src/util.mjs";
@@ -552,46 +552,177 @@ async function runMarketplace(rest) {
   throw new CliExit(`unknown marketplace subcommand: ${sub} (add | list | remove)`, 2);
 }
 
+/**
+ * plugin 子命令的 flag/位置参数解析：--name=<v> 与 --name <v> 两种形态，
+ * 未知 --flag 硬错误（防静默忽略）。
+ * @param {string[]} rest
+ * @returns {{ args: string[], name?: string, alias?: string, force: boolean, full: boolean }}
+ */
+function parsePluginFlags(rest) {
+  const out = { args: [], force: false, full: false };
+  for (let i = 0; i < rest.length; i += 1) {
+    const t = rest[i];
+    const eq = t.match(/^--(name|alias|force|full)(?:=(.*))?$/);
+    if (!eq) {
+      if (t.startsWith("--")) throw new CliExit(`unknown plugin flag: ${t}`, 2);
+      out.args.push(t);
+      continue;
+    }
+    const [, key, inline] = eq;
+    if (key === "force") {
+      if (inline !== undefined) throw new CliExit("--force takes no value", 2);
+      out.force = true;
+    } else if (key === "full") {
+      if (inline !== undefined) throw new CliExit("--full takes no value", 2);
+      out.full = true;
+    } else {
+      let value = inline;
+      if (value === undefined) {
+        value = rest[i + 1];
+        if (value === undefined) throw new CliExit(`--${key} requires a value`, 2);
+        i += 1;
+      }
+      if (value === "") throw new CliExit(`--${key} must not be empty`, 2);
+      out[key === "name" ? "name" : "alias"] = value;
+    }
+  }
+  return out;
+}
+
 async function runPlugin(rest) {
-  const [sub, name] = rest;
+  const [sub, ...restAfterSub] = rest;
   const fsp = await import("node:fs/promises");
   const lockPath = path.join(dwebHome(), "plugins.json");
   await fsp.mkdir(dwebHome(), { recursive: true });
+  const ctx = {
+    cwd: process.cwd(),
+    lockPath,
+    existsSync: (p) => fs.existsSync(p),
+    run: spawnInherit,
+  };
   if (sub === "list" || sub === undefined) {
+    const { full, args } = parsePluginFlags(restAfterSub);
+    if (args.length > 0) throw new CliExit("usage: opendweb plugin list [--full]", 2);
+    const records = await pluginList(lockPath, { cwd: ctx.cwd });
+    if (records.length === 0) {
+      console.log("(no plugins installed)");
+      return 0;
+    }
+    const aliasW = Math.max(...records.map((r) => r.alias.length), "ALIAS".length);
+    const pkgW = Math.max(...records.map((r) => r.package.length), "PACKAGE".length);
+    const verW = Math.max(...records.map((r) => r.version.length), "VERSION".length);
+    const row = (alias, pkg, ver, p) =>
+      `  ${alias.padEnd(aliasW)}  ${pkg.padEnd(pkgW)}  ${ver.padEnd(verW)}${full ? `  ${p ?? "(not resolvable)"}` : ""}`;
+    console.log(row("ALIAS", "PACKAGE", "VERSION", full ? "PATH" : null));
+    for (const r of records) console.log(row(r.alias, r.package, r.version, r.path));
+    return 0;
+  }
+  if (sub === "add" || sub === "install" || sub === "get") {
+    const flags = parsePluginFlags(restAfterSub);
+    if (flags.args.length > 1) {
+      throw new CliExit("usage: opendweb plugin add|install [alias] [--name <pkg>] [--alias <alias>] [--force]", 2);
+    }
+    const [positional] = flags.args;
+    // 位置参数与 --name 互斥：alias 寻址与显式包名是两种安装语义
+    if (positional !== undefined && flags.name !== undefined) {
+      throw new CliExit(`pass either a positional alias or --name, not both ("${positional}" and "${flags.name}")`, 2);
+    }
+    if (flags.alias !== undefined && flags.name === undefined && positional === undefined) {
+      throw new CliExit("--alias only makes sense together with --name (or a positional alias)", 2);
+    }
+    // --name 全名安装且未自定义 alias 时，alias 取包全名（opendweb use <full-name> 调用）
+    const alias = flags.alias ?? positional ?? flags.name;
+    if (!alias) throw new CliExit("usage: opendweb plugin add|install [alias] [--name <pkg>] [--alias <alias>] [--force]", 2);
+    const { pkg, version, skipped } = await pluginAdd({
+      alias,
+      ...(flags.name !== undefined ? { pkgName: flags.name } : {}),
+      globs: await marketplaceGlobs(),
+      ...ctx,
+      force: flags.force,
+    });
+    if (skipped) {
+      console.log(`already installed: ${alias} (${pkg}@${version}); use --force to reinstall or "plugin update ${alias}" to upgrade`);
+      return 0;
+    }
+    console.log(`installed: ${alias} (${pkg}@${version})`);
+    return 0;
+  }
+  if (sub === "remove" || sub === "uninstall") {
+    const { args } = parsePluginFlags(restAfterSub);
+    const [alias] = args;
+    if (!alias) throw new CliExit("usage: opendweb plugin remove|uninstall <alias>", 2);
+    const { pkg } = await pluginRemove({ name: alias, ...ctx });
+    console.log(`removed: ${alias} (${pkg})`);
+    return 0;
+  }
+  if (sub === "update") {
+    const { args } = parsePluginFlags(restAfterSub);
+    const [aliasArg] = args;
+    if (args.length > 1) throw new CliExit("usage: opendweb plugin update [alias]", 2);
+    if (aliasArg !== undefined) {
+      const r = await pluginUpdate({ alias: aliasArg, ...ctx });
+      console.log(r.upToDate ? `up to date: ${aliasArg} (${r.pkg}@${r.version})` : `updated: ${aliasArg} (${r.pkg}@${r.version}, latest ${r.latest})`);
+      return 0;
+    }
+    // 无参：全量对照。TTY 下 multiselect 勾选批量升级；非 TTY 打印对照表
     const records = await pluginList(lockPath);
     if (records.length === 0) {
       console.log("(no plugins installed)");
       return 0;
     }
-    for (const r of records) console.log(`${r.name}  ${r.package}@${r.version}`);
-    return 0;
-  }
-  if (sub === "add" || sub === "get") {
-    if (!name) throw new CliExit("usage: opendweb plugin add|get <name>", 2);
-    const { pkg, version } = await pluginAdd({
-      name,
-      globs: await marketplaceGlobs(),
-      cwd: process.cwd(),
-      lockPath,
-      existsSync: (p) => fs.existsSync(p),
-      run: spawnInherit,
+    const statuses = [];
+    for (const r of records) {
+      let latest = null;
+      let error = null;
+      try {
+        latest = await latestVersion(r.package);
+      } catch (e) {
+        error = e instanceof CliExit ? e.message : String(e);
+      }
+      statuses.push({ ...r, latest, error });
+    }
+    const outdated = statuses.filter((s) => s.latest !== null && s.latest !== s.version);
+    for (const s of statuses.filter((x) => x.latest !== null && x.latest === x.version)) {
+      console.log(`up to date  ${s.alias} (${s.package}@${s.version})`);
+    }
+    for (const s of statuses.filter((x) => x.error !== null)) {
+      console.log(`unavailable ${s.alias} (${s.error})`);
+    }
+    if (outdated.length === 0) {
+      console.log("nothing to update");
+      return 0;
+    }
+    if (process.stdin.isTTY !== true) {
+      for (const s of outdated) console.log(`outdated    ${s.alias} ${s.version} -> ${s.latest}`);
+      console.log("non-interactive session; update individually: opendweb plugin update <alias>");
+      return 0;
+    }
+    const prompts = await import("@clack/prompts");
+    const picked = await prompts.multiselect({
+      message: "select plugins to update",
+      options: outdated.map((s) => ({
+        value: s.alias,
+        label: `${s.alias}  ${s.version} -> ${s.latest}`,
+        hint: s.package,
+      })),
+      required: false,
     });
-    console.log(`installed: ${name} (${pkg}@${version})`);
+    if (prompts.isCancel(picked)) {
+      console.log("aborted; nothing was updated");
+      return 0;
+    }
+    if (picked.length === 0) {
+      console.log("nothing selected; nothing was updated");
+      return 0;
+    }
+    for (const alias of picked) {
+      const s = statuses.find((x) => x.alias === alias);
+      const r = await pluginUpdate({ alias, ...ctx, latest: s.latest });
+      console.log(`updated: ${alias} -> ${r.version}`);
+    }
     return 0;
   }
-  if (sub === "remove") {
-    if (!name) throw new CliExit("usage: opendweb plugin remove <name>", 2);
-    const { pkg } = await pluginRemove({
-      name,
-      cwd: process.cwd(),
-      lockPath,
-      existsSync: (p) => fs.existsSync(p),
-      run: spawnInherit,
-    });
-    console.log(`removed: ${name} (${pkg})`);
-    return 0;
-  }
-  throw new CliExit(`unknown plugin subcommand: ${sub} (add | get | list | remove)`, 2);
+  throw new CliExit(`unknown plugin subcommand: ${sub} (add | install | list | remove | uninstall | update)`, 2);
 }
 
 /** `opendweb setup [--config <path>]`：按配置清单序执行全部 setup 钩子并聚合（D5） */
@@ -647,19 +778,26 @@ async function runSetup(rest) {
  */
 async function runAdaptive(name, rest) {
   const globs = await marketplaceGlobs();
+  // lock 优先：显式安装（plugin add [--name] [--alias]）建立的 alias -> package
+  // 记录是信任锚——自定义 alias（如 mycf）不在 marketplace 寻址空间内
+  const lockPath = path.join(dwebHome(), "plugins.json");
+  const lockRecords = await loadLockfile(lockPath);
+  const lockResolved = lockRecords[name]?.package ?? null;
   let resolved;
   try {
-    resolved = await resolveAdaptive({ name, globs, cwd: process.cwd() });
+    resolved = await resolveAdaptive({ name, globs, cwd: process.cwd(), lockResolved });
   } catch (e) {
     if (!(e instanceof PluginNotResolved) || process.env.DWEB_NO_AUTO_INSTALL === "1") throw e;
     const lockPath = path.join(dwebHome(), "plugins.json");
     const { pkg, version } = await pluginAdd({
-      name,
+      alias: name,
       globs,
       cwd: process.cwd(),
       lockPath,
       existsSync: (p) => fs.existsSync(p),
       run: spawnInherit,
+      // 自愈语境是「解析失败」：即使 lock 已有记录（安装损坏/文件丢失）也要重装
+      force: true,
     });
     console.log(`installed: ${name} (${pkg}@${version})`);
     // 安装成功后重试解析一次；仍失败（布局异常等）→ resolveAdaptive 硬错误
@@ -720,9 +858,24 @@ Usage:
       Manage plugin candidate globs. Default: npm:@jixo/opendweb-ext-*,
       npm:opendweb-* (declaration order = resolution order; npm: only).
 
-  opendweb plugin add|get|list|remove <name>
-      Manage plugins explicitly. add/get install into the current project
-      (detected package manager) and lock name@version in ~/.opendweb/plugins.json.
+  opendweb plugin list [--full]
+      Show installed plugins as a table (ALIAS | PACKAGE | VERSION); --full
+      adds the resolved package path.
+
+  opendweb plugin add|install [alias] [--name <pkg>] [--alias <alias>] [--force]
+      Install a plugin into the current project (detected package manager)
+      and lock alias -> package@version in ~/.opendweb/plugins.json. A
+      positional alias is resolved through the marketplace globs; --name
+      installs an explicit package name (alias defaults to the full name,
+      override with --alias). --force reinstalls over an existing lock entry.
+
+  opendweb plugin update [alias]
+      Update one plugin to the registry latest, or (no argument) compare
+      all plugins against the registry and pick interactively what to
+      upgrade (non-interactive sessions get the comparison table).
+
+  opendweb plugin remove|uninstall <alias>
+      Uninstall via the detected package manager and drop the lock entry.
 
   opendweb setup [--config <path>]
       Run the setup hook of every plugin declared in the config file, in

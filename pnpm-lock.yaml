@@ -38,6 +38,9 @@ importers:
 
   packages/opendweb:
     dependencies:
+      '@clack/prompts':
+        specifier: ^1.7.0
+        version: 1.7.0
       '@jixo/opendweb-server-binary':
         specifier: workspace:*
         version: link:../server-binary

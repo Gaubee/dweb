@@ -122,3 +122,143 @@ test("saveLockfile: creates a missing parent directory on first write (v0.3.2 re
   const loaded = await loadLockfile(lockPath);
   assert.deepEqual(loaded, { cf: { package: "@jixo/opendweb-ext-cf", version: "0.1.0" } });
 });
+
+// ---- plugin add/update/list 体系（2026-08-30 Owner 规格：alias 寻址、--name
+// 显式包名、--force 重装、skipped 幂等、registry latest 对照升级、path 解析）----
+
+/** 临时项目：顶层 package.json + fixture 包拷进 node_modules（可被 resolve） */
+async function scratchProject() {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-plug-"));
+  await fsp.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");
+  await fsp.cp(
+    path.join(FIXTURES, "@jixo", "opendweb-ext-srclayout"),
+    path.join(dir, "node_modules", "@jixo", "opendweb-ext-srclayout"),
+    { recursive: true },
+  );
+  return dir;
+}
+const PKG = "@jixo/opendweb-ext-srclayout";
+
+test("pluginAdd: already-locked alias skips (idempotent); --force reinstalls", async () => {
+  const { pluginAdd, loadLockfile } = await import("../src/plugin-registry.mjs");
+  const dir = await scratchProject();
+  const lockPath = path.join(dir, "plugins.json");
+  const runs = [];
+  const run = async (cmd, args) => { runs.push([cmd, ...args]); return { code: 0, stderr: "" }; };
+  const input = (over = {}) => ({
+    alias: "srclayout", globs: ["npm:@jixo/opendweb-ext-*"], cwd: dir, lockPath,
+    existsSync: fs.existsSync, run, ...over,
+  });
+  // 首次：glob 寻址装首个候选，lock 以 alias 为键
+  const a = await pluginAdd(input());
+  assert.equal(a.pkg, PKG);
+  assert.equal(a.version, "3.1.4");
+  assert.equal(runs.length, 1);
+  let lock = await loadLockfile(lockPath);
+  assert.deepEqual(lock.srclayout, { package: PKG, version: "3.1.4" });
+  // 重复 add 同 alias：skipped，不再安装
+  const b = await pluginAdd(input());
+  assert.equal(b.skipped, true);
+  assert.equal(runs.length, 1);
+  // --force：重装（安装命令再次出现）
+  await pluginAdd(input({ force: true }));
+  assert.equal(runs.length, 2);
+  lock = await loadLockfile(lockPath);
+  assert.deepEqual(lock.srclayout, { package: PKG, version: "3.1.4" });
+});
+
+test("pluginAdd: --name installs the explicit package and the alias keys the lock", async () => {
+  const { pluginAdd, loadLockfile } = await import("../src/plugin-registry.mjs");
+  const dir = await scratchProject();
+  const lockPath = path.join(dir, "plugins.json");
+  const runs = [];
+  const r = await pluginAdd({
+    alias: PKG, pkgName: PKG, // --name 全名安装（alias 未自定义 -> 全名）
+    globs: [], cwd: dir, lockPath,
+    existsSync: fs.existsSync,
+    run: async (cmd, args) => { runs.push([cmd, ...args]); return { code: 0, stderr: "" }; },
+  });
+  assert.equal(runs[0].includes(PKG), true, "explicit package name is installed verbatim");
+  assert.equal(r.version, "3.1.4");
+  const lock = await loadLockfile(lockPath);
+  assert.deepEqual(lock[PKG], { package: PKG, version: "3.1.4" });
+});
+
+test("pluginUpdate: registry latest refreshes the lock; same version is upToDate", async () => {
+  const { pluginUpdate, loadLockfile } = await import("../src/plugin-registry.mjs");
+  const dir = await scratchProject();
+  const lockPath = path.join(dir, "plugins.json");
+  await saveLockfileForTest(lockPath, { cf: { package: PKG, version: "3.1.4" } });
+  const runs = [];
+  const run = async (cmd, args) => { runs.push([cmd, ...args]); return { code: 0, stderr: "" }; };
+  // 已是最新：不安装
+  const same = await pluginUpdate({
+    alias: "cf", lockPath, cwd: dir, existsSync: fs.existsSync, run,
+    fetchImpl: async () => new Response(JSON.stringify({ version: "3.1.4" }), { status: 200 }),
+  });
+  assert.equal(same.upToDate, true);
+  assert.equal(runs.length, 0);
+  // 有新版：安装 pkg@latest 并以读回的实际版本刷新 lock
+  const up = await pluginUpdate({
+    alias: "cf", lockPath, cwd: dir, existsSync: fs.existsSync, run,
+    fetchImpl: async () => new Response(JSON.stringify({ version: "9.9.9" }), { status: 200 }),
+  });
+  assert.equal(up.upToDate, false);
+  assert.equal(up.latest, "9.9.9");
+  assert.ok(runs[0].join(" ").includes(`${PKG}@9.9.9`), `install pin includes @9.9.9: ${runs[0]}`);
+  // fixture 实际版本是 3.1.4——读回值以磁盘为准（lock 记录真实而非请求）
+  assert.equal(up.version, "3.1.4");
+  const lock = await loadLockfile(lockPath);
+  assert.deepEqual(lock.cf, { package: PKG, version: "3.1.4" });
+});
+
+test("pluginUpdate: unknown alias is a hard error; latest lookup failure surfaces", async () => {
+  const { pluginUpdate } = await import("../src/plugin-registry.mjs");
+  const dir = await scratchProject();
+  const lockPath = path.join(dir, "plugins.json");
+  await assert.rejects(
+    pluginUpdate({ alias: "nope", lockPath, cwd: dir, existsSync: fs.existsSync, run: async () => ({ code: 0, stderr: "" }) }),
+    (e) => e instanceof CliExit && /plugin not installed: nope/.test(e.message),
+  );
+  await saveLockfileForTest(lockPath, { cf: { package: PKG, version: "3.1.4" } });
+  await assert.rejects(
+    pluginUpdate({
+      alias: "cf", lockPath, cwd: dir, existsSync: fs.existsSync, run: async () => ({ code: 0, stderr: "" }),
+      fetchImpl: async () => new Response("nope", { status: 500 }),
+    }),
+    (e) => e instanceof CliExit && /registry lookup failed.*500/.test(e.message),
+  );
+});
+
+test("pluginList: alias-keyed rows; path resolves with cwd and stays null without it", async () => {
+  const { pluginList } = await import("../src/plugin-registry.mjs");
+  const dir = await scratchProject();
+  const lockPath = path.join(dir, "plugins.json");
+  await saveLockfileForTest(lockPath, { cf: { package: PKG, version: "3.1.4" } });
+  const bare = await pluginList(lockPath);
+  assert.equal(bare[0].alias, "cf");
+  assert.equal(bare[0].path, null);
+  const withCwd = await pluginList(lockPath, { cwd: dir });
+  assert.ok(withCwd[0].path?.includes("opendweb-ext-srclayout"), `resolved path: ${withCwd[0].path}`);
+});
+
+test("latestVersion: reads dist-tags metadata; rejects malformed payloads", async () => {
+  const { latestVersion } = await import("../src/plugin-registry.mjs");
+  const urls = [];
+  const v = await latestVersion(PKG, async (url) => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ version: "1.2.3" }), { status: 200 });
+  });
+  assert.equal(v, "1.2.3");
+  assert.ok(urls[0].endsWith(`/${PKG}/latest`), `registry URL shape: ${urls[0]}`);
+  await assert.rejects(
+    latestVersion(PKG, async () => new Response(JSON.stringify({}), { status: 200 })),
+    /has no version/,
+  );
+});
+
+/** 测试内直接落一个初始 lock（绕过 pluginAdd 的安装路径） */
+async function saveLockfileForTest(lockPath, records) {
+  const { saveLockfile } = await import("../src/plugin-registry.mjs");
+  await saveLockfile(lockPath, records);
+}
