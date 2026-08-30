@@ -94,24 +94,26 @@ export async function runInteractiveSetup(opts) {
       initialValue: suggestedMode,
     });
 
-    // 4) 计划预览
+    // 4) 计划预览（note 的 body 是结构性多行文本：动态值逐项 sanitize，
+    // 换行保留给 @clack 排版）
     const plan = planExposure({ hostname, mode });
     const ingress = buildIngress({ mode: plan.mode, gatewayHost: plan.gatewayHost, relayHost: plan.relayHost });
     const targetConfig = configPath ?? path.join(cwd, "opendweb.config.toml");
+    const esc = sanitizeUI;
     ui.note(
       [
         `mode          ${plan.mode === "single" ? "single-domain path routing" : "dual hostname"}`,
-        `gateway       ${plan.gatewayHost} (${plan.publicGatewayUrl})`,
-        `relay         ${plan.relayHost} (${plan.publicRelayUrl})`,
-        `config file   ${targetConfig}`,
+        `gateway       ${esc(plan.gatewayHost)} (${esc(plan.publicGatewayUrl)})`,
+        `relay         ${esc(plan.relayHost)} (${esc(plan.publicRelayUrl)})`,
+        `config file   ${esc(targetConfig)}`,
         "",
         "ingress rules:",
-        ...ingress.ingress.map((rule) => `  ${JSON.stringify(rule)}`),
+        ...ingress.ingress.map((rule) => `  ${esc(JSON.stringify(rule))}`),
         "",
         "steps:",
         "  1. push ingress rules to Cloudflare (tunnel configurations API)",
         "  2. route DNS CNAMEs to the tunnel (best-effort)",
-        `  3. write ${targetConfig}`,
+        `  3. write ${esc(targetConfig)}`,
         "  4. verify end-to-end via the public URL (services.json)",
       ].join("\n"),
       "plan",

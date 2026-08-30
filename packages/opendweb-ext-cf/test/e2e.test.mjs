@@ -37,7 +37,7 @@ async function env() {
  */
 async function driveWizard(child, steps, outSoFar) {
   for (const step of steps) {
-    const deadline = Date.now() + 15000;
+    const deadline = Date.now() + 30000; // 冷启动（SMB 卷/页缓存空）时首 prompt 渲染可超 15s
     while (!step.expect.test(outSoFar())) {
       if (Date.now() > deadline) throw new Error(`wizard step not rendered: ${step.expect}`);
       await new Promise((r) => setTimeout(r, 100));

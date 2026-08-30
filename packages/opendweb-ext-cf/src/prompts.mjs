@@ -11,8 +11,9 @@
 import { isCancel as clackIsCancel } from "@clack/prompts";
 
 /**
- * UI 注入防护：C0 控制字符（含换行/ESC）与 DEL 转义为 \\xNN 字面量；
- * 可打印 Unicode 照常显示（见头注边界说明）。
+ * UI 注入防护：C0 控制字符（含 Tab/换行/ESC）、DEL 与 C1 控制区
+ * （U+0080-U+009F）全部转义为 \\xNN 字面量——Tab 会破坏对齐、C1 是终端
+ * 控制面；可打印 Unicode 保留（见头注边界说明）。
  * @param {unknown} v
  * @returns {string}
  */
@@ -20,7 +21,7 @@ export function sanitizeUI(v) {
   let out = "";
   for (const ch of String(v)) {
     const c = ch.codePointAt(0);
-    out += (c < 0x20 || c === 0x7f) && c !== 0x09 ? `\\x${c.toString(16).padStart(2, "0")}` : ch;
+    out += c < 0x20 || (c >= 0x7f && c <= 0x9f) ? `\\x${c.toString(16).padStart(2, "0")}` : ch;
   }
   return out;
 }
@@ -46,7 +47,10 @@ export function createPrompts(clack) {
   return {
     intro: (title) => clack.intro(sanitizeUI(title)),
     outro: (msg) => clack.outro(sanitizeUI(msg)),
-    note: (body, title) => clack.note(sanitizeUI(body), title ? sanitizeUI(title) : undefined),
+    // note 的 body 是结构性多行文本：换行是排版的一部分，绝不能整体
+    // sanitize（会变成 \x0a 字面量）。约定：调用方对动态插值逐项
+    // sanitizeUI 后再拼装（tui.mjs 的计划预览即此形态）
+    note: (body, title) => clack.note(body, title ? sanitizeUI(title) : undefined),
     log: clack.log,
     spinner: () => clack.spinner(),
     text: async ({ message, placeholder, defaultValue, validate }) =>

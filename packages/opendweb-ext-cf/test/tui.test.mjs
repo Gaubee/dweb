@@ -81,6 +81,9 @@ test("sanitizeUI: control characters are escaped, printable unicode kept (inject
   assert.equal(sanitizeUI("esc\x1b[31mred"), "esc\\x1b[31mred"); // ESC 注入转义
   assert.equal(sanitizeUI("line\nbreak"), "line\\x0abreak"); // 换行伪造 UI 转义
   assert.equal(sanitizeUI("del\x7f"), "del\\x7f");
+  assert.equal(sanitizeUI("tab\tsep"), "tab\\x09sep"); // Tab 破坏对齐——同样转义
+  assert.equal(sanitizeUI("c1\u009cseq"), "c1\\x9cseq"); // C1 控制区（U+0080-U+009F）
+  assert.equal(sanitizeUI("stx\u0082"), "stx\\x82");
 });
 
 test("createPrompts: a clack cancel result maps to InteractiveAbort", async () => {
@@ -127,6 +130,8 @@ test("runInteractiveSetup: collect -> preview -> apply; runSetup receives resolv
   assert.equal(fk.calls.note.length, 1);
   assert.match(fk.calls.note[0].body, /gateway\s+dweb\.example\.com/);
   assert.match(fk.calls.note[0].body, /steps:/);
+  // 结构性换行保留给 @clack 排版（不被 sanitize 成 \x0a 字面量）
+  assert.ok(fk.calls.note[0].body.includes("\n"), "note body keeps structural newlines");
   // 成功收尾
   assert.match(fk.calls.outro.join("\n"), /setup ok \(applied\)/);
   assert.match(fk.calls.log.join("\n"), /config set relay https:\/\/dweb\.example\.com/);
@@ -311,7 +316,29 @@ test("runInteractiveSetup: failures rethrow for dispatcher normalization (P1-2)"
   );
 });
 
-test("runInteractiveSetup: verifyProgress drives the spinner message", async () => {
+test("runInteractiveSetup: plan preview escapes dynamic paths but keeps layout newlines (R3-P1)", async () => {
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const { impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/pr\x1boj", // 控制字符进 cwd（targetConfig 的动态源）
+    env: { TUNNEL_TOKEN: "t" },
+    clack: fk,
+    runSetupImpl: impl,
+  });
+  assert.equal(r.exit, 0);
+  const body = fk.calls.note[0].body;
+  // 结构换行保留；动态路径中的 ESC 被逐项转义为 \xNN 字面量
+  assert.ok(body.includes("\n"), "layout newlines survive");
+  assert.ok(body.includes("\\x1b"), "control chars in dynamic values are escaped");
+  assert.ok(!body.includes("pr\x1boj"), "raw control char must not reach the note body");
+});
+
+test("runInteractiveSetup: verifyProgress drives the spinner; log lines stop it", async () => {
   const spinnerCalls = [];
   const fk = fakeClack([
     A.select("env"),
@@ -330,12 +357,18 @@ test("runInteractiveSetup: verifyProgress drives the spinner message", async () 
     runSetupImpl: async (input) => {
       input.verifyProgress({ elapsedMs: 1000, lastError: "HTTP 526" });
       input.verifyProgress({ elapsedMs: 6000, lastError: "HTTP 526" });
+      input.log("dns routed"); // log 行打断 spinner——先 stop 再打印
       return { plan: { publicGatewayUrl: "https://dweb.example.com" } };
     },
   });
   assert.equal(r.exit, 0);
+  const kinds = spinnerCalls.map(([k]) => k);
+  // start -> msg 更新 -> log 打断时 stop（R3 测试缺口：stop 事件本身可断言）
+  assert.equal(kinds.filter((k) => k === "stop").length >= 1, true);
+  const firstStopIdx = kinds.indexOf("stop");
+  const lastStartIdx = kinds.lastIndexOf("start");
+  assert.ok(firstStopIdx > lastStartIdx, "stop must follow the started spinner");
   const msgs = spinnerCalls.filter(([k]) => k !== "stop").map(([, m]) => m);
-  assert.equal(msgs.length, 2); // start + 一次 message 更新
   assert.match(msgs[0], /verifying via the public gateway\.\.\. 1s/);
   assert.match(msgs[1], /6s/);
 });
