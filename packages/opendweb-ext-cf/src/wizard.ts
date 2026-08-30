@@ -4,15 +4,31 @@
 // 待合并片段，不破坏用户注释）→ 端到端自检（公网拉 services.json 断言）。
 // dryRun：跳过一切网络副作用（API/DNS/自检），仅产出「将会做什么」。
 import path from "node:path";
-import { decodeTunnelToken, buildIngress, pushIngress, routeDns } from "./cf-api.js";
+import { decodeTunnelToken, buildIngress, pushIngress, routeDns, type FetchLike } from "./cf-api.js";
+
+export type ExposureMode = "dual" | "single";
+
+export interface ExposurePlan {
+  mode: ExposureMode;
+  gatewayHost: string;
+  relayHost: string;
+  publicGatewayUrl: string;
+  publicRelayUrl: string;
+}
+
+export interface VerifyInfo {
+  elapsedMs: number;
+  lastError: string;
+}
+
+export type VerifyResult = { ok: true } | { ok: false; error: string };
 
 /**
  * 解析向导输入 → 目标形态（纯函数，测试锚点）。
  * hostname 先过 DNS 形态校验（R2-M7：`foo.com&account.id=evil` 这类输入
  * 会原样进入公网 URL 与 API query，必须在入口拒绝）。
- * @param {{ hostname: string, mode?: "dual" | "single" }} input
  */
-export function planExposure({ hostname, mode = "dual" }) {
+export function planExposure({ hostname, mode = "dual" }: { hostname: string; mode?: ExposureMode }): ExposurePlan {
   let raw = String(hostname ?? "").trim().toLowerCase();
   if (raw.endsWith(".")) raw = raw.slice(0, -1); // FQDN 尾点合法（R3-Minor）
   // 每段：字母数字开头/结尾，中间可含 -，长度 <= 63（DNS label 规则）；
@@ -20,7 +36,7 @@ export function planExposure({ hostname, mode = "dual" }) {
   // 模式实际使用 relay.<hostname>，派生后的 DNS 名也必须落在同一上限内。
   const LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
   const labels = raw.split(".");
-  const relayHost = "relay." + raw;
+  const relayHost = `relay.${raw}`;
   if (labels.length < 2 || raw.length > 253 || relayHost.length > 253 || !labels.every((l) => LABEL.test(l))) {
     throw new Error(`invalid hostname: ${JSON.stringify(hostname ?? "")} (expected a DNS name like dweb.example.com)`);
   }
@@ -37,10 +53,19 @@ export function planExposure({ hostname, mode = "dual" }) {
 /**
  * 生成要写入的 opendweb.config.toml 内容（全新文件；已存在文件只打印片段）。
  * 手渲染固定形态（全部值已经过校验，JSON 字符串转义对 TOML basic string 安全）。
- * @param {{ plan: ReturnType<typeof planExposure>, tokenEnv: string, gatewayBind?: string, relayBind?: string }} input
  */
-export function renderConfigToml({ plan, tokenEnv, gatewayBind = "0.0.0.0:8787", relayBind = "0.0.0.0:3340" }) {
-  const q = (s) => JSON.stringify(s);
+export function renderConfigToml({
+  plan,
+  tokenEnv,
+  gatewayBind = "0.0.0.0:8787",
+  relayBind = "0.0.0.0:3340",
+}: {
+  plan: ExposurePlan;
+  tokenEnv: string;
+  gatewayBind?: string;
+  relayBind?: string;
+}): string {
+  const q = (s: string) => JSON.stringify(s);
   return [
     "configVersion = 1",
     "",
@@ -64,17 +89,27 @@ export function renderConfigToml({ plan, tokenEnv, gatewayBind = "0.0.0.0:8787",
  * 不再垫到 1s）、轮询 sleep 不超出 deadline，并对不尊重 signal 的实现加
  * Promise.race 兜底，保证整个函数在 timeoutMs 附近必然返回。
  * onProgress：每轮等待前回调一次（交互引导的等待反馈）；非交互调用省略。
- * @param {{ fetchImpl?: typeof fetch, publicGatewayUrl: string, expectedRelayUrl: string, timeoutMs?: number, onProgress?: (info: { elapsedMs: number, lastError: string }) => void }} input
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
-export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expectedRelayUrl, timeoutMs = 30000, onProgress }) {
+export async function verifyExposure({
+  fetchImpl = fetch,
+  publicGatewayUrl,
+  expectedRelayUrl,
+  timeoutMs = 30000,
+  onProgress,
+}: {
+  fetchImpl?: FetchLike;
+  publicGatewayUrl: string;
+  expectedRelayUrl: string;
+  timeoutMs?: number;
+  onProgress?: (info: VerifyInfo) => void;
+}): Promise<VerifyResult> {
   const deadline = Date.now() + timeoutMs;
   const url = `${publicGatewayUrl.replace(/\/+$/, "")}/services.json`;
   let lastError = "";
-  const raceRemaining = (p) =>
+  const raceRemaining = <T>(p: Promise<T>): Promise<T> =>
     Promise.race([
       p,
-      new Promise((_, reject) => {
+      new Promise<T>((_, reject) => {
         const left = deadline - Date.now();
         const t = setTimeout(() => reject(new Error(`deadline exceeded (${timeoutMs}ms)`)), Math.max(1, left));
         t.unref?.();
@@ -83,11 +118,9 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
     try {
-      const res = await raceRemaining(
-        fetchImpl(url, { signal: AbortSignal.timeout(Math.max(1, remaining)) }),
-      );
+      const res = await raceRemaining(fetchImpl(url, { signal: AbortSignal.timeout(Math.max(1, remaining)) }));
       if (res.ok) {
-        const manifest = await raceRemaining(res.json());
+        const manifest = (await raceRemaining(res.json())) as { services?: Array<{ name?: string; enabled?: boolean; url?: string | null }> };
         const relayEntry = (manifest.services ?? []).find((s) => s.name === "relay");
         if (relayEntry?.enabled !== true) {
           return { ok: false, error: "public services.json reports relay disabled" };
@@ -99,7 +132,7 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
       }
       lastError = `HTTP ${res.status}`;
     } catch (e) {
-      lastError = e?.message ?? String(e);
+      lastError = (e as Error)?.message ?? String(e);
     }
     const left = deadline - Date.now();
     if (onProgress) onProgress({ elapsedMs: timeoutMs - left, lastError });
@@ -108,21 +141,37 @@ export async function verifyExposure({ fetchImpl = fetch, publicGatewayUrl, expe
   return { ok: false, error: `public gateway not reachable within ${timeoutMs}ms (${lastError})` };
 }
 
+export interface RunSetupOptions {
+  token: string;
+  hostname: string;
+  mode?: ExposureMode;
+  cwd: string;
+  /** R2-M2：显式目标文件（`opendweb setup --config`）；缺省为 cwd 下的默认名 */
+  configPath?: string | null;
+  tokenEnvName?: string;
+  dryRun?: boolean;
+  skipVerify?: boolean;
+  fetchImpl?: FetchLike;
+  writeFile?: (p: string, content: string) => Promise<void>;
+  exists?: (p: string) => boolean;
+  log?: (line: string) => void;
+  /** 透传给 verifyExposure 的 onProgress（交互等待反馈） */
+  verifyProgress?: (info: VerifyInfo) => void;
+}
+
 /**
  * 完整 setup 流程（命令/钩子共享）。逐步报告；任一步失败抛错。
- * verifyProgress 透传给 verifyExposure 的 onProgress（交互等待反馈）。
- * @param {{ token: string, hostname: string, mode?: "dual"|"single", cwd: string, configPath?: string,
- *           tokenEnvName?: string, dryRun?: boolean, skipVerify?: boolean, fetchImpl?: typeof fetch,
- *           writeFile?: (p: string, content: string) => Promise<void>, exists?: (p: string) => boolean,
- *           log?: (line: string) => void, verifyProgress?: (info: { elapsedMs: number, lastError: string }) => void }} input
- * @returns {Promise<{ plan: ReturnType<typeof planExposure> }>}
  */
-export async function runSetup(input) {
+export async function runSetup(input: RunSetupOptions): Promise<{ plan: ExposurePlan }> {
   const {
-    token, hostname, mode = "dual", cwd,
+    token,
+    hostname,
+    mode = "dual",
+    cwd,
     configPath = null,
     tokenEnvName = "TUNNEL_TOKEN",
-    dryRun = false, skipVerify = false,
+    dryRun = false,
+    skipVerify = false,
     fetchImpl = fetch,
     writeFile = defaultWriteFile,
     exists = defaultExists,
@@ -144,12 +193,18 @@ export async function runSetup(input) {
   const ingress = buildIngress({ mode: plan.mode, gatewayHost: plan.gatewayHost, relayHost: plan.relayHost });
 
   log(`tunnel: ${creds.tunnelId} (account ${creds.accountTag})`);
-  log(`mode: ${plan.mode === "single" ? "single-domain path routing" : "dual hostname"} -> ${plan.publicGatewayUrl}${plan.mode === "single" ? "" : ` + ${plan.publicRelayUrl}`}`);
+  log(
+    `mode: ${plan.mode === "single" ? "single-domain path routing" : "dual hostname"} -> ${plan.publicGatewayUrl}${
+      plan.mode === "single" ? "" : ` + ${plan.publicRelayUrl}`
+    }`,
+  );
 
   if (dryRun) {
     log("dry-run: would PUT ingress config:");
     for (const rule of ingress.ingress) log(`  ${JSON.stringify(rule)}`);
-    log(`dry-run: would route DNS ${plan.relayHost}${plan.mode === "single" ? "" : ` and ${plan.gatewayHost}`} -> ${creds.tunnelId}.cfargotunnel.com`);
+    log(
+      `dry-run: would route DNS ${plan.relayHost}${plan.mode === "single" ? "" : ` and ${plan.gatewayHost}`} -> ${creds.tunnelId}.cfargotunnel.com`,
+    );
     log("dry-run: would write opendweb.config.toml:");
     return { plan };
   }
@@ -158,10 +213,14 @@ export async function runSetup(input) {
   log(`ingress pushed (${ingress.ingress.length} rules)`);
 
   try {
-    await routeDns({ fetchImpl, ...creds, hostnames: plan.mode === "single" ? [plan.gatewayHost] : [plan.relayHost, plan.gatewayHost] });
+    await routeDns({
+      fetchImpl,
+      ...creds,
+      hostnames: plan.mode === "single" ? [plan.gatewayHost] : [plan.relayHost, plan.gatewayHost],
+    });
     log(`dns routed (CNAME -> ${creds.tunnelId}.cfargotunnel.com)`);
   } catch (e) {
-    log(`WARNING: ${e.message}`);
+    log(`WARNING: ${(e as Error).message}`);
   }
 
   // R2-M2：目标文件 = 显式 configPath（`opendweb setup --config`）或 cwd 默认名
@@ -197,13 +256,13 @@ export async function runSetup(input) {
 
 import { writeFile as defaultWriteFileImpl } from "node:fs/promises";
 import { existsSync as defaultExistsImpl } from "node:fs";
-async function defaultWriteFile(p, content) {
+async function defaultWriteFile(p: string, content: string): Promise<void> {
   await defaultWriteFileImpl(p, content, "utf8");
 }
-function defaultExists(p) {
+function defaultExists(p: string): boolean {
   return defaultExistsImpl(p);
 }
 /** 相对 cwd 展示路径（同目录则裸文件名，否则原样绝对路径） */
-function relativeLabel(cwd, p) {
+function relativeLabel(cwd: string, p: string): string {
   return p.startsWith(`${cwd}${path.sep}`) ? p.slice(cwd.length + 1) : p;
 }

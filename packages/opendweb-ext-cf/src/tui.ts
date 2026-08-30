@@ -1,5 +1,5 @@
 // cf setup 交互式引导编排（2026-08-30 Owner 需求：setup 子命令提供交互
-// 引导；第二轮决策：不自写交互终端，改用 @clack/prompts——见 prompts.mjs
+// 引导；第二轮决策：不自写交互终端，改用 @clack/prompts——见 prompts.ts
 // 头注）。流程：token -> hostname（库 validate 即时重问）-> mode -> 计划
 // 预览（note）-> apply/dry-run/abort 选择 -> 复用 runSetup 执行（log 行 +
 // verify spinner）-> 结果指引。
@@ -10,22 +10,41 @@
 // 确认退化为二元 go/no-go，与非交互 --dry-run 的零副作用语义一致。
 import path from "node:path";
 
-import { runSetup, planExposure } from "./wizard.js";
-import { buildIngress } from "./cf-api.js";
-import { createPrompts, sanitizeUI, InteractiveAbort } from "./prompts.mjs";
+import { runSetup, planExposure, type ExposureMode, type ExposurePlan } from "./wizard.js";
+import { buildIngress, type FetchLike } from "./cf-api.js";
+import { createPrompts, sanitizeUI, InteractiveAbort, type ClackApi } from "./prompts.js";
+
+/** spinner 形状（@clack spinner 的结构化子集；闭包赋值需要命名类型） */
+interface SpinnerLike {
+  start(message?: string): void;
+  stop(message?: string): void;
+  message(text: string): void;
+}
+
+export interface RunInteractiveOptions {
+  cwd: string;
+  tokenEnvName?: string;
+  suggestedHostname?: string;
+  suggestedMode?: ExposureMode;
+  suggestedAction?: "apply" | "dry";
+  forceDryRun?: boolean;
+  configPath?: string | null;
+  skipVerify?: boolean;
+  env?: Record<string, string | undefined>;
+  fetchImpl?: FetchLike;
+  writeFile?: (p: string, c: string) => Promise<void>;
+  exists?: (p: string) => boolean;
+  runSetupImpl?: typeof runSetup;
+  /** 测试注入 fake；缺省动态 import 真库 */
+  clack?: ClackApi;
+}
 
 /**
  * 交互式 setup 引导。
- * @param {{ cwd: string, tokenEnvName?: string, suggestedHostname?: string, suggestedMode?: "dual" | "single",
- *           suggestedAction?: "apply" | "dry", forceDryRun?: boolean, configPath?: string | null, skipVerify?: boolean,
- *           env?: Record<string, string | undefined>,
- *           fetchImpl?: typeof fetch, writeFile?: (p: string, c: string) => Promise<void>,
- *           exists?: (p: string) => boolean, runSetupImpl?: typeof runSetup,
- *           clack?: Awaited<typeof import("@clack/prompts")> }} opts
- * @returns {Promise<{ exit: number }>} 成功/中止返回退出码
- * @throws {Error} 任一执行步失败——由 dispatchPluginCommand 输出标准错误
+ * @returns 成功/中止返回退出码
+ * @throws 任一执行步失败——由 dispatchPluginCommand 输出标准错误
  */
-export async function runInteractiveSetup(opts) {
+export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<{ exit: number }> {
   const {
     cwd,
     tokenEnvName = "TUNNEL_TOKEN",
@@ -40,10 +59,12 @@ export async function runInteractiveSetup(opts) {
     writeFile,
     exists,
     runSetupImpl = runSetup,
-    clack = await import("@clack/prompts"),
+    clack = (await import("@clack/prompts")) as unknown as ClackApi,
   } = opts;
   const ui = createPrompts(clack);
-  let spin = null;
+  // spinner 状态经 holder 对象持有：TS 对「回调内赋值的 let」会做错误的
+  // null 窄化（同步路径上视其为 null），对象属性读写则始终用声明类型
+  const spinState: { spin: SpinnerLike | null; started: boolean } = { spin: null, started: false };
   try {
     ui.intro("cf setup - interactive wizard");
 
@@ -54,13 +75,17 @@ export async function runInteractiveSetup(opts) {
         const choice = await ui.select({
           message: `tunnel token (detected ${tokenEnvName} in the environment)`,
           options: [
-            { value: "env", label: `use ${tokenEnvName} from the environment`, hint: "recommended" },
-            { value: "paste", label: "paste a different token", hint: "input hidden" },
+            { value: "env" as const, label: `use ${tokenEnvName} from the environment`, hint: "recommended" },
+            { value: "paste" as const, label: "paste a different token", hint: "input hidden" },
           ],
         });
-        if (choice === "paste") token = await ui.password({ message: "tunnel token (copy from Zero Trust -> Networks -> Tunnels)" });
+        if (choice === "paste") {
+          token = await ui.password({ message: "tunnel token (copy from Zero Trust -> Networks -> Tunnels)" });
+        }
       } else {
-        token = await ui.password({ message: `tunnel token (${tokenEnvName} not set; copy from Zero Trust -> Networks -> Tunnels)` });
+        token = await ui.password({
+          message: `tunnel token (${tokenEnvName} not set; copy from Zero Trust -> Networks -> Tunnels)`,
+        });
       }
       if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
     }
@@ -79,13 +104,13 @@ export async function runInteractiveSetup(opts) {
           planExposure({ hostname: v });
           return undefined;
         } catch (e) {
-          return e.message;
+          return (e as Error).message;
         }
       },
     });
 
     // 3) mode
-    const mode = await ui.select({
+    const mode = await ui.select<ExposureMode>({
       message: "routing mode",
       options: [
         { value: "dual", label: "dual - separate hostnames (gateway + relay.<gateway>)", hint: "recommended" },
@@ -96,7 +121,7 @@ export async function runInteractiveSetup(opts) {
 
     // 4) 计划预览（note 的 body 是结构性多行文本：动态值逐项 sanitize，
     // 换行保留给 @clack 排版）
-    const plan = planExposure({ hostname, mode });
+    const plan: ExposurePlan = planExposure({ hostname, mode });
     const ingress = buildIngress({ mode: plan.mode, gatewayHost: plan.gatewayHost, relayHost: plan.relayHost });
     const targetConfig = configPath ?? path.join(cwd, "opendweb.config.toml");
     const esc = sanitizeUI;
@@ -120,16 +145,16 @@ export async function runInteractiveSetup(opts) {
     );
 
     // 5) 确认：forceDryRun 下没有 apply 选项（--dry-run 语义不可覆盖）
-    let action;
+    let action: "apply" | "dry" | "no";
     if (forceDryRun) {
       action = (await ui.confirm({ message: "run this plan as a dry-run? (nothing will be pushed)" })) ? "dry" : "no";
     } else {
       action = await ui.select({
         message: "apply this plan?",
         options: [
-          { value: "apply", label: "apply - push ingress, route DNS, write config, verify" },
-          { value: "dry", label: "dry-run - rehearse with zero side effects" },
-          { value: "no", label: "abort - change nothing" },
+          { value: "apply" as const, label: "apply - push ingress, route DNS, write config, verify" },
+          { value: "dry" as const, label: "dry-run - rehearse with zero side effects" },
+          { value: "no" as const, label: "abort - change nothing" },
         ],
         initialValue: suggestedAction === "dry" ? "dry" : "apply",
       });
@@ -140,7 +165,8 @@ export async function runInteractiveSetup(opts) {
     }
 
     // 6) 执行：复用非交互的 runSetup 编排；log 行直出，verify 用 spinner
-    let spinStarted = false;
+    //（token 的防御性复检同时完成 string 窄化：forceDryRun 占位或已过 throw）
+    if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
     const result = await runSetupImpl({
       token,
       hostname,
@@ -154,26 +180,27 @@ export async function runInteractiveSetup(opts) {
       ...(writeFile ? { writeFile } : {}),
       ...(exists ? { exists } : {}),
       log: (line) => {
-        if (spin !== null && spinStarted) {
-          spin.stop();
-          spinStarted = false;
+        if (spinState.spin !== null && spinState.started) {
+          spinState.spin.stop();
+          spinState.started = false;
         }
         ui.log.message(sanitizeUI(`  ${line}`));
       },
       verifyProgress: ({ elapsedMs, lastError }) => {
         // 公网生效有延迟是常态：spinner 常驻并随轮询更新文案
-        if (spin === null) spin = ui.spinner();
-        if (!spinStarted) {
-          spin.start(sanitizeUI(`verifying via the public gateway... ${Math.round(elapsedMs / 1000)}s (${lastError})`));
-          spinStarted = true;
+        if (spinState.spin === null) spinState.spin = ui.spinner();
+        const text = sanitizeUI(`verifying via the public gateway... ${Math.round(elapsedMs / 1000)}s (${lastError})`);
+        if (!spinState.started) {
+          spinState.spin.start(text);
+          spinState.started = true;
         } else {
-          spin.message(sanitizeUI(`verifying via the public gateway... ${Math.round(elapsedMs / 1000)}s (${lastError})`));
+          spinState.spin.message(text);
         }
       },
     });
-    if (spin !== null && spinStarted) {
-      spin.stop();
-      spinStarted = false;
+    if (spinState.spin !== null && spinState.started) {
+      spinState.spin.stop();
+      spinState.started = false;
     }
 
     // 7) 结果与下一步指引
@@ -194,6 +221,6 @@ export async function runInteractiveSetup(opts) {
     }
     throw e;
   } finally {
-    spin?.stop?.();
+    spinState.spin?.stop();
   }
 }

@@ -6,8 +6,8 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { decodeTunnelToken, buildIngress, pushIngress, routeDns } from "../src/cf-api.js";
-import { planExposure, renderConfigToml, verifyExposure, runSetup } from "../src/wizard.js";
+import { decodeTunnelToken, buildIngress, pushIngress, routeDns } from "../dist/cf-api.mjs";
+import { planExposure, renderConfigToml, verifyExposure, runSetup } from "../dist/wizard.mjs";
 
 const TOKEN = Buffer.from(JSON.stringify({ a: "acc123", t: "tun456", s: "sec789" })).toString("base64");
 
@@ -289,7 +289,7 @@ test("runSetup: explicit configPath targets the chosen file, not cwd default (R2
 });
 
 test("postReady hook: cloudflared dying at startup is never a silent fake success (R2-M4/R4)", { skip: process.platform === "win32" }, async () => {
-  const plugin = (await import("../src/index.js")).default;
+  const plugin = (await import("../dist/index.mjs")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const fake = path.join(binDir, "cloudflared");
   await fsp.writeFile(fake, "#!/bin/sh\nexit 7\n", "utf8");
@@ -332,8 +332,50 @@ test("postReady hook: cloudflared dying at startup is never a silent fake succes
   }
 });
 
+// R2-M4 的晚退半边：grace 先过窗、child 之后才退出。此路径曾靠时序偶发
+// 触发并暴露过潜伏 bug——startup exit listener 抢先清 tunnelChild，导致
+// watchdog 判 tunnelChild!==active 而吞掉 WARNING（无声伪成功）。此处用
+// 绝对路径 /bin/sleep 构造确定性晚退，锁死该回归。
+test("postReady hook: dying after the grace window must surface the WARNING (R2-M4 late exit)", { skip: process.platform === "win32" }, async () => {
+  const plugin = (await import("../dist/index.mjs")).default;
+  const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
+  const fake = path.join(binDir, "cloudflared");
+  await fsp.writeFile(fake, "#!/bin/sh\n/bin/sleep 1\nexit 7\n", "utf8");
+  const { chmodSync } = await import("node:fs");
+  chmodSync(fake, 0o755);
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
+  process.env.PATH = binDir;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.DWEB_CF_SPAWN_GRACE_MS = "150";
+  const warnings = [];
+  const origError = console.error;
+  console.error = (s) => warnings.push(String(s));
+  try {
+    const r = await plugin.hooks["server.postReady"]({ options: { tunnel: true } });
+    assert.match(r?.bannerLines?.[0] ?? "", /co-spawned/, "must promote past the grace window");
+    const deadline = Date.now() + 5000;
+    while (warnings.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.match(
+      warnings.join("\n"),
+      /WARNING: cloudflared exited \(code 7\); the public tunnel is down/,
+      "late exit after promotion must warn, never a silent success",
+    );
+  } finally {
+    await plugin.hooks["server.preStop"]().catch(() => {});
+    console.error = origError;
+    process.env.PATH = prevPath;
+    process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
+});
+
 test("postReady hook: concurrent tunnel requests share one spawn; preStop reaps it (R3 race hardening)", { skip: process.platform === "win32" }, async () => {
-  const plugin = (await import("../src/index.js")).default;
+  const plugin = (await import("../dist/index.mjs")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const spawnLog = path.join(binDir, "spawns.log");
   const fake = path.join(binDir, "cloudflared");
@@ -396,7 +438,7 @@ test("postReady hook: concurrent tunnel requests share one spawn; preStop reaps 
 });
 
 test("postReady hook: preStop cancels a pending startup and reaps its child (R4)", { skip: process.platform === "win32" }, async () => {
-  const plugin = (await import("../src/index.js")).default;
+  const plugin = (await import("../dist/index.mjs")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const spawnLog = path.join(binDir, "spawns.log");
   const fake = path.join(binDir, "cloudflared");
@@ -452,7 +494,7 @@ test("postReady hook: preStop cancels a pending startup and reaps its child (R4)
   }
 });
 
-test("postReady hook: preStop before the spawn event still reaps the child (R5 negative)", { skip: process.platform === "win32" }, async () => {  const plugin = (await import("../src/index.js")).default;
+test("postReady hook: preStop before the spawn event still reaps the child (R5 negative)", { skip: process.platform === "win32" }, async () => {  const plugin = (await import("../dist/index.mjs")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const spawnLog = path.join(binDir, "spawns.log");
   const fake = path.join(binDir, "cloudflared");
@@ -506,7 +548,7 @@ test("postReady hook: preStop before the spawn event still reaps the child (R5 n
 });
 
 test("postReady hook: concurrent preStop calls share one full-stop promise and all await the child (R6-Major)", { skip: process.platform === "win32" }, async () => {
-  const plugin = (await import("../src/index.js")).default;
+  const plugin = (await import("../dist/index.mjs")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
   const spawnLog = path.join(binDir, "spawns.log");
   const fake = path.join(binDir, "cloudflared");
@@ -560,7 +602,7 @@ test("postReady hook: concurrent preStop calls share one full-stop promise and a
 });
 
 test("postReady hook: missing cloudflared degrades to a hook failure, not a crash (R2 blocked-6)", async () => {
-  const plugin = (await import("../src/index.js")).default;
+  const plugin = (await import("../dist/index.mjs")).default;
   const prevPath = process.env.PATH;
   const prevToken = process.env.TUNNEL_TOKEN;
   process.env.TUNNEL_TOKEN = "placeholder";
@@ -578,7 +620,7 @@ test("postReady hook: missing cloudflared degrades to a hook failure, not a cras
 });
 
 test("status command: read-only summary from config file + lock record (TOML and JSON variants)", async () => {
-  const cli = (await import("../src/cli.js")).default;
+  const cli = (await import("../dist/cli.mjs")).default;
   const prevHome = process.env.DWEB_HOME;
   const home = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-home-"));
   process.env.DWEB_HOME = home;

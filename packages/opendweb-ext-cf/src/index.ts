@@ -3,37 +3,66 @@
 //   tunnel    true = server 生命周期内共生 spawn cloudflared（本机需已安装）
 // 钩子：setup（向导）/ server.postReady（自检 + 共生 spawn + 横幅行）/
 // server.preStop（清理共生进程）。云端 API 交互全部在 wizard/cf-api。
-import { spawn } from "node:child_process";
-import { runSetup, verifyExposure, planExposure } from "./wizard.js";
+import { spawn, type ChildProcess } from "node:child_process";
+import { runSetup, verifyExposure } from "./wizard.js";
+
+/** config 面钩子上下文（宿主 fireHook/invoke 传入；字段按需可选） */
+export interface HookContext {
+  options?: { tokenEnv?: string; tunnel?: boolean; mode?: "dual" | "single"; hostname?: string; dryRun?: boolean; skipVerify?: boolean };
+  server?: { publicGatewayUrl?: string | null; publicRelayUrl?: string | null; [key: string]: unknown };
+  cwd?: string;
+  configPath?: string;
+  configDir?: string;
+  publicGatewayUrl?: string | null;
+  publicRelayUrl?: string | null;
+}
+
+export interface HookResult {
+  bannerLines?: string[];
+  [key: string]: unknown;
+}
+
+interface ActiveTunnel {
+  child: ChildProcess;
+  watchdog: () => void;
+}
+
+interface StartupState {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (err: Error) => void;
+  child: ChildProcess | null;
+  poll: ReturnType<typeof setInterval> | null;
+  grace: ReturnType<typeof setTimeout> | null;
+  settled: boolean;
+  stopping: boolean;
+  stopPromise: Promise<void> | null;
+}
+
+let tunnelStart: StartupState | null = null; // 启动中的状态（并发调用共享其 promise）
+let tunnelPending: StartupState | null = null; // 已 spawn 但仍在健康窗口内的状态，供 preStop 取消
+let tunnelChild: ActiveTunnel | null = null; // 当前活跃记录 { child, watchdog }，供 preStop 摘除本 child 的观察器
+let tunnelStopAll: Promise<void> | null = null; // 进行中的全程停止 Promise（并发 preStop 共享，R6-Major）
 
 /**
- * 共生 cloudflared 的生命周期状态（R3 竞态重构：「启动中」与「已登记」
- * 拆分为独立状态，exit 事件可能迟到于进程实际退出，一切判定都以
- * child.exitCode/signalCode 的同步快照为准）：
- * - tunnelStart 非空 = 启动进行中（并发 postReady 共享同一 Promise）
- * - tunnelPending 非空 = 已 spawn、尚未通过健康窗口的子进程
- * - tunnelChild 非空 = 已通过启动健康窗口的活跃记录（含本 child 的 watchdog）
- * @param {number} [graceMs] 启动健康窗口（默认 2s；DWEB_CF_SPAWN_GRACE_MS 可调，测试注入）
- * @returns {Promise<void>} resolve = 已运行超过健康窗口；reject(Error) = 启动失败
+ * 共生 cloudflared 的生命周期（R3 竞态重构：「启动中」与「已登记」拆分为
+ * 独立状态，exit 事件可能迟到于进程实际退出，一切判定都以
+ * child.exitCode/signalCode 的同步快照为准）。启动健康窗口内退出 = 启动
+ * 失败；过窗后退出无法再失败 postReady——由 per-child watchdog 输出
+ * stderr WARNING（绝不无声伪成功），preStop 主动停止先摘除观察器。
  */
-let tunnelStart = null; // 启动中的状态（并发调用共享其 promise）
-let tunnelPending = null; // 已 spawn 但仍在健康窗口内的状态，供 preStop 取消
-let tunnelChild = null; // 当前活跃记录 { child, watchdog }，供 preStop 摘除本 child 的观察器
-
-function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRACE_MS) || 2000) {
+function spawnCloudflared(token: string, graceMs: number = Number(process.env.DWEB_CF_SPAWN_GRACE_MS) || 2000): Promise<void> {
   if (tunnelStart !== null) return tunnelStart.promise;
   // 悬挂句柄（已退出但 exit 事件未派发）不得当作存活——清理后再 spawn
   if (tunnelChild !== null && !exited(tunnelChild.child)) {
     return Promise.resolve();
   }
-  // 旧 child 的 exit 监听器仍必须保留：它会为真实的晚退输出 WARNING，
-  // 但其闭包不会再清掉新的 tunnelChild。
   tunnelChild = null;
 
-  const state = {
-    promise: null,
-    resolve: null,
-    reject: null,
+  const state: StartupState = {
+    promise: null as never,
+    resolve: null as never,
+    reject: null as never,
     child: null,
     poll: null,
     grace: null,
@@ -57,7 +86,7 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
       state.grace = null;
     }
   };
-  const fail = (msg) => {
+  const fail = (msg: string) => {
     if (state.settled) return;
     state.settled = true;
     clearStartupTimers();
@@ -66,7 +95,7 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
     state.reject(new Error(msg));
   };
 
-  let child;
+  let child: ChildProcess;
   try {
     child = spawn("cloudflared", ["tunnel", "run"], {
       env: { ...process.env, TUNNEL_TOKEN: token },
@@ -74,7 +103,7 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
       detached: false,
     });
   } catch (e) {
-    fail(`failed to start cloudflared (${e?.message ?? String(e)}); is it installed and on PATH?`);
+    fail(`failed to start cloudflared (${(e as Error).message}); is it installed and on PATH?`);
     return state.promise;
   }
 
@@ -83,14 +112,14 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
   const exitLabel = () => `code ${child.exitCode ?? child.signalCode}`;
   const startupFailure = () =>
     `cloudflared exited during startup (${exitLabel()}); check TUNNEL_TOKEN and the tunnel config`;
-  child.once("error", (e) => {
-    if (!state.settled) {
-      fail(`failed to start cloudflared (${e.message}); is it installed and on PATH?`);
-    }
+  child.once("error", (e: Error) => {
+    fail(`failed to start cloudflared (${e.message}); is it installed and on PATH?`);
   });
   child.once("exit", () => {
-    // 未过健康窗口的退出（exit 事件路径）= 启动失败。过窗后由该
-    // child 专属 watchdog 负责告警，不能碰后续启动留下的新状态。
+    // 未过健康窗口的退出（exit 事件路径）= 启动失败。过窗后本 child 的
+    // 告警与 tunnelChild 清理完全归其 watchdog——此处不得抢先清记录：
+    // 本 listener 注册早于 watchdog、同一次 exit 会先执行，抢先置空会让
+    // watchdog 判 tunnelChild!==active 而静默（晚退 WARNING 被吞）。
     if (!state.settled) fail(startupFailure());
   });
   child.once("spawn", () => {
@@ -110,7 +139,7 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
 
       // 先挂 late-exit 观察器、再做最后一次同步存活判定。否则 child
       // 恰在判定与 once("exit") 之间退出，会形成无声伪成功窗口。
-      const active = { child, watchdog: null };
+      const active: ActiveTunnel = { child, watchdog: null as never };
       const watchdog = () => {
         // 仅当前活跃记录才告警+清理（R5-Minor：promote 前的窄窗退出已由
         // startup exit listener 归一为启动失败，不得再叠一条 WARNING）
@@ -138,9 +167,7 @@ function spawnCloudflared(token, graceMs = Number(process.env.DWEB_CF_SPAWN_GRAC
   return state.promise;
 }
 
-let tunnelStopAll = null; // 进行中的全程停止 Promise（并发 preStop 共享，R6-Major）
-
-function stopCloudflared() {
+function stopCloudflared(): Promise<void> {
   if (tunnelStopAll !== null) return tunnelStopAll;
   tunnelStopAll = (async () => {
     // 启动尚未过窗时，tunnelChild 尚不存在；必须取消并等待已 spawn 的
@@ -157,7 +184,7 @@ function stopCloudflared() {
 
     const active = tunnelChild;
     if (active === null) return;
-    if (tunnelChild === active) tunnelChild = null;
+    tunnelChild = null;
     // 主动停止不是异常退出：只摘除此 child 的 watchdog，不影响旧 child
     // 或之后新 child 的监听器。
     active.child.removeListener("exit", active.watchdog);
@@ -169,7 +196,7 @@ function stopCloudflared() {
   return tunnelStopAll;
 }
 
-function stopPendingStartup(state) {
+function stopPendingStartup(state: StartupState): Promise<void> {
   if (state.stopPromise !== null) return state.stopPromise;
   state.stopping = true;
   if (!state.settled) {
@@ -190,11 +217,11 @@ function stopPendingStartup(state) {
   return state.stopPromise;
 }
 
-function stopChild(child) {
+function stopChild(child: ChildProcess): Promise<void> {
   if (exited(child)) return Promise.resolve();
   return new Promise((resolve) => {
     let done = false;
-    let force = null;
+    let force: ReturnType<typeof setTimeout> | null = null;
     const finish = () => {
       if (done) return;
       done = true;
@@ -252,7 +279,7 @@ function stopChild(child) {
   });
 }
 
-function exited(child) {
+function exited(child: ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
@@ -260,7 +287,7 @@ export default {
   name: "cf",
   hooks: {
     /** `opendweb setup`：非交互向导（hostname 由 options.hostname 或 server 公网 URL 推导） */
-    async setup(ctx) {
+    async setup(ctx: HookContext): Promise<HookResult> {
       const tokenEnv = ctx.options?.tokenEnv ?? "TUNNEL_TOKEN";
       const token = process.env[tokenEnv];
       const hostname = ctx.options?.hostname ?? hostnameFromServer(ctx.server);
@@ -287,8 +314,8 @@ export default {
     },
 
     /** 就绪后：可选共生 spawn + 端到端自检（失败降级 WARNING 由 CLI 处理） */
-    async "server.postReady"(ctx) {
-      const lines = [];
+    async "server.postReady"(ctx: HookContext): Promise<HookResult | null> {
+      const lines: string[] = [];
       const tokenEnv = ctx.options?.tokenEnv ?? "TUNNEL_TOKEN";
       const token = process.env[tokenEnv];
       const gatewayUrl = ctx.publicGatewayUrl ?? ctx.server?.publicGatewayUrl ?? null;
@@ -313,7 +340,7 @@ export default {
     },
 
     /** 停止前：清理共生 cloudflared */
-    async "server.preStop"() {
+    async "server.preStop"(): Promise<HookResult | null> {
       await stopCloudflared();
       return null;
     },
@@ -321,7 +348,7 @@ export default {
 };
 
 /** 从 server 配置的公网 URL 推导 hostname（https://gw.example.com -> gw.example.com） */
-function hostnameFromServer(server) {
+function hostnameFromServer(server: HookContext["server"]): string | null {
   const url = server?.publicGatewayUrl;
   if (typeof url !== "string" || !url.startsWith("https://")) return null;
   return url.slice("https://".length).replace(/\/+$/, "").split(":")[0];

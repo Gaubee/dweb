@@ -6,9 +6,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { sanitizeUI, InteractiveAbort, createPrompts } from "../src/prompts.mjs";
-import { runInteractiveSetup } from "../src/tui.mjs";
-import { wantsInteractive } from "../src/cli.js";
+import { sanitizeUI, InteractiveAbort, createPrompts } from "../dist/prompts.mjs";
+import { runInteractiveSetup } from "../dist/tui.mjs";
+import { wantsInteractive } from "../dist/cli.mjs";
 
 /** fake clack：按类型弹出应答；记录全部调用供断言。text 执行 validate
  * （返回 string 即取下一应答重试——模拟 @clack 的重问循环） */
