@@ -119,12 +119,16 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
           pnpm --filter @jixo/opendweb-ext-cf run pack:dry
-      # npm 不替换 workspace:* 协议（pnpm 才会），发布前固定为实际版本
+      # npm 不替换 workspace:* 协议（pnpm 才会），发布前固定为实际版本。
+      # pin 目标包自身的 version 字段而非 tag 版本（v0.3.3 教训：skip 守卫下
+      # 单包 patch 只发 opendweb，pin ^<tag> 指向永不存在的 server-binary 版本，
+      # 消费者 npx 直接 notarget）
       - name: Pin workspace deps to released version
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          npm pkg set 'dependencies.@jixo/opendweb-client-sdk=^'"$VER" --prefix packages/example
-          npm pkg set 'dependencies.@jixo/opendweb-server-binary=^'"$VER" --prefix packages/opendweb
+          VER_SDK="$(node -p "require('./packages/client-sdk/package.json').version")"
+          VER_SB="$(node -p "require('./packages/server-binary/package.json').version")"
+          npm pkg set 'dependencies.@jixo/opendweb-client-sdk=^'"$VER_SDK" --prefix packages/example
+          npm pkg set 'dependencies.@jixo/opendweb-server-binary=^'"$VER_SB" --prefix packages/opendweb
           grep -r '"@jixo/opendweb' packages/*/package.json
       - name: Verify @jixo/opendweb-config tarball manifest
         run: |
