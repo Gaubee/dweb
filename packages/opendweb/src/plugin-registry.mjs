@@ -6,7 +6,7 @@
 //   （安装即信任，展示精确版本）
 // - remove：卸载包 + 删除锁定记录
 // - list：展示锁定记录
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync as nodeExistsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -26,10 +26,13 @@ export async function loadLockfile(lockPath) {
 
 /**
  * 写入锁定记录（records 形如 { [name]: { package, version } }）。
+ * 首次写入可发生在 ~/.opendweb 尚不存在时（runAdaptive 自愈安装路径），
+ * 写前建父目录——全新环境的第一条 `opendweb <plugin> ...` 不再 ENOENT。
  * @param {string} lockPath
  * @param {Record<string, { package: string, version: string }>} records
  */
 export async function saveLockfile(lockPath, records) {
+  await mkdir(path.dirname(lockPath), { recursive: true });
   await writeFile(lockPath, `${JSON.stringify(records, null, 2)}\n`, "utf8");
 }
 

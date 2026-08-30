@@ -131,21 +131,41 @@ jobs:
           cd packages/opendweb-config && npm pack --dry-run 2>&1 | tee /tmp/cfg.log
           grep -q "src/index.js" /tmp/cfg.log
           grep -q "README.md" /tmp/cfg.log
+      # 单包 patch 发布守卫（v0.3.3 起）：registry 已存在同版本则跳过，
+      # 避免单包修复被迫全量 bump（未变更的包撞「版本已存在」中断 job）
       - name: Publish @jixo/opendweb-config
-        run: npm publish --access public --provenance
+        run: |
+          V=$(node -p "require('./package.json').version")
+          [ "$(npm view "@jixo/opendweb-config@$V" version 2>/dev/null)" = "$V" ] \
+            && echo "skip: already published @$V" || npm publish --access public --provenance
         working-directory: packages/opendweb-config
       - name: Publish @jixo/opendweb-ext-cf
-        run: npm publish --access public --provenance
+        run: |
+          V=$(node -p "require('./package.json').version")
+          [ "$(npm view "@jixo/opendweb-ext-cf@$V" version 2>/dev/null)" = "$V" ] \
+            && echo "skip: already published @$V" || npm publish --access public --provenance
         working-directory: packages/opendweb-ext-cf
       - name: Publish @jixo/opendweb-server-binary
-        run: npm publish --access public --provenance
+        run: |
+          V=$(node -p "require('./package.json').version")
+          [ "$(npm view "@jixo/opendweb-server-binary@$V" version 2>/dev/null)" = "$V" ] \
+            && echo "skip: already published @$V" || npm publish --access public --provenance
         working-directory: packages/server-binary
       - name: Publish @jixo/opendweb-client-sdk
-        run: npm publish --access public --provenance
+        run: |
+          V=$(node -p "require('./package.json').version")
+          [ "$(npm view "@jixo/opendweb-client-sdk@$V" version 2>/dev/null)" = "$V" ] \
+            && echo "skip: already published @$V" || npm publish --access public --provenance
         working-directory: packages/client-sdk
       - name: Publish @jixo/opendweb-example
-        run: npm publish --access public --provenance
+        run: |
+          V=$(node -p "require('./package.json').version")
+          [ "$(npm view "@jixo/opendweb-example@$V" version 2>/dev/null)" = "$V" ] \
+            && echo "skip: already published @$V" || npm publish --access public --provenance
         working-directory: packages/example
       - name: Publish opendweb (top-level CLI)
-        run: npm publish --access public --provenance
+        run: |
+          V=$(node -p "require('./package.json').version")
+          [ "$(npm view "opendweb@$V" version 2>/dev/null)" = "$V" ] \
+            && echo "skip: already published @$V" || npm publish --access public --provenance
         working-directory: packages/opendweb

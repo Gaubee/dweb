@@ -110,3 +110,15 @@ test("detectPackageManager: lockfile probing order", async () => {
   await fsp.writeFile(path.join(dir, "pnpm-lock.yaml"), "", "utf8");
   assert.equal(detectPackageManager(dir, fs.existsSync), "pnpm");
 });
+
+// v0.3.2 线上回归：全新环境（~/.opendweb 不存在）首次自愈安装时
+// saveLockfile 直写不存在的父目录 → ENOENT。写前 mkdir 后 load/save 往返
+// 在「目录不存在」起点上必须成功。
+test("saveLockfile: creates a missing parent directory on first write (v0.3.2 regression)", async () => {
+  const { saveLockfile, loadLockfile } = await import("../src/plugin-registry.mjs");
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-lock-"));
+  const lockPath = path.join(base, "fresh-home", "plugins.json");
+  await saveLockfile(lockPath, { cf: { package: "@jixo/opendweb-ext-cf", version: "0.1.0" } });
+  const loaded = await loadLockfile(lockPath);
+  assert.deepEqual(loaded, { cf: { package: "@jixo/opendweb-ext-cf", version: "0.1.0" } });
+});
