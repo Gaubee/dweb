@@ -110,6 +110,15 @@ jobs:
           cd ../client-sdk && npm pack --dry-run 2>&1 | tee /tmp/sdk.log
           grep -q "dweb.darwin-arm64.node" /tmp/sdk.log
           grep -q "dweb.win32-x64.node" /tmp/sdk.log
+      # ext-cf 的 dist 不入库（gitignored）：CI 安装 workspace 依赖后构建，
+      # pack:dry 门禁一步完成 build + 依赖清单断言 + bundle 残留 grep。
+      # 必须先于 Pin workspace deps：pin 会改写 package.json 的依赖声明，
+      # frozen-lockfile 安装要求两者一致（v0.3.2 首发实测教训）
+      - name: Build & gate @jixo/opendweb-ext-cf
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm --filter @jixo/opendweb-ext-cf run pack:dry
       # npm 不替换 workspace:* 协议（pnpm 才会），发布前固定为实际版本
       - name: Pin workspace deps to released version
         run: |
@@ -117,13 +126,6 @@ jobs:
           npm pkg set 'dependencies.@jixo/opendweb-client-sdk=^'"$VER" --prefix packages/example
           npm pkg set 'dependencies.@jixo/opendweb-server-binary=^'"$VER" --prefix packages/opendweb
           grep -r '"@jixo/opendweb' packages/*/package.json
-      # ext-cf 的 dist 不入库（gitignored）：CI 安装 workspace 依赖后构建，
-      # pack:dry 门禁一步完成 build + 依赖清单断言 + bundle 残留 grep
-      - name: Build & gate @jixo/opendweb-ext-cf
-        run: |
-          corepack enable
-          pnpm install --frozen-lockfile
-          pnpm --filter @jixo/opendweb-ext-cf run pack:dry
       - name: Verify @jixo/opendweb-config tarball manifest
         run: |
           cd packages/opendweb-config && npm pack --dry-run 2>&1 | tee /tmp/cfg.log
