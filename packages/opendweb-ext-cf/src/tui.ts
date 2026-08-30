@@ -11,7 +11,7 @@
 import path from "node:path";
 
 import { runSetup, planExposure, type ExposureMode, type ExposurePlan } from "./wizard.js";
-import { buildIngress, decodeTunnelToken, lookupZoneName, type FetchLike } from "./cf-api.js";
+import { buildIngress, decodeTunnelToken, lookupZoneName, extractTunnelToken, tokenSummary, type FetchLike } from "./cf-api.js";
 import { createPrompts, sanitizeUI, InteractiveAbort, type ClackApi } from "./prompts.js";
 
 /** spinner 形状（@clack spinner 的结构化子集；闭包赋值需要命名类型） */
@@ -94,7 +94,25 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
       );
     }
 
-    // 1) token：dry-run 不需要（与非交互 --dry-run 的占位语义一致）
+    // 1) token：dry-run 不需要（与非交互 --dry-run 的占位语义一致）。
+    // 粘贴宽容度（2026-08-31 Owner 需求）：用户常粘整条安装命令甚至多行
+    // 文本——extractTunnelToken 按 eyJ 前缀 + base64url + 长度特征提取并
+    // trim；输入仍全程遮蔽（防肩窥），提交后回显头尾摘要供对照
+    const pasteToken = async (message: string): Promise<string> => {
+      const raw = await ui.password({
+        message,
+        validate: (v) => {
+          if (v === undefined || v === "") return "a tunnel token is required (the eyJ... string from the connector install command)";
+          if (extractTunnelToken(v) === null) {
+            return "no tunnel token found in the input - paste the eyJ... string (a full install command line is fine)";
+          }
+          return undefined;
+        },
+      });
+      const extracted = extractTunnelToken(raw) ?? raw.trim();
+      ui.log.message(`token: ${tokenSummary(extracted)}`);
+      return extracted;
+    };
     let token = forceDryRun ? "dry-run-token" : env[tokenEnvName];
     if (!forceDryRun) {
       if (token) {
@@ -106,12 +124,12 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
           ],
         });
         if (choice === "paste") {
-          token = await ui.password({ message: "tunnel token (Zero Trust -> Networks -> Tunnels: your tunnel -> copy token)" });
+          token = await pasteToken("tunnel token (Zero Trust -> Networks -> Tunnels: your tunnel -> copy token)");
         }
       } else {
-        token = await ui.password({
-          message: `tunnel token (${tokenEnvName} not set; Zero Trust -> Networks -> Tunnels: create or open a tunnel/connector, then copy its token)`,
-        });
+        token = await pasteToken(
+          `tunnel token (${tokenEnvName} not set; Zero Trust -> Networks -> Tunnels: create or open a tunnel/connector, then copy its token)`,
+        );
       }
       if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
     }

@@ -152,7 +152,8 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
   // 应答式驱动（@clack 键序：text/password \r 提交、select \r/方向键）：
   // 粘贴 token → hostname → dual → dry-run
   const driven = driveWizard(child, [
-    { expect: /tunnel token/, send: "piped-token\r" },
+    // validate 只放行 eyJ 形态（2026-08-31 粘贴宽容度）——用合法形态驱动
+    { expect: /tunnel token/, send: `eyJ${"A1b2c3D4e5".repeat(18)}\r` },
     { expect: /gateway hostname/, send: "dweb.example.com\r" },
     { expect: /routing mode/, send: "\r" },
     { expect: /apply this plan/, send: "\x1b[B\r" },
@@ -167,8 +168,10 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
   assert.match(out, /gateway\s+dweb\.example\.com/);
   assert.match(out, /dry-run: would PUT ingress config/);
   assert.match(out, /dry-run ok - nothing was pushed/);
-  // 遮蔽：管道模式无回显，粘贴的 token 不得出现在输出
-  assert.ok(!out.includes("piped-token"), "token must not be echoed");
+  // 遮蔽：管道模式无回显，完整 token 不得出现在输出（头尾摘要除外）
+  const fullToken = `eyJ${"A1b2c3D4e5".repeat(18)}`;
+  assert.ok(!out.includes(fullToken), "full token must not be echoed");
+  assert.match(out, /token: eyJA1b2c\.\.\.[a-zA-Z0-9]{6} \(\d+ chars\)/);
   // dry-run 零副作用：不写配置文件
   assert.equal(await fsp.stat(path.join(e.dir, "opendweb.config.toml")).then(() => true).catch(() => false), false);
 });

@@ -1,6 +1,6 @@
 {
   "name": "@jixo/opendweb-ext-cf",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "opendweb plugin — Cloudflare Tunnel exposure wizard (ingress push via API, end-to-end verification, optional cloudflared co-spawn)",
   "license": "MIT OR Apache-2.0",
   "type": "module",

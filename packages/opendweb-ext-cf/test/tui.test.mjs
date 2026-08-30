@@ -43,7 +43,12 @@ function fakeClack(answers) {
     },
     password: async (cfg) => {
       calls.password.push(cfg);
-      return next("password").value;
+      for (;;) {
+        const a = next("password");
+        const err = cfg.validate?.(a.value);
+        if (err) continue; // 重问：消耗下一个应答
+        return a.value;
+      }
     },
     select: async (cfg) => {
       calls.select.push(cfg);
@@ -260,22 +265,53 @@ test("runInteractiveSetup: forceDryRun with real runSetup touches neither fetch 
   assert.equal(spies.write, 0);
 });
 
-test("runInteractiveSetup: pasted token is used when the environment has none", async () => {
+// 真实形态 token（eyJ 前缀 base64url，长度 150+）
+const RAW_TOKEN = `eyJ${"A1b2c3D4e5".repeat(18)}`;
+
+test("runInteractiveSetup: a pasted bare token passes validation and echoes a head/tail summary", async () => {
   const fk = fakeClack([
-    A.password("pasted-token"),
+    A.password(`  ${RAW_TOKEN}  `), // 前后空白自动 trim
     A.text("dweb.example.com"),
     A.select("dual"),
     A.select("apply"),
   ]);
   const { calls, impl } = mockRunSetup();
-  const r = await runInteractiveSetup({
-    cwd: "/proj",
-    env: {},
-    clack: fk,
-    runSetupImpl: impl,
-  });
+  const r = await runInteractiveSetup({ cwd: "/proj", env: {}, clack: fk, runSetupImpl: impl });
   assert.equal(r.exit, 0);
-  assert.equal(calls[0].token, "pasted-token");
+  assert.equal(calls[0].token, RAW_TOKEN);
+  // 提交后回显头尾对照（头 8 + 尾 6 + 长度），不再是全遮蔽黑箱
+  const summary = `token: ${RAW_TOKEN.slice(0, 8)}...${RAW_TOKEN.slice(-6)} (${RAW_TOKEN.length} chars)`;
+  assert.ok(fk.calls.log.includes(summary), `expected summary line "${summary}", got: ${JSON.stringify(fk.calls.log)}`);
+});
+
+test("runInteractiveSetup: pasting the full install command extracts the token (2026-08-31 Owner)", async () => {
+  const fk = fakeClack([
+    A.password(`sudo cloudflared service install ${RAW_TOKEN}`),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const { calls, impl } = mockRunSetup();
+  const r = await runInteractiveSetup({ cwd: "/proj", env: {}, clack: fk, runSetupImpl: impl });
+  assert.equal(r.exit, 0);
+  assert.equal(calls[0].token, RAW_TOKEN, "command wrapper must be stripped");
+});
+
+test("runInteractiveSetup: non-token input is re-asked with an explanation", async () => {
+  const fk = fakeClack([
+    A.password("sudo cloudflared service install"), // 无 token：拒
+    A.password("hello"),                             // 非 eyJ 形态：拒
+    A.password(RAW_TOKEN),                           // 合法：过
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const { calls, impl } = mockRunSetup();
+  const r = await runInteractiveSetup({ cwd: "/proj", env: {}, clack: fk, runSetupImpl: impl });
+  assert.equal(r.exit, 0);
+  assert.equal(calls[0].token, RAW_TOKEN);
+  // validate 的两次拒绝确实发生（fake 的重问循环消耗了 3 个 password 应答）
+  assert.equal(fk.calls.password.length, 1, "one prompt instance, re-asked in place");
 });
 
 test("runInteractiveSetup: invalid hostname is re-asked until it validates", async () => {

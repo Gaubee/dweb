@@ -28,6 +28,25 @@ export interface IngressConfig {
  * a/t 会拼进 API URL 路径、s 进 Authorization 头——白名单字符集阻断
  * 路径穿越/头注入（合法 CF 值均为 [A-Za-z0-9_-]）。
  */
+/**
+ * 从粘贴文本中提取 tunnel token（2026-08-31 Owner 需求）：用户粘贴的常是
+ * 整条安装命令（`sudo cloudflared service install eyJ...`）甚至多行说明，
+ * 而非裸 token。CF token 是 base64(JSON{a,t,s})——必然以 eyJ（`{"` 的
+ * base64）开头、字符集 base64url、无 padding，实际长度 150+（阈值 80 留
+ * 余量）。取首个匹配；无匹配返回 null（调用方负责重问）。
+ */
+export function extractTunnelToken(raw: string): string | null {
+  const m = /eyJ[A-Za-z0-9_-]{80,}/.exec(raw.trim());
+  return m === null ? null : m[0];
+}
+
+/** token 摘要（提交后回显对照用）：头 8 + … + 尾 6 + 长度 */
+export function tokenSummary(token: string): string {
+  const head = token.slice(0, 8);
+  const tail = token.length > 14 ? token.slice(-6) : "";
+  return `${head}...${tail} (${token.length} chars)`;
+}
+
 export function decodeTunnelToken(token: string): TunnelCreds {
   let json: string;
   try {

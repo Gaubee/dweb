@@ -23,7 +23,10 @@ export interface ClackApi {
     defaultValue?: string;
     validate?: (value: string | undefined) => string | undefined;
   }): Promise<string>;
-  password(options: { message: string }): Promise<string>;
+  password(options: {
+    message: string;
+    validate?: (value: string) => string | undefined;
+  }): Promise<string>;
   select<T>(options: {
     message: string;
     options: Array<{ value: T; label: string; hint?: string }>;
@@ -45,7 +48,10 @@ export interface UiPrompts {
     defaultValue?: string;
     validate?: (value: string | undefined) => string | undefined;
   }): Promise<string>;
-  password(input: { message: string }): Promise<string>;
+  password(input: {
+    message: string;
+    validate?: (value: string) => string | undefined;
+  }): Promise<string>;
   select<T>(input: {
     message: string;
     options: Array<{ value: T; label: string; hint?: string }>;
@@ -103,7 +109,13 @@ export function createPrompts(clack: ClackApi): UiPrompts {
           ...(validate ? { validate } : {}),
         }),
       ),
-    password: async ({ message }) => guard(await clack.password({ message: sanitizeUI(message) })),
+    password: async ({ message, validate }) =>
+      guard(
+        await clack.password({
+          message: sanitizeUI(message),
+          ...(validate !== undefined ? { validate } : {}),
+        }),
+      ),
     select: async ({ message, options, initialValue }) =>
       guard(
         await clack.select({
