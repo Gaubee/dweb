@@ -4,6 +4,7 @@
   "description": "opendweb local plugin helper — definePlugin wraps the declare/hook subprocess protocol (runtime-agnostic ESM)",
   "license": "MIT OR Apache-2.0",
   "type": "module",
+  "files": ["src", "README.md"],
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js"

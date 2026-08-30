@@ -117,6 +117,24 @@ jobs:
           npm pkg set 'dependencies.@jixo/opendweb-client-sdk=^'"$VER" --prefix packages/example
           npm pkg set 'dependencies.@jixo/opendweb-server-binary=^'"$VER" --prefix packages/opendweb
           grep -r '"@jixo/opendweb' packages/*/package.json
+      # ext-cf 的 dist 不入库（gitignored）：CI 安装 workspace 依赖后构建，
+      # pack:dry 门禁一步完成 build + 依赖清单断言 + bundle 残留 grep
+      - name: Build & gate @jixo/opendweb-ext-cf
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm --filter @jixo/opendweb-ext-cf run pack:dry
+      - name: Verify @jixo/opendweb-config tarball manifest
+        run: |
+          cd packages/opendweb-config && npm pack --dry-run 2>&1 | tee /tmp/cfg.log
+          grep -q "src/index.js" /tmp/cfg.log
+          grep -q "README.md" /tmp/cfg.log
+      - name: Publish @jixo/opendweb-config
+        run: npm publish --access public --provenance
+        working-directory: packages/opendweb-config
+      - name: Publish @jixo/opendweb-ext-cf
+        run: npm publish --access public --provenance
+        working-directory: packages/opendweb-ext-cf
       - name: Publish @jixo/opendweb-server-binary
         run: npm publish --access public --provenance
         working-directory: packages/server-binary
