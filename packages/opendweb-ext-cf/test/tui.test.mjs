@@ -380,3 +380,115 @@ test("wantsInteractive: explicit flag always; otherwise only TTY without hostnam
   assert.equal(wantsInteractive({}, false), false);
   assert.equal(wantsInteractive({ hostname: "x.example.com" }, true), false);
 });
+
+// 2026-08-30 用户实测反馈：gateway 本身已是 zone 的子域时（如
+// gaubee.tweb.xin @ zone tweb.xin），dual 的 relay.<gateway> 超出免费
+// Universal SSL 的覆盖（zone 根 + 一级）——向导必须在 mode 步给出 single
+// 建议并说明原因，而不是无差别推荐 dual。
+const ZONE_TOKEN = Buffer.from(JSON.stringify({ a: "acc123", t: "tun456", s: "sec789" })).toString("base64");
+
+test("mode step: zone lookup recommends single when relay.<gateway> is beyond the free Universal SSL cert", async () => {
+  const fk = fakeClack([
+    A.select("env"),                     // token 来源
+    A.text("gaubee.tweb.xin"),           // zone 一级子域 -> relay 是二级
+    A.select("single"),                  // 建议已切到 single，用户确认
+    A.select("apply"),
+  ]);
+  const { calls, impl } = mockRunSetup();
+  const fetches = [];
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: { TUNNEL_TOKEN: ZONE_TOKEN },
+    clack: fk,
+    runSetupImpl: impl,
+    fetchImpl: async (url) => {
+      fetches.push(String(url));
+      return new Response(JSON.stringify({ result: [{ id: "zone1" }] }), { status: 200 });
+    },
+  });
+  assert.equal(r.exit, 0);
+  // zone 查询确实发生（hostname 后、mode 前）
+  assert.ok(fetches.some((u) => u.includes("/zones?") && u.includes("tweb.xin")), `zone query missing: ${fetches}`);
+  // 建议体现在选项与初始值上
+  const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
+  assert.ok(modeSel, "mode select captured");
+  const dual = modeSel.options.find((o) => o.value === "dual");
+  const single = modeSel.options.find((o) => o.value === "single");
+  assert.match(dual.hint, /needs a paid edge certificate.*ACM/);
+  assert.match(dual.hint, /relay\.gaubee\.tweb\.xin/);
+  assert.match(single.hint, /recommended.*free Universal SSL/);
+  assert.equal(modeSel.initialValue, "single");
+  assert.equal(calls[0].mode, "single");
+});
+
+test("mode step: zone at the gateway itself keeps dual as the recommended mode", async () => {
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("tweb.xin"),                  // gateway == zone -> relay 一级子域
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const { impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: { TUNNEL_TOKEN: ZONE_TOKEN },
+    clack: fk,
+    runSetupImpl: impl,
+    fetchImpl: async () => new Response(JSON.stringify({ result: [{ id: "zone1" }] }), { status: 200 }),
+  });
+  assert.equal(r.exit, 0);
+  const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
+  const dual = modeSel.options.find((o) => o.value === "dual");
+  const single = modeSel.options.find((o) => o.value === "single");
+  assert.match(dual.hint, /recommended.*covered by the free Universal SSL/);
+  assert.equal(single.hint, undefined);
+  assert.equal(modeSel.initialValue, "dual");
+});
+
+test("mode step: zone lookup failure degrades to the generic recommendation", async () => {
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const { calls } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: { TUNNEL_TOKEN: ZONE_TOKEN },
+    suggestedMode: "dual",
+    clack: fk,
+    runSetupImpl: async (input) => {
+      calls.push(input);
+      return { plan: { publicGatewayUrl: `https://${input.hostname}` } };
+    },
+    fetchImpl: async () => new Response(JSON.stringify({ result: [] }), { status: 200 }), // zone 查不到
+  });
+  assert.equal(r.exit, 0);
+  const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
+  assert.equal(modeSel.options.find((o) => o.value === "dual").hint, "recommended");
+  assert.equal(modeSel.options.find((o) => o.value === "single").hint, undefined);
+  assert.equal(modeSel.initialValue, "dual");
+});
+
+test("mode step: an invalid token degrades to the generic recommendation without crashing", async () => {
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const { impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: { TUNNEL_TOKEN: "not-a-jwt-shape" },
+    clack: fk,
+    runSetupImpl: impl,
+    fetchImpl: async () => {
+      throw new Error("fetch must not be reached for an undecodable token");
+    },
+  });
+  assert.equal(r.exit, 0);
+  const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
+  assert.equal(modeSel.options.find((o) => o.value === "dual").hint, "recommended");
+});

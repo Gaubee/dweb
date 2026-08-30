@@ -121,6 +121,36 @@ export async function pushIngress({
 }
 
 /**
+ * 查询 host 所属 zone 的名字（证书覆盖建议与 DNS 路由共用）。
+ * zone 名先试末两段、再试末三段（example.co.uk 这类公共后缀）；
+ * 查不到（token 无 Zone:Read / zone 不在本账号）返回 null。
+ */
+export async function lookupZoneName({
+  fetchImpl = fetch,
+  apiBase = CF_API_BASE,
+  accountTag,
+  apiToken,
+  host,
+}: {
+  fetchImpl?: FetchLike;
+  apiBase?: string;
+  host: string;
+} & Omit<TunnelCreds, "tunnelId">): Promise<{ zoneName: string; zoneId: string } | null> {
+  const labels = host.split(".");
+  const zoneCandidates = [...new Set([labels.slice(-2).join("."), labels.slice(-3).join(".")])];
+  for (const zoneName of zoneCandidates) {
+    const qs = new URLSearchParams({ name: zoneName, "account.id": accountTag });
+    const zoneRes = await fetchImpl(`${apiBase}/zones?${qs}`, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+    });
+    const zoneBody = (await zoneRes.json().catch(() => ({}))) as CfResponse;
+    const zoneId = zoneBody?.result?.[0]?.id ?? null;
+    if (zoneId) return { zoneName, zoneId };
+  }
+  return null;
+}
+
+/**
  * DNS 路由（best-effort）：查 zone → 建 CNAME <host> → <tunnelId>.cfargotunnel.com。
  * TUNNEL_TOKEN 的 api token 不一定有 DNS 权限——失败时抛错并提示手工路径。
  * R2-M7：query 经 URLSearchParams 构造（值里疑似 query 的字符一律编码）；
@@ -140,19 +170,13 @@ export async function routeDns({
 } & TunnelCreds): Promise<string[]> {
   const results: string[] = [];
   for (const host of hostnames) {
-    const labels = host.split(".");
-    const zoneCandidates = [labels.slice(-2).join("."), labels.slice(-3).join(".")];
     let zoneId: string | null = null;
     let lastZoneErr = "";
-    for (const zoneName of [...new Set(zoneCandidates)]) {
-      const qs = new URLSearchParams({ name: zoneName, "account.id": accountTag });
-      const zoneRes = await fetchImpl(`${apiBase}/zones?${qs}`, {
-        headers: { Authorization: `Bearer ${apiToken}` },
-      });
-      const zoneBody = (await zoneRes.json().catch(() => ({}))) as CfResponse;
-      zoneId = zoneBody?.result?.[0]?.id ?? null;
-      if (zoneId) break;
-      lastZoneErr = `zone lookup for ${zoneName} returned no zone`;
+    const zone = await lookupZoneName({ fetchImpl, apiBase, accountTag, apiToken, host });
+    if (zone) {
+      zoneId = zone.zoneId;
+    } else {
+      lastZoneErr = `zone lookup for ${host.split(".").slice(-2).join(".")} returned no zone`;
     }
     if (!zoneId) {
       throw new Error(

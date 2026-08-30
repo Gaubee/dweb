@@ -11,7 +11,7 @@
 import path from "node:path";
 
 import { runSetup, planExposure, type ExposureMode, type ExposurePlan } from "./wizard.js";
-import { buildIngress, type FetchLike } from "./cf-api.js";
+import { buildIngress, decodeTunnelToken, lookupZoneName, type FetchLike } from "./cf-api.js";
 import { createPrompts, sanitizeUI, InteractiveAbort, type ClackApi } from "./prompts.js";
 
 /** spinner 形状（@clack spinner 的结构化子集；闭包赋值需要命名类型） */
@@ -19,6 +19,11 @@ interface SpinnerLike {
   start(message?: string): void;
   stop(message?: string): void;
   message(text: string): void;
+}
+
+/** 1 -> first, 2 -> second, 3+ -> Nth（zone 深度提示用） */
+function ordinal(n: number): string {
+  return n === 1 ? "first" : n === 2 ? "second" : n === 3 ? "third" : `${n}th`;
 }
 
 export interface RunInteractiveOptions {
@@ -80,14 +85,20 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
           ],
         });
         if (choice === "paste") {
-          token = await ui.password({ message: "tunnel token (copy from Zero Trust -> Networks -> Tunnels)" });
+          token = await ui.password({ message: "tunnel token (Zero Trust -> Networks -> Tunnels: your tunnel -> copy token)" });
         }
       } else {
         token = await ui.password({
-          message: `tunnel token (${tokenEnvName} not set; copy from Zero Trust -> Networks -> Tunnels)`,
+          message: `tunnel token (${tokenEnvName} not set; Zero Trust -> Networks -> Tunnels: create or open a tunnel/connector, then copy its token)`,
         });
       }
       if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
+      // 教程提示（2026-08-30 用户实测反馈）：CF 网页向导创建连接器时会引导
+      // 配置「服务/Public Hostname」——token 模式（remote-managed）下该步可
+      // 跳过或随意填写：apply 时经 API 推送最终 ingress，网页配置会被覆盖
+      ui.log.message(
+        "note: the connector wizard's public-hostname/service step is optional - this tool pushes the final routing via the Cloudflare API",
+      );
     }
 
     // 2) hostname：库 validate 即时重问（planExposure 的 DNS 形态校验即权威）。
@@ -109,14 +120,62 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
       },
     });
 
-    // 3) mode
+    // 3) mode：按 zone 证书覆盖给建议。CF 免费 Universal SSL 只覆盖 zone 根
+    // 与一级子域（*.zone）：dual 的 relay.<gateway> 相对 zone 深两级的场景
+    // （如 gateway=a.b.example.com、zone=example.com）不在免费证书内，选 dual
+    // 会让 relay 端 HTTPS 握手失败——此时建议 single（或 ACM/Total TLS）。
+    // 查询失败（token 无 Zone:Read 等）静默降级为通用文案，不阻塞向导。
+    let modeHints: { dual: string; single: string; dualRecommended: boolean } | null = null;
+    if (!forceDryRun && fetchImpl !== undefined && token !== undefined) {
+      try {
+        const creds = decodeTunnelToken(token);
+        const spin = ui.spinner();
+        spinState.spin = spin;
+        spin.start("checking zone certificate coverage");
+        const zone = await lookupZoneName({
+          fetchImpl,
+          accountTag: creds.accountTag,
+          apiToken: creds.apiToken,
+          host: hostname,
+        });
+        spin.stop("zone check done");
+        spinState.spin = null;
+        if (zone) {
+          const depth = hostname.split(".").length - zone.zoneName.split(".").length;
+          modeHints =
+            depth === 0
+              ? {
+                  dual: "recommended - relay.<gateway> is a first-level subdomain, covered by the free Universal SSL cert",
+                  single: "one hostname, /relay and /ping path routing",
+                  dualRecommended: true,
+                }
+              : {
+                  dual: `needs a paid edge certificate: relay.${hostname} would be a ${ordinal(depth + 1)}-level subdomain of ${zone.zoneName}, beyond the free Universal SSL cert (ACM / Total TLS required)`,
+                  single: `recommended for ${zone.zoneName} - stays on ${hostname}, covered by the free Universal SSL cert`,
+                  dualRecommended: false,
+                };
+        }
+      } catch {
+        // zone 不可知（权限/网络）：不做建议，保持通用选项
+      }
+    }
+    const dualHint = modeHints === null ? "recommended" : modeHints.dual;
+    const singleHint = modeHints !== null && !modeHints.dualRecommended ? modeHints.single : undefined;
     const mode = await ui.select<ExposureMode>({
       message: "routing mode",
       options: [
-        { value: "dual", label: "dual - separate hostnames (gateway + relay.<gateway>)", hint: "recommended" },
-        { value: "single", label: "single - one hostname, /relay and /ping path routing" },
+        {
+          value: "dual",
+          label: "dual - separate hostnames (gateway + relay.<gateway>)",
+          ...(dualHint !== undefined ? { hint: dualHint } : {}),
+        },
+        {
+          value: "single",
+          label: "single - one hostname, /relay and /ping path routing",
+          ...(singleHint !== undefined ? { hint: singleHint } : {}),
+        },
       ],
-      initialValue: suggestedMode,
+      initialValue: modeHints !== null && !modeHints.dualRecommended ? "single" : suggestedMode,
     });
 
     // 4) 计划预览（note 的 body 是结构性多行文本：动态值逐项 sanitize，
