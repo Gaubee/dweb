@@ -155,7 +155,7 @@ export default {
  * setup 引导模式的进入条件：显式 --interactive 恒进（管道/脚本可驱动）；
  * 否则仅当「终端 && 缺 --hostname」时自动进入（裸 `opendweb cf setup` 即引导）。
  */
-export function wantsInteractive(args: { interactive?: boolean; hostname?: string }, isTTY: boolean): boolean {
+export function wantsInteractive(args: { interactive?: boolean | undefined; hostname?: string | undefined }, isTTY: boolean): boolean {
   return args.interactive === true || (!args.hostname && isTTY);
 }
 
@@ -266,7 +266,8 @@ function tomlSummary(text: string): ConfigSummary {
   const server: ConfigSummary["server"] = {};
   for (const key of ["publicGatewayUrl", "publicRelayUrl"] as const) {
     const m = new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m").exec(text);
-    if (m) server[key] = m[1];
+    const v = m?.[1];
+    if (v !== undefined) server[key] = v;
   }
   const plugins: ConfigSummary["plugins"] = [];
   let current: PluginEntrySummary | null = null;
@@ -286,8 +287,9 @@ function tomlSummary(text: string): ConfigSummary {
     }
     if (current === null) {
       const arr = /^\s*"?plugins"?\s*=\s*\[(.*)\]/.exec(line);
-      if (arr) {
-        for (const part of arr[1].split(",")) {
+      const arrBody = arr?.[1];
+      if (arrBody !== undefined) {
+        for (const part of arrBody.split(",")) {
           const s = part.trim().replace(/^"|"$/g, "");
           if (s) plugins.push(s);
         }
@@ -295,11 +297,13 @@ function tomlSummary(text: string): ConfigSummary {
       continue;
     }
     const kv = /^\s*(name|tokenEnv|mode)\s*=\s*"([^"]*)"/.exec(line);
-    if (!kv) continue;
-    if (kv[1] === "name") current.name = kv[2];
+    const kvKey = kv?.[1];
+    const kvVal = kv?.[2];
+    if (kvKey === undefined || kvVal === undefined) continue;
+    if (kvKey === "name") current.name = kvVal;
     else {
       current.options = current.options ?? {};
-      (current.options as Record<string, string>)[kv[1]] = kv[2];
+      (current.options as Record<string, string>)[kvKey] = kvVal;
     }
   }
   if (current?.name !== undefined) plugins.push(current);

@@ -44,6 +44,11 @@ let tunnelPending: StartupState | null = null; // 已 spawn 但仍在健康窗�
 let tunnelChild: ActiveTunnel | null = null; // 当前活跃记录 { child, watchdog }，供 preStop 摘除本 child 的观察器
 let tunnelStopAll: Promise<void> | null = null; // 进行中的全程停止 Promise（并发 preStop 共享，R6-Major）
 
+/** 退出标签（exit 快照优先 code，其次 signal），watchdog 与悬挂清理共用 */
+function exitLabelOf(child: ChildProcess): string {
+  return `code ${child.exitCode ?? child.signalCode}`;
+}
+
 /**
  * 共生 cloudflared 的生命周期（R3 竞态重构：「启动中」与「已登记」拆分为
  * 独立状态，exit 事件可能迟到于进程实际退出，一切判定都以
@@ -52,12 +57,25 @@ let tunnelStopAll: Promise<void> | null = null; // 进行中的全程停止 Prom
  * stderr WARNING（绝不无声伪成功），preStop 主动停止先摘除观察器。
  */
 function spawnCloudflared(token: string, graceMs: number = Number(process.env.DWEB_CF_SPAWN_GRACE_MS) || 2000): Promise<void> {
-  if (tunnelStart !== null) return tunnelStart.promise;
-  // 悬挂句柄（已退出但 exit 事件未派发）不得当作存活——清理后再 spawn
-  if (tunnelChild !== null && !exited(tunnelChild.child)) {
-    return Promise.resolve();
+  // 全程停止事务进行中：事务快照取走的是旧状态，此刻新 spawn 的 child
+  // 无人认领（事务会在 tunnelChild===null 时直接返回）——拒绝，杜绝孤儿
+  // 进程逃逸 preStop（R6 复审阻塞项：stop-中-start 所有权竞态）。
+  if (tunnelStopAll !== null) {
+    return Promise.reject(new Error("cloudflared is stopping; refusing to start a new tunnel"));
   }
-  tunnelChild = null;
+  if (tunnelStart !== null) return tunnelStart.promise;
+  if (tunnelChild !== null) {
+    if (!exited(tunnelChild.child)) {
+      return Promise.resolve();
+    }
+    // 防御性不变量：悬挂记录（快照已退出）不得无声丢弃——否则其 watchdog
+    // 若在清理后才派发，会因 tunnelChild!==active 静默返回，晚退 WARNING
+    // 被吞。同步完成告警并摘除旧 watchdog（双保险防双报）。
+    const stale = tunnelChild;
+    tunnelChild = null;
+    stale.child.removeListener("exit", stale.watchdog);
+    console.error(`WARNING: cloudflared exited (${exitLabelOf(stale.child)}); the public tunnel is down`);
+  }
 
   const state: StartupState = {
     promise: null as never,
@@ -109,9 +127,8 @@ function spawnCloudflared(token: string, graceMs: number = Number(process.env.DW
 
   state.child = child;
   tunnelPending = state;
-  const exitLabel = () => `code ${child.exitCode ?? child.signalCode}`;
   const startupFailure = () =>
-    `cloudflared exited during startup (${exitLabel()}); check TUNNEL_TOKEN and the tunnel config`;
+    `cloudflared exited during startup (${exitLabelOf(child)}); check TUNNEL_TOKEN and the tunnel config`;
   child.once("error", (e: Error) => {
     fail(`failed to start cloudflared (${e.message}); is it installed and on PATH?`);
   });
@@ -145,7 +162,7 @@ function spawnCloudflared(token: string, graceMs: number = Number(process.env.DW
         // startup exit listener 归一为启动失败，不得再叠一条 WARNING）
         if (tunnelChild !== active) return;
         tunnelChild = null;
-        console.error(`WARNING: cloudflared exited (${exitLabel()}); the public tunnel is down`);
+        console.error(`WARNING: cloudflared exited (${exitLabelOf(child)}); the public tunnel is down`);
       };
       active.watchdog = watchdog;
       child.once("exit", watchdog);
@@ -351,5 +368,5 @@ export default {
 function hostnameFromServer(server: HookContext["server"]): string | null {
   const url = server?.publicGatewayUrl;
   if (typeof url !== "string" || !url.startsWith("https://")) return null;
-  return url.slice("https://".length).replace(/\/+$/, "").split(":")[0];
+  return url.slice("https://".length).replace(/\/+$/, "").split(":")[0] ?? null;
 }

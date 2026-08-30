@@ -24,7 +24,7 @@ interface SpinnerLike {
 export interface RunInteractiveOptions {
   cwd: string;
   tokenEnvName?: string;
-  suggestedHostname?: string;
+  suggestedHostname?: string | undefined;
   suggestedMode?: ExposureMode;
   suggestedAction?: "apply" | "dry";
   forceDryRun?: boolean;

@@ -101,7 +101,7 @@ export async function verifyExposure({
   publicGatewayUrl: string;
   expectedRelayUrl: string;
   timeoutMs?: number;
-  onProgress?: (info: VerifyInfo) => void;
+  onProgress?: ((info: VerifyInfo) => void) | undefined;
 }): Promise<VerifyResult> {
   const deadline = Date.now() + timeoutMs;
   const url = `${publicGatewayUrl.replace(/\/+$/, "")}/services.json`;
@@ -147,7 +147,7 @@ export interface RunSetupOptions {
   mode?: ExposureMode;
   cwd: string;
   /** R2-M2：显式目标文件（`opendweb setup --config`）；缺省为 cwd 下的默认名 */
-  configPath?: string | null;
+  configPath?: string | null | undefined;
   tokenEnvName?: string;
   dryRun?: boolean;
   skipVerify?: boolean;

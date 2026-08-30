@@ -374,6 +374,70 @@ test("postReady hook: dying after the grace window must surface the WARNING (R2-
   }
 });
 
+// R6 复审阻塞项回归：preStop 停止事务进行中并发 postReady 不得产出无人
+// 认领的孤儿 child——事务快照取走旧状态后，新 spawn 的进程会逃逸清理。
+// 契约：停止中的新启动直接拒绝（拒绝消息可辨认），stop settle 后无进程存活。
+test("postReady hook: a start racing an in-flight preStop is rejected, never an orphan (R6 stop-vs-start)", { skip: process.platform === "win32" }, async () => {
+  const plugin = (await import("../dist/index.mjs")).default;
+  const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
+  const spawnLog = path.join(binDir, "spawns.log");
+  const fake = path.join(binDir, "cloudflared");
+  await fsp.writeFile(fake, '#!/bin/sh\necho $$ >> "$DWEB_CF_SPAWN_LOG"\nexec /bin/sleep 30\n', "utf8");
+  const { chmodSync } = await import("node:fs");
+  chmodSync(fake, 0o755);
+  const prevPath = process.env.PATH;
+  const prevToken = process.env.TUNNEL_TOKEN;
+  const prevGrace = process.env.DWEB_CF_SPAWN_GRACE_MS;
+  process.env.PATH = binDir;
+  process.env.TUNNEL_TOKEN = "placeholder";
+  process.env.DWEB_CF_SPAWN_GRACE_MS = "150";
+  process.env.DWEB_CF_SPAWN_LOG = spawnLog;
+  const { execFileSync } = await import("node:child_process");
+  try {
+    await plugin.hooks["server.postReady"]({ options: { tunnel: true } });
+    // 有界等待首个 spawn 记录落盘：新写可执行文件的首次 exec 可滞后数百
+    // 毫秒（macOS 扫描），确保 fake 已进入 /bin/sleep 再触发停止竞态
+    let firstPid = "";
+    const logDeadline = Date.now() + 5000;
+    while (Date.now() < logDeadline) {
+      try {
+        firstPid = (await fsp.readFile(spawnLog, "utf8")).trim();
+        if (firstPid) break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    assert.ok(firstPid, "first spawn must be recorded before racing the stop");
+    // 不 await：让 preStop 停在 reap 旧 child 的 await 上
+    const stopP = plugin.hooks["server.preStop"]();
+    let racing = null;
+    try {
+      await plugin.hooks["server.postReady"]({ options: { tunnel: true } });
+    } catch (e) {
+      racing = e;
+    }
+    assert.ok(racing instanceof Error, "a start during an in-flight stop must be rejected");
+    assert.match(racing.message, /cloudflared is stopping/);
+    await stopP;
+    assert.throws(
+      () => execFileSync("/bin/sh", ["-c", `kill -0 ${Number(firstPid)}`]),
+      "the reaped child pid must be gone when the stop promise settles",
+    );
+    const pids = (await fsp.readFile(spawnLog, "utf8")).trim().split("\n").filter(Boolean);
+    assert.equal(pids.length, 1, `expected exactly one spawn (the racing start must not spawn), got: ${pids}`);
+  } finally {
+    await plugin.hooks["server.preStop"]().catch(() => {});
+    try {
+      execFileSync("/bin/sh", ["-c", `kill $(cat ${JSON.stringify(spawnLog)} 2>/dev/null) 2>/dev/null || true`]);
+    } catch { /* best effort */ }
+    process.env.PATH = prevPath;
+    process.env.DWEB_CF_SPAWN_GRACE_MS = prevGrace;
+    delete process.env.DWEB_CF_SPAWN_LOG;
+    if (prevToken === undefined) delete process.env.TUNNEL_TOKEN;
+    else process.env.TUNNEL_TOKEN = prevToken;
+  }
+});
+
 test("postReady hook: concurrent tunnel requests share one spawn; preStop reaps it (R3 race hardening)", { skip: process.platform === "win32" }, async () => {
   const plugin = (await import("../dist/index.mjs")).default;
   const binDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-bin-"));
