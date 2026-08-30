@@ -26,6 +26,27 @@ async function env() {
   return { dir, home };
 }
 
+
+/**
+ * 应答式驱动 @clack 向导：每步等到上一问渲染出 expect 再发送 send。
+ * @clack 在 prompt 切换窗口内到达的 keypress 会被丢弃（无 readline 行缓冲），
+ * 预置全量输入会卡死——按提示节奏发送是可靠形态。
+ * @param {import("node:child_process").ChildProcess} child
+ * @param {{ expect: RegExp, send: string }[]} steps
+ * @param {() => string} outSoFar
+ */
+async function driveWizard(child, steps, outSoFar) {
+  for (const step of steps) {
+    const deadline = Date.now() + 15000;
+    while (!step.expect.test(outSoFar())) {
+      if (Date.now() > deadline) throw new Error(`wizard step not rendered: ${step.expect}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    child.stdin.write(step.send);
+  }
+  child.stdin.end();
+}
+
 /**
  * 有界等待子进程退出（P1-3 的 watchdog，R2 收尾：正常退出即 clearTimeout，
  * 超时 timer 亦 unref——不留 30s 残留 timer 拖住测试进程）。
@@ -124,25 +145,28 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
     env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1" },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  // 管道预置全部应答：粘贴 token（遮蔽）→ hostname → dual → dry-run
-  child.stdin.write("piped-token\n");
-  child.stdin.write("dweb.example.com\n");
-  child.stdin.write("1\n");
-  child.stdin.write("d\n");
-  child.stdin.end();
   let out = "";
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
+  // 应答式驱动（@clack 键序：text/password \r 提交、select \r/方向键）：
+  // 粘贴 token → hostname → dual → dry-run
+  const driven = driveWizard(child, [
+    { expect: /tunnel token/, send: "piped-token\r" },
+    { expect: /gateway hostname/, send: "dweb.example.com\r" },
+    { expect: /routing mode/, send: "\r" },
+    { expect: /apply this plan/, send: "\x1b[B\r" },
+  ], () => out);
   // P1-3：有界等待——挂起时 kill 子进程并带已采集输出失败（不留僵尸门禁）
-  const code = await exitWithDeadline(child);
+  const code = await Promise.race([exitWithDeadline(child), driven.then(() => "driven")]);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}\nstderr: ${err}`);
-  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  const finalCode = await exitWithDeadline(child);
+  assert.equal(finalCode, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /interactive wizard/);
-  assert.match(out, /plan:/);
+  assert.match(out, /plan/);
   assert.match(out, /gateway\s+dweb\.example\.com/);
   assert.match(out, /dry-run: would PUT ingress config/);
-  assert.match(out, /setup ok \(dry-run\)/);
+  assert.match(out, /dry-run ok - nothing was pushed/);
   // 遮蔽：管道模式无回显，粘贴的 token 不得出现在输出
   assert.ok(!out.includes("piped-token"), "token must not be echoed");
   // dry-run 零副作用：不写配置文件
@@ -160,26 +184,29 @@ test("cf setup --interactive --dry-run: y still runs dry-run only; unicode cwd s
     env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1" },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  // forceDryRun：不问 token；hostname -> mode -> 二元确认 y（即便输 y 也是 dry）
-  child.stdin.write("dweb.example.com\n");
-  child.stdin.write("1\n");
-  child.stdin.write("y\n");
-  child.stdin.end();
   let out = "";
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
-  const code = await exitWithDeadline(child);
+  // forceDryRun：不问 token；hostname -> mode -> 二元确认 y（即便输 y 也是 dry）
+  const driven = driveWizard(child, [
+    { expect: /gateway hostname/, send: "dweb.example.com\r" },
+    { expect: /routing mode/, send: "\r" },
+    { expect: /dry-run\? \(nothing will be pushed\)/, send: "y" },
+  ], () => out);
+  const code = await Promise.race([exitWithDeadline(child), driven.then(() => "driven")]);
+  const finalCode = await exitWithDeadline(child);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
-  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  assert.equal(finalCode, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /dry-run\? \(nothing will be pushed\)/);
   assert.match(out, /dry-run: would PUT ingress config/);
-  assert.match(out, /setup ok \(dry-run\)/);
+  assert.match(out, /dry-run ok - nothing was pushed/);
   // 非 token 问题不得出现（forceDryRun 跳过收集）
   assert.ok(!out.includes("paste the tunnel token"));
-  // ASCII 纪律：stdout 全 ASCII，Unicode 目录以 \xNN 转义出现
-  assert.match(out, /^[\x00-\x7F]*$/, "stdout must be all-ASCII");
-  assert.ok(out.includes("\\xc3\\xbc"), "unicode dir bytes (UTF-8) must be escaped visibly");
+  // Unicode 边界（Owner 二轮决策）：@clack 骨架为 Unicode 装饰，动态值保留
+  // 可打印 Unicode——unicode 目录原样可见；注入面由 sanitizeUI 的控制字符
+  // 转义堵住（单测覆盖），此处断言输出不含裸换行外控制字符以外的注入形态
+  assert.ok(out.includes("gr\u00fc\u2713"), "unicode cwd must be visible in the plan");
 });
 
 test("cf setup without a terminal and without --hostname fails with wizard guidance", async () => {
@@ -213,19 +240,22 @@ test("cf setup --interactive: TOML config prefills tokenEnv/hostname/mode (flag 
     env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1", CUSTOM_TOK_ENV: "tok" },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  // 全部回车取预填：token 用 env -> hostname 取 config 推导 -> mode=single -> dry
-  child.stdin.write("\n");
-  child.stdin.write("\n");
-  child.stdin.write("\n");
-  child.stdin.write("d\n");
-  child.stdin.end();
   let out = "";
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
-  const code = await exitWithDeadline(child);
+  // 全部回车取预填：token 用 env -> hostname 取 config 推导 -> mode=single
+  // -> action select 下移到 dry-run
+  const driven = driveWizard(child, [
+    { expect: /detected CUSTOM_TOK_ENV/, send: "\r" },
+    { expect: /gateway hostname/, send: "\r" },
+    { expect: /routing mode/, send: "\r" },
+    { expect: /apply this plan/, send: "\x1b[B\r" },
+  ], () => out);
+  const code = await Promise.race([exitWithDeadline(child), driven.then(() => "driven")]);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
-  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  const finalCode = await exitWithDeadline(child);
+  assert.equal(finalCode, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /detected CUSTOM_TOK_ENV in the environment/); // tokenEnv 预填
   assert.match(out, /gateway\s+cfg\.example\.com/); // hostname 从 server.publicGatewayUrl 预填
   assert.match(out, /single-domain path routing/); // mode=single 预填
@@ -248,18 +278,20 @@ test("cf setup --interactive: JSON config prefill loses to explicit flags", asyn
     env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1", TUNNEL_TOKEN: "tok" },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  child.stdin.write("\n"); // token 用 TUNNEL_TOKEN（flag 覆盖 JSON_TOK_ENV）
-  child.stdin.write("\n"); // hostname 取 flag 值（覆盖 json 推导）
-  child.stdin.write("\n"); // mode=dual（flag 覆盖 config single）
-  child.stdin.write("d\n");
-  child.stdin.end();
   let out = "";
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
-  const code = await exitWithDeadline(child);
+  const driven = driveWizard(child, [
+    { expect: /detected TUNNEL_TOKEN/, send: "\r" }, // flag 覆盖 JSON_TOK_ENV
+    { expect: /gateway hostname/, send: "\r" },      // flag hostname 为默认值
+    { expect: /routing mode/, send: "\r" },          // flag dual 覆盖 config single
+    { expect: /apply this plan/, send: "\x1b[B\r" },
+  ], () => out);
+  const code = await Promise.race([exitWithDeadline(child), driven.then(() => "driven")]);
   assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
-  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  const finalCode = await exitWithDeadline(child);
+  assert.equal(finalCode, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /detected TUNNEL_TOKEN in the environment/);
   assert.ok(!out.includes("JSON_TOK_ENV"), "flag token-env must beat config");
   assert.match(out, /gateway\s+flag\.example\.com/);

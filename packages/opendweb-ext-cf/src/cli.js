@@ -93,8 +93,6 @@ export default {
           suggestedAction: args["dry-run"] ? "dry" : "apply",
           forceDryRun: args["dry-run"] === true,
           skipVerify: Boolean(args["skip-verify"]),
-          stdout,
-          stderr,
         });
       }
       if (!args.hostname) {
@@ -165,9 +163,10 @@ async function runStatus({ args, mode, log, cwd }) {
 
 /**
  * 读取 cwd 的配置文件摘要（只读展示 + 引导预填；正式解析归 CLI 的
- * config-file 模块）。TOML 用最小扫描（本包零依赖）；解析不了的字段显示
- * 为缺省而非报错。cfOptions = cf 插件 [[plugins]] 条目的 options 摘要
- * （tokenEnv/mode，flag > config > default 的 config 层）。
+ * config-file 模块）。TOML 用最小扫描（核心零依赖；交互引导层才依赖
+ * @clack/prompts）；解析不了的字段显示为缺省而非报错。cfOptions = cf
+ * 插件 [[plugins]] 条目的 options 摘要（tokenEnv/mode，flag > config >
+ * default 的 config 层）。
  */
 function readConfigState(cwd) {
   for (const name of ["opendweb.config.toml", "opendweb.config.json"]) {

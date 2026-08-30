@@ -1,122 +1,67 @@
-// TUI 引导单测（2026-08-30 Owner 需求）：输入组件（默认值/遮蔽/选择/确认）
-// 与 runInteractiveSetup 编排（预览/确认/中止/dry-run/forceDryRun/无效
-// hostname 重问/失败 rethrow/ASCII 纪律），streams 全注入。应答行在调用前
-// 写入管道（PassThrough 缓冲，行队列 backlog 顺序消费——这正是被测语义）。
+// TUI 引导单测（2026-08-30 Owner 二轮决策：交互层基于 @clack/prompts）。
+// 编排测试注入 fake clack（脚本化应答；text 会执行 validate 模拟库的重问
+// 语义），@clack 自身的交互正确性由库自身测试背书；管道驱动的真实库行为
+// 由 e2e 覆盖（\r 提交、方向键序列）。另覆盖 sanitizeUI 防注入与
+// InteractiveAbort 的编排语义。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PassThrough } from "node:stream";
 
-import { createPrompts, asciiEscape } from "../src/prompts.mjs";
+import { sanitizeUI, InteractiveAbort, createPrompts } from "../src/prompts.mjs";
 import { runInteractiveSetup } from "../src/tui.mjs";
 import { wantsInteractive } from "../src/cli.js";
 
-/** 造一对管道流；feed() 把预置应答行全部写入（调用被测函数前执行） */
-function scriptedIO(lines) {
-  const input = new PassThrough();
-  const output = new PassThrough();
-  let chunks = "";
-  output.on("data", (d) => (chunks += d));
+/** fake clack：按类型弹出应答；记录全部调用供断言。text 执行 validate
+ * （返回 string 即取下一应答重试——模拟 @clack 的重问循环） */
+function fakeClack(answers) {
+  const queue = [...answers];
+  const calls = { text: [], password: [], select: [], confirm: [], intro: [], outro: [], note: [], log: [] };
+  const next = (type) => {
+    if (queue.length === 0) throw new Error(`fake clack: no scripted answer left for ${type}`);
+    const a = queue.shift();
+    if (a.type !== type) throw new Error(`fake clack: expected ${a.type}, got call ${type}`);
+    return a;
+  };
   return {
-    input,
-    output,
-    text: () => chunks,
-    feed: () => { for (const line of lines) input.write(`${line}\n`); },
+    calls,
+    isCancel: (v) => v === Symbol.for("clack:cancel"),
+    intro: (t) => { calls.intro.push(t); },
+    outro: (m) => { calls.outro.push(m); },
+    note: (body, title) => { calls.note.push({ body, title }); },
+    log: { message: (m) => { calls.log.push(m); }, step: (m) => { calls.log.push(m); } },
+    spinner: () => ({ start: () => {}, stop: () => {}, message: () => {} }),
+    text: async (cfg) => {
+      calls.text.push(cfg);
+      for (;;) {
+        const a = next("text");
+        // @clack 语义：空提交且设有 defaultValue 时 validate 收到 undefined，
+        // validate 通过后库返回 defaultValue
+        const toValidate = a.value === "" && cfg.defaultValue !== undefined ? undefined : a.value;
+        const err = cfg.validate?.(toValidate);
+        if (err) continue; // 重问：消耗下一个应答
+        return a.value === "" && cfg.defaultValue !== undefined ? cfg.defaultValue : a.value;
+      }
+    },
+    password: async (cfg) => {
+      calls.password.push(cfg);
+      return next("password").value;
+    },
+    select: async (cfg) => {
+      calls.select.push(cfg);
+      return next("select").value;
+    },
+    confirm: async (cfg) => {
+      calls.confirm.push(cfg);
+      return next("confirm").value;
+    },
   };
 }
 
-test("prompts: ask uses the default on empty input, returns typed value otherwise", async () => {
-  const io = scriptedIO(["", "typed.example.com"]);
-  io.feed();
-  const ui = createPrompts(io);
-  assert.equal(await ui.ask("gateway hostname", { default: "dweb.example.com" }), "dweb.example.com");
-  assert.equal(await ui.ask("gateway hostname", { default: "dweb.example.com" }), "typed.example.com");
-  ui.close();
-});
-
-test("prompts: askSecret masks the echoed input and restores _writeToOutput precisely", async () => {
-  const io = scriptedIO(["sekret-token-value"]);
-  io.feed();
-  const ui = createPrompts(io);
-  const value = await ui.askSecret("tunnel token");
-  assert.equal(value, "sekret-token-value");
-  const text = io.text();
-  assert.ok(!text.includes("sekret-token-value"), "secret must not be echoed");
-  assert.ok(text.includes("input hidden"));
-  // P2：遮蔽用 _writeToOutput 是原型方法——finally 后不得留下 own 属性
-  assert.equal(Object.hasOwn(ui.rl, "_writeToOutput"), false);
-  ui.close();
-});
-
-test("prompts: select honors default and validates invalid choices", async () => {
-  const io = scriptedIO(["9", "2"]);
-  io.feed();
-  const ui = createPrompts(io);
-  const picked = await ui.select("routing mode", [
-    { value: "dual", label: "dual", default: true },
-    { value: "single", label: "single" },
-  ]);
-  assert.equal(picked, "single");
-  assert.ok(io.text().includes("enter a number between 1 and 2"));
-  ui.close();
-});
-
-test("prompts: select falls back to the default on empty input", async () => {
-  const io = scriptedIO([""]);
-  io.feed();
-  const ui = createPrompts(io);
-  assert.equal(
-    await ui.select("routing mode", [
-      { value: "dual", label: "dual", default: true },
-      { value: "single", label: "single" },
-    ]),
-    "dual",
-  );
-  ui.close();
-});
-
-test("prompts: confirm3 maps y/d/n, the default, and re-asks on junk", async () => {
-  const io = scriptedIO(["y", "d", "n", "", "x", "yes"]);
-  io.feed();
-  const ui = createPrompts(io);
-  assert.equal(await ui.confirm3("apply this plan?"), "apply");
-  assert.equal(await ui.confirm3("apply this plan?"), "dry");
-  assert.equal(await ui.confirm3("apply this plan?"), "no");
-  assert.equal(await ui.confirm3("apply this plan?", "no"), "no");
-  assert.equal(await ui.confirm3("apply this plan?"), "apply");
-  assert.ok(io.text().includes("answer y, d or n"));
-  ui.close();
-});
-
-test("prompts: binary confirm maps y/n, the default, and re-asks on junk", async () => {
-  const io = scriptedIO(["y", "n", "", "x", "yes", "no"]);
-  io.feed();
-  const ui = createPrompts(io);
-  assert.equal(await ui.confirm("run it?"), true);
-  assert.equal(await ui.confirm("run it?"), false);
-  assert.equal(await ui.confirm("run it?", false), false);
-  assert.equal(await ui.confirm("run it?"), true); // x -> 重问 -> yes
-  assert.equal(await ui.confirm("run it?", false), false); // no
-  assert.ok(io.text().includes("answer y or n"));
-  ui.close();
-});
-
-test("prompts: EOF drains the backlog first, then rejects the next question (P1-3)", async () => {
-  const input = new PassThrough();
-  const output = new PassThrough();
-  output.on("data", () => {});
-  input.write("first\n");
-  input.end(); // EOF：backlog 里的行仍可消费；之后的提问必须拒绝而非挂死
-  const ui = createPrompts({ input, output });
-  assert.equal(await ui.ask("q1"), "first");
-  await assert.rejects(() => ui.ask("q2"), /input closed before an answer/);
-  ui.close();
-});
-
-test("asciiEscape: non-ASCII bytes become \\xNN escapes (writer discipline anchor)", () => {
-  assert.equal(asciiEscape("ok"), "ok");
-  assert.equal(asciiEscape("bad\u2713host"), "bad\\xe2\\x9c\\x93host");
-  assert.equal(asciiEscape("line\nbreak"), "line\\x0abreak");
-});
+const A = {
+  text: (value) => ({ type: "text", value }),
+  password: (value) => ({ type: "password", value }),
+  select: (value) => ({ type: "select", value }),
+  confirm: (value) => ({ type: "confirm", value }),
+};
 
 /** 编排用 mock runSetup：捕获参数并模拟成功 */
 function mockRunSetup() {
@@ -130,15 +75,46 @@ function mockRunSetup() {
   };
 }
 
+test("sanitizeUI: control characters are escaped, printable unicode kept (injection guard)", () => {
+  assert.equal(sanitizeUI("ok"), "ok");
+  assert.equal(sanitizeUI("bad\u2713host"), "bad\u2713host"); // 可打印 Unicode 保留（@clack 骨架即 Unicode）
+  assert.equal(sanitizeUI("esc\x1b[31mred"), "esc\\x1b[31mred"); // ESC 注入转义
+  assert.equal(sanitizeUI("line\nbreak"), "line\\x0abreak"); // 换行伪造 UI 转义
+  assert.equal(sanitizeUI("del\x7f"), "del\\x7f");
+});
+
+test("createPrompts: a clack cancel result maps to InteractiveAbort", async () => {
+  const cancel = Symbol.for("clack:cancel");
+  const fk = {
+    isCancel: (v) => v === cancel,
+    intro: () => {}, outro: () => {}, note: () => {},
+    log: { message: () => {} }, spinner: () => ({ start: () => {}, stop: () => {}, message: () => {} }),
+    text: async () => cancel,
+    password: async () => "x",
+    select: async () => "x",
+    confirm: async () => true,
+  };
+  const ui = createPrompts(fk);
+  await assert.rejects(() => ui.text({ message: "m" }), (e) => e instanceof InteractiveAbort);
+  // message 类动态值经 sanitizeUI
+  const calls = [];
+  fk.text = async (cfg) => { calls.push(cfg); return "v"; };
+  await ui.text({ message: "inject\nme" });
+  assert.equal(calls[0].message, "inject\\x0ame");
+});
+
 test("runInteractiveSetup: collect -> preview -> apply; runSetup receives resolved inputs", async () => {
-  const io = scriptedIO(["", "dweb.example.com", "1", "y"]); // env token 默认 / hostname / dual / apply
-  io.feed();
+  const fk = fakeClack([
+    A.select("env"),              // token 来源
+    A.text("dweb.example.com"),   // hostname
+    A.select("dual"),             // mode
+    A.select("apply"),            // 确认
+  ]);
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: { TUNNEL_TOKEN: "env-token" },
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
@@ -147,96 +123,127 @@ test("runInteractiveSetup: collect -> preview -> apply; runSetup receives resolv
   assert.equal(calls[0].hostname, "dweb.example.com");
   assert.equal(calls[0].mode, "dual");
   assert.equal(calls[0].dryRun, false);
-  const text = io.text();
-  assert.match(text, /plan:/);
-  assert.match(text, /gateway\s+dweb\.example\.com/);
-  assert.match(text, /this will:/);
-  assert.match(text, /setup ok \(applied\)/);
-  assert.match(text, /config set relay https:\/\/dweb\.example\.com/);
+  // 计划预览进 note（标题 plan）
+  assert.equal(fk.calls.note.length, 1);
+  assert.match(fk.calls.note[0].body, /gateway\s+dweb\.example\.com/);
+  assert.match(fk.calls.note[0].body, /steps:/);
+  // 成功收尾
+  assert.match(fk.calls.outro.join("\n"), /setup ok \(applied\)/);
+  assert.match(fk.calls.log.join("\n"), /config set relay https:\/\/dweb\.example\.com/);
 });
 
-test("runInteractiveSetup: empty hostname falls back to the suggested value", async () => {
-  const io = scriptedIO(["", "", "1", "y"]);
-  io.feed();
+test("runInteractiveSetup: empty hostname falls back to the suggested default value", async () => {
+  const fk = fakeClack([
+    A.select("env"),
+    A.text(""),                   // 空输入 -> @clack 取 defaultValue
+    A.select("dual"),
+    A.select("apply"),
+  ]);
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: { TUNNEL_TOKEN: "t" },
     suggestedHostname: "suggested.example.com",
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
   assert.equal(calls[0].hostname, "suggested.example.com");
+  // 建议值作为 defaultValue 传入库
+  assert.equal(fk.calls.text[0].defaultValue, "suggested.example.com");
 });
 
 test("runInteractiveSetup: abort keeps exit 0 and never runs setup", async () => {
-  const io = scriptedIO(["", "dweb.example.com", "1", "n"]);
-  io.feed();
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("no"),
+  ]);
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: { TUNNEL_TOKEN: "t" },
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
   assert.equal(calls.length, 0);
-  assert.match(io.text(), /aborted; nothing was changed/);
+  assert.match(fk.calls.outro.join("\n"), /aborted; nothing was changed/);
 });
 
-test("runInteractiveSetup: d runs the same flow as dry-run (zero side effects)", async () => {
-  const io = scriptedIO(["", "dweb.example.com", "2", "d"]); // single + dry
-  io.feed();
+test("runInteractiveSetup: clack cancel (Ctrl+C) maps to abort semantics", async () => {
+  const cancel = Symbol.for("clack:cancel");
+  const fk = fakeClack([]);
+  fk.select = async () => cancel; // 第一个问题（token 来源）即取消
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: { TUNNEL_TOKEN: "t" },
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
+    runSetupImpl: impl,
+  });
+  assert.equal(r.exit, 0);
+  assert.equal(calls.length, 0);
+  assert.match(fk.calls.outro.join("\n"), /aborted; nothing was changed/);
+});
+
+test("runInteractiveSetup: dry choice runs the same flow as dry-run", async () => {
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("dweb.example.com"),
+    A.select("single"),
+    A.select("dry"),
+  ]);
+  const { calls, impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: { TUNNEL_TOKEN: "t" },
+    clack: fk,
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
   assert.equal(calls[0].dryRun, true);
+  assert.equal(calls[0].skipVerify, true);
   assert.equal(calls[0].mode, "single");
-  assert.match(io.text(), /setup ok \(dry-run\)/);
-  assert.match(io.text(), /rehearsal/);
+  assert.match(fk.calls.outro.join("\n"), /dry-run ok - nothing was pushed/);
 });
 
 test("runInteractiveSetup: forceDryRun skips token collection and cannot become apply (P1-1)", async () => {
-  const io = scriptedIO(["dweb.example.com", "1", "y"]); // 无 token 问题；mode；二元确认 y
-  io.feed();
+  const fk = fakeClack([
+    A.text("dweb.example.com"),
+    A.select("dual"),             // mode 选择在 forced dry-run 下仍然存在
+    A.confirm(true),              // 二元 go
+  ]);
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
-    env: {}, // 无环境 token：forceDryRun 下不得询问
+    env: {},                      // 无环境 token：forceDryRun 下不得询问
     forceDryRun: true,
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
+  assert.equal(fk.calls.password.length, 0, "dry-run must not demand a token");
+  assert.match(fk.calls.confirm[0].message, /dry-run\? \(nothing will be pushed\)/);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].dryRun, true);
   assert.equal(calls[0].skipVerify, true);
   assert.equal(calls[0].token, "dry-run-token");
-  const text = io.text();
-  assert.ok(!text.includes("paste the tunnel token"), "dry-run must not demand a token");
-  assert.match(text, /dry-run\? \(nothing will be pushed\)/);
 });
 
 test("runInteractiveSetup: forceDryRun with real runSetup touches neither fetch nor writeFile (P1-1)", async () => {
-  const io = scriptedIO(["dweb.example.com", "1", "y"]);
-  io.feed();
+  const fk = fakeClack([
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.confirm(true),
+  ]);
   const spies = { fetch: 0, write: 0 };
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: {},
     forceDryRun: true,
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
     fetchImpl: async () => { spies.fetch += 1; throw new Error("must not be called"); },
     writeFile: async () => { spies.write += 1; },
     exists: () => false,
@@ -247,72 +254,90 @@ test("runInteractiveSetup: forceDryRun with real runSetup touches neither fetch 
 });
 
 test("runInteractiveSetup: pasted token is used when the environment has none", async () => {
-  const io = scriptedIO(["pasted-token", "dweb.example.com", "1", "y"]);
-  io.feed();
+  const fk = fakeClack([
+    A.password("pasted-token"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: {},
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
   assert.equal(calls[0].token, "pasted-token");
-  assert.ok(!io.text().includes("pasted-token"), "pasted token must stay masked");
 });
 
 test("runInteractiveSetup: invalid hostname is re-asked until it validates", async () => {
-  const io = scriptedIO(["", "bad host", "localhost", "dweb.example.com", "1", "y"]);
-  io.feed();
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("bad host"),           // validate 拒绝 -> 库重问
+    A.text("localhost"),          // 仍拒（单段）
+    A.text("dweb.example.com"),   // 通过
+    A.select("dual"),
+    A.select("apply"),
+  ]);
   const { calls, impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: { TUNNEL_TOKEN: "t" },
-    stdin: io.input,
-    stdout: io.output,
+    clack: fk,
     runSetupImpl: impl,
   });
   assert.equal(r.exit, 0);
   assert.equal(calls[0].hostname, "dweb.example.com");
-  const text = io.text();
-  assert.match(text, /invalid hostname/);
-  assert.equal((text.match(/gateway hostname/g) ?? []).length, 3);
-});
-
-test("runInteractiveSetup: non-ASCII dynamic values are escaped in the output (P1-2)", async () => {
-  const io = scriptedIO(["", "bad\u2713host", "dweb.example.com", "1", "y"]);
-  io.feed();
-  const { impl } = mockRunSetup();
-  const r = await runInteractiveSetup({
-    cwd: "/proj",
-    env: { TUNNEL_TOKEN: "t" },
-    stdin: io.input,
-    stdout: io.output,
-    runSetupImpl: impl,
-  });
-  assert.equal(r.exit, 0);
-  const text = io.text();
-  // 校验错误消息回显里的 \u2713 必须以 \xe2\x9c\x93 转义出现，不得有裸字节
-  assert.ok(text.includes("\\xe2\\x9c\\x93"), "non-ASCII must be \\xNN-escaped");
-  assert.ok(!text.includes("\u2713"), "raw non-ASCII must never reach the output");
 });
 
 test("runInteractiveSetup: failures rethrow for dispatcher normalization (P1-2)", async () => {
-  const io = scriptedIO(["", "dweb.example.com", "1", "y"]);
-  io.feed();
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
   await assert.rejects(
     () => runInteractiveSetup({
       cwd: "/proj",
       env: { TUNNEL_TOKEN: "t" },
-      stdin: io.input,
-      stdout: io.output,
+      clack: fk,
       runSetupImpl: async () => {
         throw new Error("boom from cloudflare api");
       },
     }),
     /boom from cloudflare api/,
   );
+});
+
+test("runInteractiveSetup: verifyProgress drives the spinner message", async () => {
+  const spinnerCalls = [];
+  const fk = fakeClack([
+    A.select("env"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  fk.spinner = () => {
+    const s = { start: (m) => spinnerCalls.push(["start", m]), stop: () => spinnerCalls.push(["stop"]), message: (m) => spinnerCalls.push(["msg", m]) };
+    return s;
+  };
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: { TUNNEL_TOKEN: "t" },
+    clack: fk,
+    runSetupImpl: async (input) => {
+      input.verifyProgress({ elapsedMs: 1000, lastError: "HTTP 526" });
+      input.verifyProgress({ elapsedMs: 6000, lastError: "HTTP 526" });
+      return { plan: { publicGatewayUrl: "https://dweb.example.com" } };
+    },
+  });
+  assert.equal(r.exit, 0);
+  const msgs = spinnerCalls.filter(([k]) => k !== "stop").map(([, m]) => m);
+  assert.equal(msgs.length, 2); // start + 一次 message 更新
+  assert.match(msgs[0], /verifying via the public gateway\.\.\. 1s/);
+  assert.match(msgs[1], /6s/);
 });
 
 test("wantsInteractive: explicit flag always; otherwise only TTY without hostname", () => {

@@ -36,8 +36,7 @@ export function planExposure({ hostname, mode = "dual" }) {
 
 /**
  * 生成要写入的 opendweb.config.toml 内容（全新文件；已存在文件只打印片段）。
- * 手渲染固定形态（全部值已经过校验，JSON 字符串转义对 TOML basic string 安全），
- * 保持插件零依赖。
+ * 手渲染固定形态（全部值已经过校验，JSON 字符串转义对 TOML basic string 安全）。
  * @param {{ plan: ReturnType<typeof planExposure>, tokenEnv: string, gatewayBind?: string, relayBind?: string }} input
  */
 export function renderConfigToml({ plan, tokenEnv, gatewayBind = "0.0.0.0:8787", relayBind = "0.0.0.0:3340" }) {

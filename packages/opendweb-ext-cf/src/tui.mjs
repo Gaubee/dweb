@@ -1,28 +1,29 @@
-// cf setup 交互式引导编排（2026-08-30 Owner 需求：setup 子命令提供 TUI
-// 引导；线性流程 + 秘密 token 本地输入，故 TUI 而非 WebUI——判断依据见
-// prompts.mjs 头注）。流程：token -> hostname（校验重问）-> mode -> 计划
-// 预览 -> 确认 -> 复用 runSetup 执行 -> 结果指引。
-// 契约（P1-2）：全部输出经 asciiEscape 的受控 writer（createWriter，见
-// prompts.mjs）；失败 rethrow 交宿主 dispatchPluginCommand 归一化到
-// stderr 的 error[plugin/cf] 通道；用户主动中止是正常退出（exit 0）。
-// forceDryRun（P1-1）：--dry-run 不可被确认框覆盖——跳过 token 收集
-// （占位 token）、确认退化为二元 go/no-go，保证零副作用语义与非交互
-// --dry-run 一致。
+// cf setup 交互式引导编排（2026-08-30 Owner 需求：setup 子命令提供交互
+// 引导；第二轮决策：不自写交互终端，改用 @clack/prompts——见 prompts.mjs
+// 头注）。流程：token -> hostname（库 validate 即时重问）-> mode -> 计划
+// 预览（note）-> apply/dry-run/abort 选择 -> 复用 runSetup 执行（log 行 +
+// verify spinner）-> 结果指引。
+// 契约：动态值经 sanitizeUI 堵 UI 注入；失败 rethrow 交宿主
+// dispatchPluginCommand 归一化到 stderr 的 error[plugin/cf]；用户主动中止
+// （InteractiveAbort：Ctrl+C/ESC/输入流关闭）是正常退出（exit 0）。
+// forceDryRun：--dry-run 不可被确认覆盖——跳过 token 收集（占位 token）、
+// 确认退化为二元 go/no-go，与非交互 --dry-run 的零副作用语义一致。
 import path from "node:path";
 
 import { runSetup, planExposure } from "./wizard.js";
 import { buildIngress } from "./cf-api.js";
-import { createPrompts, createWriter } from "./prompts.mjs";
+import { createPrompts, sanitizeUI, InteractiveAbort } from "./prompts.mjs";
 
 /**
  * 交互式 setup 引导。
  * @param {{ cwd: string, tokenEnvName?: string, suggestedHostname?: string, suggestedMode?: "dual" | "single",
  *           suggestedAction?: "apply" | "dry", forceDryRun?: boolean, configPath?: string | null, skipVerify?: boolean,
- *           stdin?: NodeJS.ReadStream, stdout?: NodeJS.WriteStream, env?: Record<string, string | undefined>,
+ *           env?: Record<string, string | undefined>,
  *           fetchImpl?: typeof fetch, writeFile?: (p: string, c: string) => Promise<void>,
- *           exists?: (p: string) => boolean, runSetupImpl?: typeof runSetup }} opts
- * @returns {Promise<{ exit: number } | undefined>} 成功/中止返回退出码
- * @throws {Error} 任一执行步失败（含输入关闭）——由 dispatchPluginCommand 输出标准错误
+ *           exists?: (p: string) => boolean, runSetupImpl?: typeof runSetup,
+ *           clack?: Awaited<typeof import("@clack/prompts")> }} opts
+ * @returns {Promise<{ exit: number }>} 成功/中止返回退出码
+ * @throws {Error} 任一执行步失败——由 dispatchPluginCommand 输出标准错误
  */
 export async function runInteractiveSetup(opts) {
   const {
@@ -34,95 +35,110 @@ export async function runInteractiveSetup(opts) {
     forceDryRun = false,
     configPath = null,
     skipVerify = false,
-    stdin = process.stdin,
-    stdout = process.stdout,
     env = process.env,
     fetchImpl,
     writeFile,
     exists,
     runSetupImpl = runSetup,
+    clack = await import("@clack/prompts"),
   } = opts;
-  const ui = createPrompts({ input: stdin, output: stdout });
-  const w = createWriter(stdout);
+  const ui = createPrompts(clack);
+  let spin = null;
   try {
-    w.line();
-    w.line("cf setup - interactive wizard", w.paint.bold);
-    w.line("wire a Cloudflare Tunnel to this opendweb server", w.paint.dim);
-    w.line();
+    ui.intro("cf setup - interactive wizard");
 
     // 1) token：dry-run 不需要（与非交互 --dry-run 的占位语义一致）
     let token = forceDryRun ? "dry-run-token" : env[tokenEnvName];
     if (!forceDryRun) {
       if (token) {
-        w.line(`detected ${tokenEnvName} in the environment`, w.paint.dim);
-        const choice = await ui.select("tunnel token", [
-          { value: "env", label: `use ${tokenEnvName} from the environment`, default: true },
-          { value: "paste", label: "paste a different token" },
-        ]);
-        if (choice === "paste") token = await ui.askSecret(`tunnel token (copy from Zero Trust -> Networks -> Tunnels)`);
+        const choice = await ui.select({
+          message: `tunnel token (detected ${tokenEnvName} in the environment)`,
+          options: [
+            { value: "env", label: `use ${tokenEnvName} from the environment`, hint: "recommended" },
+            { value: "paste", label: "paste a different token", hint: "input hidden" },
+          ],
+        });
+        if (choice === "paste") token = await ui.password({ message: "tunnel token (copy from Zero Trust -> Networks -> Tunnels)" });
       } else {
-        w.line(`no ${tokenEnvName} in the environment; paste the tunnel token`, w.paint.dim);
-        token = await ui.askSecret(`tunnel token (copy from Zero Trust -> Networks -> Tunnels)`);
+        token = await ui.password({ message: `tunnel token (${tokenEnvName} not set; copy from Zero Trust -> Networks -> Tunnels)` });
       }
       if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
     }
 
-    // 2) hostname：带校验重问（planExposure 的 DNS 形态校验即权威）
-    let hostname;
-    for (;;) {
-      hostname = await ui.ask("gateway hostname (e.g. dweb.example.com)", {
-        default: suggestedHostname,
-        required: suggestedHostname === undefined,
-      });
-      try {
-        planExposure({ hostname });
-        break;
-      } catch (e) {
-        w.line(`  ${e.message}`, w.paint.dim);
-      }
-    }
+    // 2) hostname：库 validate 即时重问（planExposure 的 DNS 形态校验即权威）。
+    // @clack 语义：空提交且设有 defaultValue 时 validate 收到 undefined（库在
+    // validate 通过后才回退到 defaultValue）——undefined 必须放行
+    const hostname = await ui.text({
+      message: "gateway hostname (e.g. dweb.example.com)",
+      ...(suggestedHostname !== undefined ? { placeholder: suggestedHostname, defaultValue: suggestedHostname } : {}),
+      validate: (v) => {
+        if (v === undefined || v === "") {
+          return suggestedHostname !== undefined ? undefined : "a hostname is required";
+        }
+        try {
+          planExposure({ hostname: v });
+          return undefined;
+        } catch (e) {
+          return e.message;
+        }
+      },
+    });
 
     // 3) mode
-    const mode = await ui.select("routing mode", [
-      { value: "dual", label: "dual - separate hostnames (gateway + relay.<gateway>)", default: suggestedMode !== "single" },
-      { value: "single", label: "single - one hostname, /relay and /ping path routing", default: suggestedMode === "single" },
-    ]);
+    const mode = await ui.select({
+      message: "routing mode",
+      options: [
+        { value: "dual", label: "dual - separate hostnames (gateway + relay.<gateway>)", hint: "recommended" },
+        { value: "single", label: "single - one hostname, /relay and /ping path routing" },
+      ],
+      initialValue: suggestedMode,
+    });
 
     // 4) 计划预览
     const plan = planExposure({ hostname, mode });
     const ingress = buildIngress({ mode: plan.mode, gatewayHost: plan.gatewayHost, relayHost: plan.relayHost });
     const targetConfig = configPath ?? path.join(cwd, "opendweb.config.toml");
-    w.line();
-    w.line("plan:");
-    w.line(`  mode          ${plan.mode === "single" ? "single-domain path routing" : "dual hostname"}`);
-    w.line(`  gateway       ${plan.gatewayHost} (${plan.publicGatewayUrl})`);
-    w.line(`  relay         ${plan.relayHost} (${plan.publicRelayUrl})`);
-    w.line(`  config file   ${targetConfig}`);
-    w.line("  ingress rules:");
-    for (const rule of ingress.ingress) w.line(`    ${JSON.stringify(rule)}`);
-    w.line("  this will:");
-    w.line("    1. push ingress rules to Cloudflare (tunnel configurations API)");
-    w.line("    2. route DNS CNAMEs to the tunnel (best-effort)");
-    w.line(`    3. write ${targetConfig}`);
-    w.line("    4. verify end-to-end via the public URL (services.json)");
-    w.line();
+    ui.note(
+      [
+        `mode          ${plan.mode === "single" ? "single-domain path routing" : "dual hostname"}`,
+        `gateway       ${plan.gatewayHost} (${plan.publicGatewayUrl})`,
+        `relay         ${plan.relayHost} (${plan.publicRelayUrl})`,
+        `config file   ${targetConfig}`,
+        "",
+        "ingress rules:",
+        ...ingress.ingress.map((rule) => `  ${JSON.stringify(rule)}`),
+        "",
+        "steps:",
+        "  1. push ingress rules to Cloudflare (tunnel configurations API)",
+        "  2. route DNS CNAMEs to the tunnel (best-effort)",
+        `  3. write ${targetConfig}`,
+        "  4. verify end-to-end via the public URL (services.json)",
+      ].join("\n"),
+      "plan",
+    );
 
     // 5) 确认：forceDryRun 下没有 apply 选项（--dry-run 语义不可覆盖）
     let action;
     if (forceDryRun) {
-      action = (await ui.confirm("run this plan as a dry-run? (nothing will be pushed)")) ? "dry" : "no";
+      action = (await ui.confirm({ message: "run this plan as a dry-run? (nothing will be pushed)" })) ? "dry" : "no";
     } else {
-      action = await ui.confirm3("apply this plan?", suggestedAction);
+      action = await ui.select({
+        message: "apply this plan?",
+        options: [
+          { value: "apply", label: "apply - push ingress, route DNS, write config, verify" },
+          { value: "dry", label: "dry-run - rehearse with zero side effects" },
+          { value: "no", label: "abort - change nothing" },
+        ],
+        initialValue: suggestedAction === "dry" ? "dry" : "apply",
+      });
     }
     if (action === "no") {
-      w.line();
-      w.line("aborted; nothing was changed");
+      ui.outro("aborted; nothing was changed");
       return { exit: 0 };
     }
 
-    // 6) 执行：复用非交互的 runSetup 编排，log 行带前缀缩进
-    w.line();
-    let lastBucket = -1;
+    // 6) 执行：复用非交互的 runSetup 编排；log 行直出，verify 用 spinner
+    let spinStarted = false;
     const result = await runSetupImpl({
       token,
       hostname,
@@ -135,30 +151,47 @@ export async function runInteractiveSetup(opts) {
       ...(fetchImpl ? { fetchImpl } : {}),
       ...(writeFile ? { writeFile } : {}),
       ...(exists ? { exists } : {}),
-      log: (line) => w.line(`  | ${line}`, w.paint.dim),
+      log: (line) => {
+        if (spin !== null && spinStarted) {
+          spin.stop();
+          spinStarted = false;
+        }
+        ui.log.message(sanitizeUI(`  ${line}`));
+      },
       verifyProgress: ({ elapsedMs, lastError }) => {
-        // 轮询 ~1s 一次：每 5s 汇报一次等待状态（公网生效有延迟是常态）
-        const bucket = Math.floor(elapsedMs / 5000);
-        if (bucket > lastBucket) {
-          lastBucket = bucket;
-          w.line(`  | still verifying... ${Math.round(elapsedMs / 1000)}s (${lastError})`, w.paint.dim);
+        // 公网生效有延迟是常态：spinner 常驻并随轮询更新文案
+        if (spin === null) spin = ui.spinner();
+        if (!spinStarted) {
+          spin.start(sanitizeUI(`verifying via the public gateway... ${Math.round(elapsedMs / 1000)}s (${lastError})`));
+          spinStarted = true;
+        } else {
+          spin.message(sanitizeUI(`verifying via the public gateway... ${Math.round(elapsedMs / 1000)}s (${lastError})`));
         }
       },
     });
+    if (spin !== null && spinStarted) {
+      spin.stop();
+      spinStarted = false;
+    }
 
     // 7) 结果与下一步指引
-    w.line();
-    w.line(`setup ok (${action === "dry" ? "dry-run" : "applied"})`, w.paint.green);
     if (action === "dry") {
-      w.line("this was a rehearsal - nothing was pushed; re-run and choose [y] to apply", w.paint.dim);
+      ui.outro("dry-run ok - nothing was pushed; re-run and choose apply to execute");
     } else {
-      w.line("next steps:");
-      w.line("  1. start the server:              opendweb server");
-      w.line(`  2. point clients at the gateway:   config set relay ${result.plan.publicGatewayUrl}`);
-      w.line("to co-spawn cloudflared with the server, add [plugins.options] tunnel = true", w.paint.dim);
+      ui.log.message("next steps:");
+      ui.log.message("  1. start the server:              opendweb server");
+      ui.log.message(`  2. point clients at the gateway:   config set relay ${result.plan.publicGatewayUrl}`);
+      ui.log.message("  3. co-spawn cloudflared with the server: [plugins.options] tunnel = true");
+      ui.outro("setup ok (applied)");
     }
     return { exit: 0 };
+  } catch (e) {
+    if (e instanceof InteractiveAbort) {
+      ui.outro("aborted; nothing was changed");
+      return { exit: 0 };
+    }
+    throw e;
   } finally {
-    ui.close();
+    spin?.stop?.();
   }
 }
