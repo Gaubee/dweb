@@ -1,125 +1,28 @@
-// cf setup 交互引导（TUI，零依赖）：readline 行输入 + 数字选择 + y/d/n 确认。
-// 形态判断：setup 是线性流程（token/hostname/mode -> 计划确认 -> 带状态执行
-// -> 结果指引），无图形化诉求；token 是秘密，本地 TTY 输入比起 localhost
-// web 表单更简单也更安全。所有输出全 ASCII（D10 纪律）；颜色仅在 TTY 且
-// 未设 NO_COLOR 时启用。streams 可注入（测试）。
-import readline from "node:readline/promises";
+// cf setup 交互式引导编排（2026-08-30 Owner 需求：setup 子命令提供 TUI
+// 引导；线性流程 + 秘密 token 本地输入，故 TUI 而非 WebUI——判断依据见
+// prompts.mjs 头注）。流程：token -> hostname（校验重问）-> mode -> 计划
+// 预览 -> 确认 -> 复用 runSetup 执行 -> 结果指引。
+// 契约（P1-2）：全部输出经 asciiEscape 的受控 writer（createWriter，见
+// prompts.mjs）；失败 rethrow 交宿主 dispatchPluginCommand 归一化到
+// stderr 的 error[plugin/cf] 通道；用户主动中止是正常退出（exit 0）。
+// forceDryRun（P1-1）：--dry-run 不可被确认框覆盖——跳过 token 收集
+// （占位 token）、确认退化为二元 go/no-go，保证零副作用语义与非交互
+// --dry-run 一致。
 import path from "node:path";
 
-import { runSetup, planExposure, renderConfigToml } from "./wizard.js";
+import { runSetup, planExposure } from "./wizard.js";
 import { buildIngress } from "./cf-api.js";
+import { createPrompts, createWriter } from "./prompts.mjs";
 
 /**
- * 基础输入组件（全部行式，无 raw mode —— 跨平台零惊喜）。
- * 行分发自维护队列而非 rl.question：question 挂起期间到达的额外行会被
- * readline 丢弃（管道预置输入 / 脚本驱动的真实场景），backlog 暂存后逐问
- * 供给；输入关闭时拒绝未决问题（Ctrl+C / EOF -> 上层按失败处理）。
- * @param {{ input: NodeJS.ReadStream & { isTTY?: boolean }, output: NodeJS.WriteStream & { isTTY?: boolean } }} streams
- */
-export function createPrompts({ input, output }) {
-  const rl = readline.createInterface({ input, output });
-  const paint = colors(output);
-  const backlog = [];
-  const pending = [];
-  let closed = false;
-  rl.on("line", (line) => {
-    const next = pending.shift();
-    if (next) next.resolve(line);
-    else backlog.push(line);
-  });
-  rl.on("close", () => {
-    closed = true;
-    for (const next of pending.splice(0)) next.reject(new Error("input closed before an answer"));
-  });
-  const readLine = () => {
-    if (backlog.length > 0) return Promise.resolve(backlog.shift());
-    if (closed) return Promise.reject(new Error("input closed before an answer"));
-    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
-  };
-
-  async function ask(label, { default: def, required = false } = {}) {
-    for (;;) {
-      output.write(`${label}${def !== undefined ? ` (${def})` : ""}: `);
-      const answer = (await readLine()).trim();
-      const value = answer === "" && def !== undefined ? def : answer;
-      if (!required || value !== "") return value;
-      output.write(paint.dim("  a value is required\n"));
-    }
-  }
-
-  async function askSecret(label) {
-    // 遮蔽手法：提示语自己写；terminal 模式下按键回显经 _writeToOutput
-    // 替换为 '*'（readline 的半私有稳定接口——零依赖下的务实选择），
-    // 管道模式本就无回显。
-    output.write(`${label} (input hidden): `);
-    const orig = rl._writeToOutput?.bind(rl);
-    rl._writeToOutput = (s) => rl.output.write(s ? "*" : s);
-    try {
-      return (await readLine()).trim();
-    } finally {
-      rl._writeToOutput = orig;
-      output.write("\n");
-    }
-  }
-
-  async function select(label, options) {
-    const fallback = options.findIndex((o) => o.default);
-    output.write(`? ${label}\n`);
-    options.forEach((o, i) => {
-      const mark = o.default ? " (default)" : "";
-      output.write(`  ${i + 1}) ${o.label}${paint.dim(mark)}\n`);
-    });
-    for (;;) {
-      output.write(`  choose [${fallback + 1}]: `);
-      const raw = (await readLine()).trim();
-      const idx = raw === "" ? fallback : Number(raw) - 1;
-      if (Number.isInteger(idx) && idx >= 0 && idx < options.length) return options[idx].value;
-      output.write(paint.dim(`  enter a number between 1 and ${options.length}\n`));
-    }
-  }
-
-  /**
-   * 三态确认：y = apply / d = dry-run / n = abort（回车取默认，通常 apply）。
-   * @returns {Promise<"apply" | "dry" | "no">}
-   */
-  async function confirm3(label, def = "apply") {
-    for (;;) {
-      output.write(`? ${label} [y] apply / [d] dry-run / [n] abort (${def}): `);
-      const raw = (await readLine()).trim().toLowerCase();
-      const value = raw === "" ? def : raw;
-      if (value === "y" || value === "yes") return "apply";
-      if (value === "d" || value === "dry") return "dry";
-      if (value === "n" || value === "no") return "no";
-      output.write(paint.dim("  answer y, d or n\n"));
-    }
-  }
-
-  return { ask, askSecret, select, confirm3, rl, paint, close: () => rl.close() };
-}
-
-/** NO_COLOR / 非 TTY 时全部恒等（输出内容不因颜色通道而变化） */
-function colors(output) {
-  if (!output.isTTY || process.env.NO_COLOR) {
-    return { dim: (s) => String(s), bold: (s) => String(s), green: (s) => String(s), red: (s) => String(s) };
-  }
-  return {
-    dim: (s) => `\x1b[2m${s}\x1b[22m`,
-    bold: (s) => `\x1b[1m${s}\x1b[22m`,
-    green: (s) => `\x1b[32m${s}\x1b[39m`,
-    red: (s) => `\x1b[31m${s}\x1b[39m`,
-  };
-}
-
-/**
- * 交互式 setup 引导：收集 token/hostname/mode -> 计划预览 -> y/d/n 确认 ->
- * 复用 runSetup 执行（dry-run 同一编排）。任一步失败返回 exit 1；用户主动
- * 中止返回 exit 0（不是错误）。
+ * 交互式 setup 引导。
  * @param {{ cwd: string, tokenEnvName?: string, suggestedHostname?: string, suggestedMode?: "dual" | "single",
- *           suggestedAction?: "apply" | "dry", configPath?: string | null, skipVerify?: boolean,
+ *           suggestedAction?: "apply" | "dry", forceDryRun?: boolean, configPath?: string | null, skipVerify?: boolean,
  *           stdin?: NodeJS.ReadStream, stdout?: NodeJS.WriteStream, env?: Record<string, string | undefined>,
  *           fetchImpl?: typeof fetch, writeFile?: (p: string, c: string) => Promise<void>,
  *           exists?: (p: string) => boolean, runSetupImpl?: typeof runSetup }} opts
- * @returns {Promise<{ exit: number }>}
+ * @returns {Promise<{ exit: number } | undefined>} 成功/中止返回退出码
+ * @throws {Error} 任一执行步失败（含输入关闭）——由 dispatchPluginCommand 输出标准错误
  */
 export async function runInteractiveSetup(opts) {
   const {
@@ -128,6 +31,7 @@ export async function runInteractiveSetup(opts) {
     suggestedHostname,
     suggestedMode = "dual",
     suggestedAction = "apply",
+    forceDryRun = false,
     configPath = null,
     skipVerify = false,
     stdin = process.stdin,
@@ -139,28 +43,29 @@ export async function runInteractiveSetup(opts) {
     runSetupImpl = runSetup,
   } = opts;
   const ui = createPrompts({ input: stdin, output: stdout });
-  const out = (line = "") => stdout.write(`${line}\n`);
-  const dim = (line = "") => stdout.write(`${ui.paint.dim(line)}\n`);
+  const w = createWriter(stdout);
   try {
-    out();
-    out(ui.paint.bold("cf setup - interactive wizard"));
-    out(ui.paint.dim("wire a Cloudflare Tunnel to this opendweb server"));
-    out();
+    w.line();
+    w.line("cf setup - interactive wizard", w.paint.bold);
+    w.line("wire a Cloudflare Tunnel to this opendweb server", w.paint.dim);
+    w.line();
 
-    // 1) token：环境已设则默认复用；否则粘贴（回显遮蔽）
-    let token = env[tokenEnvName];
-    if (token) {
-      dim(`detected ${tokenEnvName} in the environment`);
-      const choice = await ui.select("tunnel token", [
-        { value: "env", label: `use ${tokenEnvName} from the environment`, default: true },
-        { value: "paste", label: "paste a different token" },
-      ]);
-      if (choice === "paste") token = await ui.askSecret(`tunnel token (copy from Zero Trust -> Networks -> Tunnels)`);
-    } else {
-      dim(`no ${tokenEnvName} in the environment; paste the tunnel token`);
-      token = await ui.askSecret(`tunnel token (copy from Zero Trust -> Networks -> Tunnels)`);
+    // 1) token：dry-run 不需要（与非交互 --dry-run 的占位语义一致）
+    let token = forceDryRun ? "dry-run-token" : env[tokenEnvName];
+    if (!forceDryRun) {
+      if (token) {
+        w.line(`detected ${tokenEnvName} in the environment`, w.paint.dim);
+        const choice = await ui.select("tunnel token", [
+          { value: "env", label: `use ${tokenEnvName} from the environment`, default: true },
+          { value: "paste", label: "paste a different token" },
+        ]);
+        if (choice === "paste") token = await ui.askSecret(`tunnel token (copy from Zero Trust -> Networks -> Tunnels)`);
+      } else {
+        w.line(`no ${tokenEnvName} in the environment; paste the tunnel token`, w.paint.dim);
+        token = await ui.askSecret(`tunnel token (copy from Zero Trust -> Networks -> Tunnels)`);
+      }
+      if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
     }
-    if (!token) throw new Error(`no tunnel token provided (set ${tokenEnvName} or paste one when asked)`);
 
     // 2) hostname：带校验重问（planExposure 的 DNS 形态校验即权威）
     let hostname;
@@ -173,7 +78,7 @@ export async function runInteractiveSetup(opts) {
         planExposure({ hostname });
         break;
       } catch (e) {
-        stdout.write(ui.paint.dim(`  ${e.message}\n`));
+        w.line(`  ${e.message}`, w.paint.dim);
       }
     }
 
@@ -187,31 +92,36 @@ export async function runInteractiveSetup(opts) {
     const plan = planExposure({ hostname, mode });
     const ingress = buildIngress({ mode: plan.mode, gatewayHost: plan.gatewayHost, relayHost: plan.relayHost });
     const targetConfig = configPath ?? path.join(cwd, "opendweb.config.toml");
-    out();
-    out("plan:");
-    out(`  mode          ${plan.mode === "single" ? "single-domain path routing" : "dual hostname"}`);
-    out(`  gateway       ${plan.gatewayHost} (${plan.publicGatewayUrl})`);
-    out(`  relay         ${plan.relayHost} (${plan.publicRelayUrl})`);
-    out(`  config file   ${targetConfig}`);
-    out("  ingress rules:");
-    for (const rule of ingress.ingress) out(`    ${JSON.stringify(rule)}`);
-    out("  this will:");
-    out("    1. push ingress rules to Cloudflare (tunnel configurations API)");
-    out("    2. route DNS CNAMEs to the tunnel (best-effort)");
-    out(`    3. write ${targetConfig}`);
-    out("    4. verify end-to-end via the public URL (services.json)");
-    out();
+    w.line();
+    w.line("plan:");
+    w.line(`  mode          ${plan.mode === "single" ? "single-domain path routing" : "dual hostname"}`);
+    w.line(`  gateway       ${plan.gatewayHost} (${plan.publicGatewayUrl})`);
+    w.line(`  relay         ${plan.relayHost} (${plan.publicRelayUrl})`);
+    w.line(`  config file   ${targetConfig}`);
+    w.line("  ingress rules:");
+    for (const rule of ingress.ingress) w.line(`    ${JSON.stringify(rule)}`);
+    w.line("  this will:");
+    w.line("    1. push ingress rules to Cloudflare (tunnel configurations API)");
+    w.line("    2. route DNS CNAMEs to the tunnel (best-effort)");
+    w.line(`    3. write ${targetConfig}`);
+    w.line("    4. verify end-to-end via the public URL (services.json)");
+    w.line();
 
-    // 5) 确认（apply / dry-run / abort）
-    const action = await ui.confirm3("apply this plan?", suggestedAction);
+    // 5) 确认：forceDryRun 下没有 apply 选项（--dry-run 语义不可覆盖）
+    let action;
+    if (forceDryRun) {
+      action = (await ui.confirm("run this plan as a dry-run? (nothing will be pushed)")) ? "dry" : "no";
+    } else {
+      action = await ui.confirm3("apply this plan?", suggestedAction);
+    }
     if (action === "no") {
-      out();
-      out("aborted; nothing was changed");
+      w.line();
+      w.line("aborted; nothing was changed");
       return { exit: 0 };
     }
 
     // 6) 执行：复用非交互的 runSetup 编排，log 行带前缀缩进
-    out();
+    w.line();
     let lastBucket = -1;
     const result = await runSetupImpl({
       token,
@@ -225,37 +135,30 @@ export async function runInteractiveSetup(opts) {
       ...(fetchImpl ? { fetchImpl } : {}),
       ...(writeFile ? { writeFile } : {}),
       ...(exists ? { exists } : {}),
-      log: (line) => stdout.write(ui.paint.dim(`  | ${line}\n`)),
+      log: (line) => w.line(`  | ${line}`, w.paint.dim),
       verifyProgress: ({ elapsedMs, lastError }) => {
         // 轮询 ~1s 一次：每 5s 汇报一次等待状态（公网生效有延迟是常态）
         const bucket = Math.floor(elapsedMs / 5000);
         if (bucket > lastBucket) {
           lastBucket = bucket;
-          stdout.write(ui.paint.dim(`  | still verifying... ${Math.round(elapsedMs / 1000)}s (${lastError})\n`));
+          w.line(`  | still verifying... ${Math.round(elapsedMs / 1000)}s (${lastError})`, w.paint.dim);
         }
       },
     });
 
     // 7) 结果与下一步指引
-    out();
-    out(ui.paint.green(`setup ok (${action === "dry" ? "dry-run" : "applied"})`));
+    w.line();
+    w.line(`setup ok (${action === "dry" ? "dry-run" : "applied"})`, w.paint.green);
     if (action === "dry") {
-      dim("this was a rehearsal - nothing was pushed; re-run and choose [y] to apply");
+      w.line("this was a rehearsal - nothing was pushed; re-run and choose [y] to apply", w.paint.dim);
     } else {
-      out("next steps:");
-      out("  1. start the server:              opendweb server");
-      out(`  2. point clients at the gateway:   config set relay ${result.plan.publicGatewayUrl}`);
-      dim("to co-spawn cloudflared with the server, add [plugins.options] tunnel = true");
+      w.line("next steps:");
+      w.line("  1. start the server:              opendweb server");
+      w.line(`  2. point clients at the gateway:   config set relay ${result.plan.publicGatewayUrl}`);
+      w.line("to co-spawn cloudflared with the server, add [plugins.options] tunnel = true", w.paint.dim);
     }
     return { exit: 0 };
-  } catch (e) {
-    out();
-    stdout.write(ui.paint.red(`failed: ${e?.message ?? String(e)}\n`));
-    return { exit: 1 };
   } finally {
     ui.close();
   }
 }
-
-/** 非 TTY 下渲染合并片段（供未来复用；当前作为 renderConfigToml 的再导出锚点） */
-export { renderConfigToml };

@@ -111,7 +111,15 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
   let err = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (err += d));
-  const code = await new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0)));
+  // P1-3：有界等待——挂起时 kill 子进程并带已采集输出失败（不留僵尸门禁）
+  const code = await Promise.race([
+    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
+    new Promise((resolve) => setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve("timeout");
+    }, 30000)),
+  ]);
+  assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}\nstderr: ${err}`);
   assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
   assert.match(out, /interactive wizard/);
   assert.match(out, /plan:/);
@@ -122,6 +130,135 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
   assert.ok(!out.includes("piped-token"), "token must not be echoed");
   // dry-run 零副作用：不写配置文件
   assert.equal(await fsp.stat(path.join(e.dir, "opendweb.config.toml")).then(() => true).catch(() => false), false);
+});
+
+test("cf setup --interactive --dry-run: y still runs dry-run only; unicode cwd stays ASCII (P1-1/P1-2)", async () => {
+  const e = await env();
+  // Unicode 目录名：计划预览里的 config 路径必须以 \xNN 转义出现（D10 纪律）
+  const weird = path.join(e.dir, "gr\u00fc\u2713");
+  await fsp.mkdir(weird, { recursive: true });
+  await fsp.writeFile(path.join(weird, "package.json"), JSON.stringify({ name: "t", private: true }), "utf8");
+  const child = spawn(NODE, [CLI, "cf", "setup", "--interactive", "--dry-run"], {
+    cwd: weird,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  // forceDryRun：不问 token；hostname -> mode -> 二元确认 y（即便输 y 也是 dry）
+  child.stdin.write("dweb.example.com\n");
+  child.stdin.write("1\n");
+  child.stdin.write("y\n");
+  child.stdin.end();
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (err += d));
+  const code = await Promise.race([
+    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
+    new Promise((resolve) => setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve("timeout");
+    }, 30000)),
+  ]);
+  assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
+  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  assert.match(out, /dry-run\? \(nothing will be pushed\)/);
+  assert.match(out, /dry-run: would PUT ingress config/);
+  assert.match(out, /setup ok \(dry-run\)/);
+  // 非 token 问题不得出现（forceDryRun 跳过收集）
+  assert.ok(!out.includes("paste the tunnel token"));
+  // ASCII 纪律：stdout 全 ASCII，Unicode 目录以 \xNN 转义出现
+  assert.match(out, /^[\x00-\x7F]*$/, "stdout must be all-ASCII");
+  assert.ok(out.includes("\\xc3\\xbc"), "unicode dir bytes (UTF-8) must be escaped visibly");
+});
+
+test("cf setup without a terminal and without --hostname fails with wizard guidance", async () => {
+  const e = await env();
+  const r = await runCli(["cf", "setup"], e); // 测试子进程 stdin 非 TTY
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /--hostname is required/);
+  assert.match(r.err, /--interactive/);
+});
+
+test("cf setup --interactive: TOML config prefills tokenEnv/hostname/mode (flag > config > default)", async () => {
+  const e = await env();
+  await fsp.writeFile(
+    path.join(e.dir, "opendweb.config.toml"),
+    [
+      "configVersion = 1",
+      "",
+      "[server]",
+      'publicGatewayUrl = "https://cfg.example.com"',
+      "",
+      "[[plugins]]",
+      'name = "cf"',
+      "[plugins.options]",
+      'tokenEnv = "CUSTOM_TOK_ENV"',
+      'mode = "single"',
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  const child = spawn(NODE, [CLI, "cf", "setup", "--interactive"], {
+    cwd: e.dir,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1", CUSTOM_TOK_ENV: "tok" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  // 全部回车取预填：token 用 env -> hostname 取 config 推导 -> mode=single -> dry
+  child.stdin.write("\n");
+  child.stdin.write("\n");
+  child.stdin.write("\n");
+  child.stdin.write("d\n");
+  child.stdin.end();
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (err += d));
+  const code = await Promise.race([
+    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
+    new Promise((resolve) => setTimeout(() => { child.kill("SIGKILL"); resolve("timeout"); }, 30000)),
+  ]);
+  assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
+  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  assert.match(out, /detected CUSTOM_TOK_ENV in the environment/); // tokenEnv 预填
+  assert.match(out, /gateway\s+cfg\.example\.com/); // hostname 从 server.publicGatewayUrl 预填
+  assert.match(out, /single-domain path routing/); // mode=single 预填
+  assert.match(out, /\^\/relay\.\*/); // single 的 ingress 规则（dry-run 输出）
+});
+
+test("cf setup --interactive: JSON config prefill loses to explicit flags", async () => {
+  const e = await env();
+  await fsp.writeFile(
+    path.join(e.dir, "opendweb.config.json"),
+    JSON.stringify({
+      configVersion: 1,
+      server: { publicGatewayUrl: "https://json.example.com" },
+      plugins: [{ name: "cf", options: { tokenEnv: "JSON_TOK_ENV", mode: "single" } }],
+    }),
+    "utf8",
+  );
+  const child = spawn(NODE, [CLI, "cf", "setup", "--interactive", "--hostname", "flag.example.com", "--mode", "dual", "--token-env", "TUNNEL_TOKEN"], {
+    cwd: e.dir,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, DWEB_HOME: e.home, NO_COLOR: "1", TUNNEL_TOKEN: "tok" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdin.write("\n"); // token 用 TUNNEL_TOKEN（flag 覆盖 JSON_TOK_ENV）
+  child.stdin.write("\n"); // hostname 取 flag 值（覆盖 json 推导）
+  child.stdin.write("\n"); // mode=dual（flag 覆盖 config single）
+  child.stdin.write("d\n");
+  child.stdin.end();
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (err += d));
+  const code = await Promise.race([
+    new Promise((resolve) => child.on("exit", (c) => resolve(c ?? 0))),
+    new Promise((resolve) => setTimeout(() => { child.kill("SIGKILL"); resolve("timeout"); }, 30000)),
+  ]);
+  assert.notEqual(code, "timeout", `wizard hung; stdout so far: ${out}`);
+  assert.equal(code, 0, `stderr: ${err}\nstdout: ${out}`);
+  assert.match(out, /detected TUNNEL_TOKEN in the environment/);
+  assert.ok(!out.includes("JSON_TOK_ENV"), "flag token-env must beat config");
+  assert.match(out, /gateway\s+flag\.example\.com/);
+  assert.match(out, /relay\s+relay\.flag\.example\.com/); // dual 生效（config 的 single 被覆盖）
 });
 
 test("cf setup --help: wizard flag is part of the zero-exec usage", async () => {

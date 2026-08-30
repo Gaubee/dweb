@@ -1,11 +1,13 @@
-// TUI 引导单测：输入组件（默认值/遮蔽/选择/三态确认）与 runInteractiveSetup
-// 编排（预览/确认/中止/dry-run/无效 hostname 重问），streams 全注入。
-// 应答行在调用前写入管道（PassThrough 缓冲，readline 顺序消费）。
+// TUI 引导单测（2026-08-30 Owner 需求）：输入组件（默认值/遮蔽/选择/确认）
+// 与 runInteractiveSetup 编排（预览/确认/中止/dry-run/forceDryRun/无效
+// hostname 重问/失败 rethrow/ASCII 纪律），streams 全注入。应答行在调用前
+// 写入管道（PassThrough 缓冲，行队列 backlog 顺序消费——这正是被测语义）。
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 
-import { createPrompts, runInteractiveSetup } from "../src/tui.mjs";
+import { createPrompts, asciiEscape } from "../src/prompts.mjs";
+import { runInteractiveSetup } from "../src/tui.mjs";
 import { wantsInteractive } from "../src/cli.js";
 
 /** 造一对管道流；feed() 把预置应答行全部写入（调用被测函数前执行） */
@@ -14,7 +16,12 @@ function scriptedIO(lines) {
   const output = new PassThrough();
   let chunks = "";
   output.on("data", (d) => (chunks += d));
-  return { input, output, text: () => chunks, feed: () => { for (const line of lines) input.write(`${line}\n`); } };
+  return {
+    input,
+    output,
+    text: () => chunks,
+    feed: () => { for (const line of lines) input.write(`${line}\n`); },
+  };
 }
 
 test("prompts: ask uses the default on empty input, returns typed value otherwise", async () => {
@@ -26,7 +33,7 @@ test("prompts: ask uses the default on empty input, returns typed value otherwis
   ui.close();
 });
 
-test("prompts: askSecret masks the echoed input", async () => {
+test("prompts: askSecret masks the echoed input and restores _writeToOutput precisely", async () => {
   const io = scriptedIO(["sekret-token-value"]);
   io.feed();
   const ui = createPrompts(io);
@@ -35,6 +42,8 @@ test("prompts: askSecret masks the echoed input", async () => {
   const text = io.text();
   assert.ok(!text.includes("sekret-token-value"), "secret must not be echoed");
   assert.ok(text.includes("input hidden"));
+  // P2：遮蔽用 _writeToOutput 是原型方法——finally 后不得留下 own 属性
+  assert.equal(Object.hasOwn(ui.rl, "_writeToOutput"), false);
   ui.close();
 });
 
@@ -76,6 +85,37 @@ test("prompts: confirm3 maps y/d/n, the default, and re-asks on junk", async () 
   assert.equal(await ui.confirm3("apply this plan?"), "apply");
   assert.ok(io.text().includes("answer y, d or n"));
   ui.close();
+});
+
+test("prompts: binary confirm maps y/n, the default, and re-asks on junk", async () => {
+  const io = scriptedIO(["y", "n", "", "x", "yes", "no"]);
+  io.feed();
+  const ui = createPrompts(io);
+  assert.equal(await ui.confirm("run it?"), true);
+  assert.equal(await ui.confirm("run it?"), false);
+  assert.equal(await ui.confirm("run it?", false), false);
+  assert.equal(await ui.confirm("run it?"), true); // x -> 重问 -> yes
+  assert.equal(await ui.confirm("run it?", false), false); // no
+  assert.ok(io.text().includes("answer y or n"));
+  ui.close();
+});
+
+test("prompts: EOF drains the backlog first, then rejects the next question (P1-3)", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.on("data", () => {});
+  input.write("first\n");
+  input.end(); // EOF：backlog 里的行仍可消费；之后的提问必须拒绝而非挂死
+  const ui = createPrompts({ input, output });
+  assert.equal(await ui.ask("q1"), "first");
+  await assert.rejects(() => ui.ask("q2"), /input closed before an answer/);
+  ui.close();
+});
+
+test("asciiEscape: non-ASCII bytes become \\xNN escapes (writer discipline anchor)", () => {
+  assert.equal(asciiEscape("ok"), "ok");
+  assert.equal(asciiEscape("bad\u2713host"), "bad\\xe2\\x9c\\x93host");
+  assert.equal(asciiEscape("line\nbreak"), "line\\x0abreak");
 });
 
 /** 编排用 mock runSetup：捕获参数并模拟成功 */
@@ -165,6 +205,47 @@ test("runInteractiveSetup: d runs the same flow as dry-run (zero side effects)",
   assert.match(io.text(), /rehearsal/);
 });
 
+test("runInteractiveSetup: forceDryRun skips token collection and cannot become apply (P1-1)", async () => {
+  const io = scriptedIO(["dweb.example.com", "1", "y"]); // 无 token 问题；mode；二元确认 y
+  io.feed();
+  const { calls, impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: {}, // 无环境 token：forceDryRun 下不得询问
+    forceDryRun: true,
+    stdin: io.input,
+    stdout: io.output,
+    runSetupImpl: impl,
+  });
+  assert.equal(r.exit, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].dryRun, true);
+  assert.equal(calls[0].skipVerify, true);
+  assert.equal(calls[0].token, "dry-run-token");
+  const text = io.text();
+  assert.ok(!text.includes("paste the tunnel token"), "dry-run must not demand a token");
+  assert.match(text, /dry-run\? \(nothing will be pushed\)/);
+});
+
+test("runInteractiveSetup: forceDryRun with real runSetup touches neither fetch nor writeFile (P1-1)", async () => {
+  const io = scriptedIO(["dweb.example.com", "1", "y"]);
+  io.feed();
+  const spies = { fetch: 0, write: 0 };
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: {},
+    forceDryRun: true,
+    stdin: io.input,
+    stdout: io.output,
+    fetchImpl: async () => { spies.fetch += 1; throw new Error("must not be called"); },
+    writeFile: async () => { spies.write += 1; },
+    exists: () => false,
+  });
+  assert.equal(r.exit, 0);
+  assert.equal(spies.fetch, 0);
+  assert.equal(spies.write, 0);
+});
+
 test("runInteractiveSetup: pasted token is used when the environment has none", async () => {
   const io = scriptedIO(["pasted-token", "dweb.example.com", "1", "y"]);
   io.feed();
@@ -199,20 +280,39 @@ test("runInteractiveSetup: invalid hostname is re-asked until it validates", asy
   assert.equal((text.match(/gateway hostname/g) ?? []).length, 3);
 });
 
-test("runInteractiveSetup: runSetup failure exits 1 with the error surfaced", async () => {
-  const io = scriptedIO(["", "dweb.example.com", "1", "y"]);
+test("runInteractiveSetup: non-ASCII dynamic values are escaped in the output (P1-2)", async () => {
+  const io = scriptedIO(["", "bad\u2713host", "dweb.example.com", "1", "y"]);
   io.feed();
+  const { impl } = mockRunSetup();
   const r = await runInteractiveSetup({
     cwd: "/proj",
     env: { TUNNEL_TOKEN: "t" },
     stdin: io.input,
     stdout: io.output,
-    runSetupImpl: async () => {
-      throw new Error("boom from cloudflare api");
-    },
+    runSetupImpl: impl,
   });
-  assert.equal(r.exit, 1);
-  assert.match(io.text(), /failed: boom from cloudflare api/);
+  assert.equal(r.exit, 0);
+  const text = io.text();
+  // 校验错误消息回显里的 \u2713 必须以 \xe2\x9c\x93 转义出现，不得有裸字节
+  assert.ok(text.includes("\\xe2\\x9c\\x93"), "non-ASCII must be \\xNN-escaped");
+  assert.ok(!text.includes("\u2713"), "raw non-ASCII must never reach the output");
+});
+
+test("runInteractiveSetup: failures rethrow for dispatcher normalization (P1-2)", async () => {
+  const io = scriptedIO(["", "dweb.example.com", "1", "y"]);
+  io.feed();
+  await assert.rejects(
+    () => runInteractiveSetup({
+      cwd: "/proj",
+      env: { TUNNEL_TOKEN: "t" },
+      stdin: io.input,
+      stdout: io.output,
+      runSetupImpl: async () => {
+        throw new Error("boom from cloudflare api");
+      },
+    }),
+    /boom from cloudflare api/,
+  );
 });
 
 test("wantsInteractive: explicit flag always; otherwise only TTY without hostname", () => {

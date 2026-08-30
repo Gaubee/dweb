@@ -87,8 +87,11 @@ export function parseCommandArgs(spec, argv) {
 
 /**
  * 插件命令执行包装器：错误归一化、ASCII 纪律、退出码映射（design D3）。
- * run 收 { command, args, log, cwd }；返回 { exit?: number } 可指定退出码。
- * @param {{ manifest: { name: string, commands: Array<import("zod").infer<typeof CommandSpecSchema>>, run: (input: { command: string, args: Record<string, unknown>, log: (line: string) => void, cwd: string }) => Promise<{ exit?: number } | void> }, command: string, argv: string[], cwd: string, stdout?: NodeJS.WriteStream, stderr?: NodeJS.WriteStream }} input
+ * run 收 { command, args, log, cwd, stdout, stderr }——stdout/stderr 即包装器
+ * 所用的同一流（交互式插件如 cf 的引导直接写 stdout，错误 rethrow 后由
+ * 本包装器归一化到 stderr 的 error[plugin/<name>] 通道）；返回
+ * { exit?: number } 可指定退出码。
+ * @param {{ manifest: { name: string, commands: Array<import("zod").infer<typeof CommandSpecSchema>>, run: (input: { command: string, args: Record<string, unknown>, log: (line: string) => void, cwd: string, stdout: NodeJS.WriteStream, stderr: NodeJS.WriteStream }) => Promise<{ exit?: number } | void> }, command: string, argv: string[], cwd: string, stdout?: NodeJS.WriteStream, stderr?: NodeJS.WriteStream }} input
  * @returns {Promise<number>} 进程退出码
  */
 export async function dispatchPluginCommand({ manifest, command, argv, cwd, stdout = process.stdout, stderr = process.stderr }) {
@@ -107,7 +110,7 @@ export async function dispatchPluginCommand({ manifest, command, argv, cwd, stdo
   }
   const log = (line = "") => stdout.write(`${asciiEscape(line)}\n`);
   try {
-    const result = await manifest.run({ command, args, log, cwd });
+    const result = await manifest.run({ command, args, log, cwd, stdout, stderr });
     if (result && typeof result.exit === "number") return result.exit;
     return 0;
   } catch (e) {
