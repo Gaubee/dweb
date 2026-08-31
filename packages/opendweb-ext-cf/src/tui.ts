@@ -9,31 +9,10 @@
 // forceDryRun：--dry-run 不可被确认覆盖——跳过 token 收集（占位 token）、
 // 确认退化为二元 go/no-go，与非交互 --dry-run 的零副作用语义一致。
 import path from "node:path";
-import readline from "node:readline";
 
 import { runSetup, planExposure, type ExposureMode, type ExposurePlan } from "./wizard.js";
 import { buildIngress, decodeTunnelToken, lookupZoneName, extractTunnelToken, tokenSummary, type FetchLike } from "./cf-api.js";
 import { createPrompts, sanitizeUI, InteractiveAbort, type ClackApi } from "./prompts.js";
-
-/**
- * 块粘贴捕获：readline 逐行收（canonical 模式，TTY/pipe 皆可）。读到含
- * token 的行立即返回（后续粘贴行随 rl.close 丢弃）；空行且已有内容时收块。
- * 与 @clack 的 stdin 交接：此函数独占期间不创建 @clack prompt，close 后归还。
- */
-async function defaultReadLines(prompt: string): Promise<string[]> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const lines: string[] = [];
-  try {
-    for (;;) {
-      const answer = await new Promise<string>((resolve) => rl.question(lines.length === 0 ? prompt : "", resolve));
-      lines.push(answer);
-      if (extractTunnelToken(answer) !== null) return lines;
-      if (answer.trim() === "" && lines.length > 1) return lines;
-    }
-  } finally {
-    rl.close();
-  }
-}
 
 /** spinner 形状（@clack spinner 的结构化子集；闭包赋值需要命名类型） */
 interface SpinnerLike {
@@ -61,8 +40,6 @@ export interface RunInteractiveOptions {
   writeFile?: (p: string, c: string) => Promise<void>;
   exists?: (p: string) => boolean;
   runSetupImpl?: typeof runSetup;
-  /** 块粘贴捕获注入点（测试）；缺省 readline 逐行收（TTY/pipe 均可） */
-  readLinesImpl?: (prompt: string) => Promise<string[]>;
   /** 测试注入 fake；缺省动态 import 真库 */
   clack?: ClackApi;
 }
@@ -87,7 +64,6 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
     writeFile,
     exists,
     runSetupImpl = runSetup,
-    readLinesImpl,
     clack = (await import("@clack/prompts")) as unknown as ClackApi,
   } = opts;
   const ui = createPrompts(clack);
@@ -124,51 +100,30 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
     }
 
     // 1) token：dry-run 不需要（与非交互 --dry-run 的占位语义一致）。
-    // 粘贴宽容度（2026-08-31 Owner 需求，二轮修正）：多行粘贴（brew 一行 +
-    // 空行 + sudo install 行）在单行 password 框里会碎裂——首行先提交、
-    // token 行停在框里。通道化：块捕获（readline 逐行收，命中含 token 的
-    // 行即停，多行/空行全兼容；终端会回显粘贴内容）与裸 token 遮蔽输入
-    // （防肩窥）二选一，块捕获为默认项
-    const readLines = readLinesImpl ?? defaultReadLines;
+    // 粘贴宽容度（2026-08-31 Owner 三轮定案：单口直贴，不选通道）：多行块
+    // 在单行 password 框里碎裂成逐行提交——validate 充当累积器，闭包 buffer
+    // 聚合整块（含空行/前后文字），命中 token 形态即过；全程遮蔽。命中后
+    // 显示头尾摘要并由用户确认，不确认则整段重输
     const collectToken = async (message: string): Promise<string> => {
-      const choice = await ui.select<"block" | "bare">({
-        message,
-        options: [
-          {
-            value: "block" as const,
-            label: "paste the install command / any text containing the token",
-            hint: "multi-line ok; pasted text is shown as-is",
-          },
-          { value: "bare" as const, label: "type or paste the bare token", hint: "input hidden" },
-        ],
-      });
-      if (choice === "bare") {
-        const raw = await ui.password({
-          message: "tunnel token (the eyJ... string)",
+      for (;;) {
+        let buffer = "";
+        await ui.password({
+          message,
           validate: (v) => {
-            if (v === undefined || v === "") return "a tunnel token is required (the eyJ... string)";
-            if (extractTunnelToken(v) === null) {
-              return "no tunnel token found in the input - paste the eyJ... string (a full install command line is fine)";
-            }
-            return undefined;
+            buffer += (v ?? "") + "\n";
+            if (extractTunnelToken(buffer) !== null) return undefined;
+            if (buffer.trim() === "") return "paste the token (the eyJ... string) or the whole install command";
+            return "no token in the input yet - keep pasting (multi-line text is collected as one block)";
           },
         });
-        const extracted = extractTunnelToken(raw) ?? raw.trim();
+        const extracted = extractTunnelToken(buffer) ?? buffer.trim();
         ui.log.message(`token: ${tokenSummary(extracted)}`);
-        return extracted;
-      }
-      for (;;) {
-        const lines = await readLines(
-          "paste anything containing the token (finish with an empty line, or just wait - capture stops at the token line):",
-        );
-        const extracted = extractTunnelToken(lines.join("\n"));
-        if (extracted !== null) {
-          ui.log.message(`token: ${tokenSummary(extracted)}`);
-          return extracted;
-        }
-        ui.log.message("no tunnel token found in the pasted text - paste again (the eyJ... string from the install command)");
+        const confirmed = await ui.confirm({ message: "use this token?" });
+        if (confirmed) return extracted;
+        ui.log.message("re-enter the token");
       }
     };
+
     let token = forceDryRun ? "dry-run-token" : env[tokenEnvName];
     let apiToken: string | undefined;
     if (!forceDryRun) {
@@ -200,8 +155,9 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
         apiToken = (await ui.password({
           message: "management API token (CF_API_TOKEN; create at My Profile -> API Tokens - Tunnel Edit + DNS Edit)",
           validate: (v) => {
-            if (v === undefined || v.trim().length < 40) {
-              return "paste the API token (the long string shown once at creation, >=40 chars)";
+            const t = (v ?? "").trim();
+            if (t.length < 40 || !/^[A-Za-z0-9_.-]+$/.test(t)) {
+              return "paste the API token (the string shown once at creation: >=40 chars, no spaces)";
             }
             return undefined;
           },

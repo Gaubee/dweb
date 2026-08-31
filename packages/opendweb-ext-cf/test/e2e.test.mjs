@@ -158,12 +158,12 @@ test("cf setup --interactive: piped stdin drives the full wizard (dry-run, zero 
   // 应答式驱动（@clack 键序：text/password \r 提交、select \r/方向键）：
   // 粘贴 token → hostname → dual → dry-run
   const driven = driveWizard(child, [
-    // token 通道 select（默认项 = 块捕获）-> 粘 Owner 实测形态的多行块
-    { expect: /tunnel token/, send: "\r" },
-    {
-      expect: /paste anything containing the token/,
-      send: `brew install cloudflared && \n\nsudo cloudflared service install eyJ${"A1b2c3D4e5".repeat(18)}\n`,
-    },
+    // 单口累积捕获（2026-08-31 三轮）：多行块碎裂成逐行提交，validator
+    // 聚合整块后提取 -> confirm
+    { expect: /tunnel token/, send: "brew install cloudflared && \r" },
+    { expect: /no token in the input yet/, send: "\r" },
+    { expect: /no token in the input yet/, send: `sudo cloudflared service install eyJ${"A1b2c3D4e5".repeat(18)}\r` },
+    { expect: /use this token\?/, send: "y" },
     { expect: /management API token/, send: "e2e-api-token-0123456789abcdef0123456789\r" },
     { expect: /gateway hostname/, send: "dweb.example.com\r" },
     { expect: /routing mode/, send: "\r" },
