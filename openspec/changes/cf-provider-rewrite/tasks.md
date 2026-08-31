@@ -47,3 +47,17 @@
 - [ ] 3.4 CF_CLIENT=sdk 与 rest 的真实 API 对拍（需真实凭据的一次性冒烟）
 - [ ] 3.5 cloudflared npm 无 checksum（README 已注记）；可选 CLOUDFLARED_BIN
       自供；后续评估官方 checksum 清单校验
+
+## 4. 复审闭环（2026-08-31）
+
+- [x] 4.1 Codex R1（gpt-5.6-terra xhigh，46min）：**3.5/10 Not release-ready**
+      ——七项阻塞：SDK 聚合导入构造失败且引入 447KB chunk、PUT 全量替换丢
+      originRequest 等非 ingress 字段、ownership 三缺口（new 撞名/锚点未消
+      费/zone 非最长后缀）、OAuth access token 落盘 + 超时后 listener 泄漏、
+      write-scope 降级缺失、install 路径不匹配 + stop 竞态、dry-run 落盘凭据
+- [x] 4.2 R1 整改（b1cb51b，发布 1.0.1）：全部阻塞修复；cf 126/126（+18
+      用例）、下游 92/92、pack:dry 递归扫描（静态+动态 import）368KB、
+      tsc 干净
+- [ ] 4.3 Codex R2 复验：**服务端故障中断**（模型 API 403 GROUP_DELETED，
+      重连 100 次未果）——待服务恢复后重跑 R2（复核 R1 七项 CLOSED 状态与
+      回归检查）；workspace 已回收
