@@ -45,14 +45,25 @@ export function resolveCloudflaredBin(): string | null {
   return cachedCloudflaredBin();
 }
 
-/** 惰性安装（按需）：npm:cloudflared 的 install() 下载官方 binary 到缓存 */
-export async function ensureCloudflaredBin(log: (line: string) => void): Promise<string | null> {
+/**
+ * 惰性安装（按需）：npm:cloudflared 的 install(to) 把 binary 下载到 `to`
+ * （目标文件路径，非目录——源码 install.js：download(url, to) + chmodSync(to)
+ * + 返回 to）。目标与 cachedCloudflaredBin 的探测路径严格一致（B6a）：
+ * ~/.opendweb/cloudflared/current/cloudflared(.exe)。loadInstall 注入面供测试
+ * 替换（真实 loader 动态 import npm:cloudflared）。
+ */
+export async function ensureCloudflaredBin(
+  log: (line: string) => void,
+  loadInstall: () => Promise<{ install: (to: string) => Promise<string> }> = async () =>
+    (await import("cloudflared")) as { install: (to: string) => Promise<string> },
+): Promise<string | null> {
   const found = resolveCloudflaredBin();
   if (found !== null) return found;
   try {
-    const mod = (await import("cloudflared")) as { install: (to: string) => Promise<string> };
-    const dir = path.join(cloudflaredHome(process.env.DWEB_HOME ?? undefined), "current");
-    const bin = await mod.install(dir);
+    const mod = await loadInstall();
+    const name = process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+    const target = path.join(cloudflaredHome(process.env.DWEB_HOME ?? undefined), "current", name);
+    const bin = await mod.install(target);
     log(`cloudflared: installed to ${bin}`);
     return bin;
   } catch (e) {
@@ -97,7 +108,12 @@ function exitLabelOf(child: ChildProcess): string {
  * 失败；过窗后退出无法再失败 postReady——由 per-child watchdog 输出
  * stderr WARNING（绝不无声伪成功），preStop 主动停止先摘除观察器。
  */
-export async function spawnCloudflared(token: string, graceMs: number = Number(process.env.DWEB_CF_SPAWN_GRACE_MS) || 2000): Promise<void> {
+export async function spawnCloudflared(
+  token: string,
+  graceMs: number = Number(process.env.DWEB_CF_SPAWN_GRACE_MS) || 2000,
+  resolveBin: () => Promise<string | null> = async () =>
+    resolveCloudflaredBin() ?? (await ensureCloudflaredBin(() => {})),
+): Promise<void> {
   // 全程停止事务进行中：事务快照取走的是旧状态，此刻新 spawn 的 child
   // 无人认领（事务会在 tunnelChild===null 时直接返回）——拒绝，杜绝孤儿
   // 进程逃逸 preStop（R6 复审阻塞项：stop-中-start 所有权竞态）。
@@ -156,7 +172,14 @@ export async function spawnCloudflared(token: string, graceMs: number = Number(p
 
   let child: ChildProcess;
   try {
-    const bin = resolveCloudflaredBin() ?? (await ensureCloudflaredBin(() => {}));
+    const bin = await resolveBin();
+    // B6b：await 期间（自动安装可长达数分钟）stop 事务可能已启动——此刻
+    // spawn 出的 child 无人认领（事务在 tunnelChild===null 时直接返回）。
+    // 重新检查停止条件，停止中即以同一 stop 语义拒绝，杜绝孤儿进程。
+    if (tunnelStopAll !== null || state.stopping) {
+      fail("cloudflared is stopping; refusing to start a new tunnel");
+      return state.promise;
+    }
     if (bin === null) {
       fail("cloudflared not found on PATH or in the cache, and the auto-install failed; install it (brew install cloudflared / npm i -g cloudflared) or set CLOUDFLARED_BIN");
       return state.promise;

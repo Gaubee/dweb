@@ -78,6 +78,41 @@ test("bin resolution: a cloudflared on PATH wins over the cache (1.0 order)", as
   }
 });
 
+// B6a：install(to) 收到的是目标二进制文件路径（npm:cloudflared 的 install 语
+// 义——download(url, to)+chmodSync(to)+返回 to），与 cachedCloudflaredBin 的
+// 探测路径完全一致；返回值即安装结果路径。
+test("ensureCloudflaredBin: install() receives the exact target FILE path and its result is returned (B6a)", async () => {
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-install-"));
+  const prev = { bin: process.env.CLOUDFLARED_BIN, home: process.env.DWEB_HOME, path: process.env.PATH };
+  try {
+    process.env.DWEB_HOME = home;
+    process.env.PATH = ""; // 无 PATH 命中、无缓存 -> 走注入的 install
+    if (prev.bin !== undefined) delete process.env.CLOUDFLARED_BIN;
+    const installCalls = [];
+    const logs = [];
+    const bin = await ensureCloudflaredBin(
+      (l) => logs.push(l),
+      async () => ({
+        install: async (to) => {
+          installCalls.push(to);
+          return to;
+        },
+      }),
+    );
+    const name = process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+    const expected = path.join(home, "cloudflared", "current", name);
+    assert.deepEqual(installCalls, [expected], "install(to) gets the exact binary file path, not the containing dir");
+    assert.equal(bin, expected, "the installed file path is returned (matches cachedCloudflaredBin's probe path)");
+    assert.ok(logs.some((l) => l.includes(`installed to ${expected}`)), JSON.stringify(logs));
+  } finally {
+    if (prev.bin === undefined) delete process.env.CLOUDFLARED_BIN;
+    else process.env.CLOUDFLARED_BIN = prev.bin;
+    if (prev.home === undefined) delete process.env.DWEB_HOME;
+    else process.env.DWEB_HOME = prev.home;
+    process.env.PATH = prev.path;
+  }
+});
+
 // ---- spawn 生命周期（7 项 R2-R6 契约） ----
 
 /**
@@ -231,6 +266,32 @@ test("spawn: a start racing an in-flight stop is rejected, never an orphan", { s
     assert.equal(pids.length, 1, `expected exactly one spawn (the racing start must not spawn), got: ${pids}`);
   } finally {
     await restore();
+  }
+});
+
+// 3b) B6b：stop 发生在惰性 bin 解析（自动安装可长达数分钟）期间——解析完成
+//     后必须重新检查停止事务，绝不 spawn 出无人认领的孤儿 child。
+test("spawn: a stop racing the lazy bin resolution spawns nothing (B6b)", { skip: process.platform === "win32" }, async () => {
+  const { restore, spawnLog } = await lifecycleEnv(
+    10000,
+    '#!/bin/sh\necho $$ >> "$DWEB_CF_SPAWN_LOG"\nexec /bin/sleep 30\n',
+  );
+  let stopped = null;
+  try {
+    const delayedBin = async () => {
+      await new Promise((r) => setTimeout(r, 250));
+      return "/nonexistent/late-resolved-cloudflared"; // 路径无关紧要：停止检查必须先于 spawn
+    };
+    const startup = spawnCloudflared("placeholder", 10000, delayedBin);
+    stopped = assert.rejects(startup, /stopped before it became healthy|cloudflared is stopping/);
+    await stopCloudflared(); // 解析未完成时即停止
+    await stopped;
+    await new Promise((r) => setTimeout(r, 400)); // 留窗给迟到的解析继续走错路
+    const spawned = await fsp.readFile(spawnLog, "utf8").then(() => true).catch(() => false);
+    assert.equal(spawned, false, "no child may be spawned after the stop transaction began");
+  } finally {
+    await restore();
+    await stopped?.catch(() => {});
   }
 });
 

@@ -48,12 +48,14 @@ export function resolveClientId(explicit?: string, env?: Record<string, string |
   return CF_OAUTH.builtinClientId === "" ? null : CF_OAUTH.builtinClientId;
 }
 
+/**
+ * 持久化登录态（B4a 契约）：恰好两个字段——refresh token 与 client id。
+ * access token 绝不落盘（过期快、且是完整凭据）；需要时总是用 refresh token
+ * 现换一个（getApiToken 无磁盘 access-token 捷径）。
+ */
 export interface StoredAuth {
   refreshToken: string;
   clientId: string;
-  /** 相对 epoch 毫秒；access token 缓存（内存语义，文件里可为陈旧值） */
-  accessToken?: string;
-  expiresAt?: number;
 }
 
 export function authFilePath(home: string): string {
@@ -66,9 +68,10 @@ export async function loadStoredAuth(
 ): Promise<StoredAuth | null> {
   try {
     const raw = await readFileImpl(authFilePath(home));
-    const parsed = JSON.parse(raw) as StoredAuth;
+    const parsed = JSON.parse(raw) as Partial<StoredAuth> & Record<string, unknown>;
     if (typeof parsed?.refreshToken !== "string" || typeof parsed?.clientId !== "string") return null;
-    return parsed;
+    // 归一为恰好两字段：1.0.0 落过盘的 accessToken/expiresAt 直接剥离
+    return { refreshToken: parsed.refreshToken, clientId: parsed.clientId };
   } catch {
     return null;
   }
@@ -128,18 +131,30 @@ export interface CallbackResult {
 /**
  * 在 127.0.0.1:callbackPort 起一次性 HTTP 服务接收 ?code=&state=；state 不匹配
  * 或缺少 code 返回 400（浏览器侧可见原因），匹配即 200 并停机。
+ * signal（B4b）：取消即关停监听并拒绝——loginFlow 超时路径据此释放 18971 端口，
+ * 不再留下卡死的 loopback 监听。
  */
 type ServerLike = Pick<Server, "once" | "on" | "close" | "listen">;
 
 export async function waitForCallback(
-  deps: { createServerImpl?: () => ServerLike } = {},
+  deps: { createServerImpl?: () => ServerLike; signal?: AbortSignal } = {},
 ): Promise<CallbackResult> {
   const srv: ServerLike = (deps.createServerImpl ?? (() => createServer() as unknown as ServerLike))();
+  const { signal } = deps;
   return new Promise<CallbackResult>((resolve, reject) => {
     const fail = (e: Error) => {
       srv.close();
       reject(e);
     };
+    let onAbort: (() => void) | null = null;
+    if (signal !== undefined) {
+      onAbort = () => fail(signal.reason instanceof Error ? signal.reason : new Error("oauth callback wait aborted"));
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
     srv.once("error", fail);
     srv.on("request", (req, res) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -161,6 +176,7 @@ export async function waitForCallback(
         return;
       }
       res.writeHead(200).end("authorization received - you can close this tab and return to the terminal");
+      if (onAbort !== null && signal !== undefined) signal.removeEventListener("abort", onAbort);
       srv.close();
       resolve({ code, state });
     });
@@ -220,33 +236,41 @@ export async function loginFlow(opts: {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? CF_OAUTH.loginTimeoutMs;
 
-  const callbackP = waitForCallback(opts.createServerImpl !== undefined ? { createServerImpl: opts.createServerImpl } : {});
+  // 超时经 AbortSignal 传入 waitForCallback（B4b）：到点即关停 loopback 监听，
+  // 端口 18971 不因一次未完成的登录被卡死
+  const cancel = new AbortController();
+  const timer = setTimeout(
+    () => cancel.abort(new Error(`browser login did not complete within ${Math.round(timeoutMs / 1000)}s`)),
+    timeoutMs,
+  );
+  if (typeof timer === "object" && "unref" in timer) (timer as { unref(): void }).unref();
+  const callbackP = waitForCallback({
+    ...(opts.createServerImpl !== undefined ? { createServerImpl: opts.createServerImpl } : {}),
+    signal: cancel.signal,
+  });
   // 端口被占（上一次未完成登录的残留监听等）在 listen 阶段即抛出，先于浏览器
   opts.openBrowser(authorizeUrl);
-  const callback = await Promise.race([
-    callbackP,
-    new Promise<never>((_, reject) => {
-      const t = setTimeout(() => reject(new Error(`browser login did not complete within ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
-      if (typeof t === "object" && "unref" in t) (t as { unref(): void }).unref();
-    }),
-  ]).catch(async (e: Error) => {
-    void callbackP.catch(() => {}); // 避免未处理拒绝
-    throw e;
-  });
-  if (callback.state !== state) {
-    throw new Error("oauth state mismatch (possible CSRF - aborting)");
+  try {
+    const callback = await callbackP;
+    if (callback.state !== state) {
+      throw new Error("oauth state mismatch (possible CSRF - aborting)");
+    }
+    const tokens = await postToken(
+      {
+        grant_type: "authorization_code",
+        code: callback.code,
+        code_verifier: verifier,
+        client_id: opts.clientId,
+        redirect_uri: redirectUri(),
+      },
+      fetchImpl,
+    );
+    return { ...tokens, state };
+  } finally {
+    clearTimeout(timer);
+    // 任何收尾路径（成功/失败/超时后迟到完成）都确保监听释放
+    cancel.abort();
   }
-  const tokens = await postToken(
-    {
-      grant_type: "authorization_code",
-      code: callback.code,
-      code_verifier: verifier,
-      client_id: opts.clientId,
-      redirect_uri: redirectUri(),
-    },
-    fetchImpl,
-  );
-  return { ...tokens, state };
 }
 
 /** refresh token 换新 access token（rotation：响应可携带新 refresh token） */
@@ -267,8 +291,10 @@ export async function refreshAccessToken(opts: {
 
 /**
  * 取得可用的 API bearer：显式 API token env 优先（方案 B），否则用持久化
- * 登录态（静默 refresh，回写新 token 缓存）。都不可用时返回 null（调用方
- * 引导 login 或设置 env）。
+ * 登录态现换 access token（B4a：磁盘上只有 refresh token，无缓存捷径——
+ * 每次都走 refresh；rotation 的新 refresh token 经 persist 回写）。
+ * dry-run 调用方传 no-op persist 即「网络读发生、磁盘零写入」。
+ * 都不可用时返回 null（调用方引导 login 或设置 env）。
  */
 export async function getApiToken(home: string, opts: {
   env?: Record<string, string | undefined>;
@@ -280,9 +306,6 @@ export async function getApiToken(home: string, opts: {
   if (envToken) return envToken;
   const stored = opts.stored ?? (await loadStoredAuth(home));
   if (stored === null) return null;
-  if (stored.accessToken !== undefined && stored.expiresAt !== undefined && stored.expiresAt > Date.now() + 30_000) {
-    return stored.accessToken;
-  }
   try {
     const refreshed = await refreshAccessToken({
       refreshToken: stored.refreshToken,
@@ -292,11 +315,9 @@ export async function getApiToken(home: string, opts: {
     const next: StoredAuth = {
       refreshToken: refreshed.refreshToken ?? stored.refreshToken,
       clientId: stored.clientId,
-      accessToken: refreshed.accessToken,
-      ...(refreshed.expiresAt !== undefined ? { expiresAt: refreshed.expiresAt } : {}),
     };
     await (opts.persist ?? ((a) => saveStoredAuth(home, a)))(next);
-    return next.accessToken ?? refreshed.accessToken;
+    return refreshed.accessToken;
   } catch {
     // refresh 失败（吊销/网络）：视为未登录，由调用方引导重新 login
     return null;

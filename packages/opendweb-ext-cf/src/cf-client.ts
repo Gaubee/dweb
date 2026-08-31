@@ -5,7 +5,7 @@
 // account id 推导（Owner 实测指出的 CLOUDFLARE_ACCOUNT_ID 缺陷修复）：
 // zone 对象自带 account{id,name}（Zone Read 权限即可），选 zone 即得账户；
 // 不再使用旧的 zones?account.id= 过滤查询。
-import type { IngressConfig } from "./route-model.js";
+import type { IngressRule } from "./route-model.js";
 import type { FetchLike } from "./cf-api.js";
 
 export interface ZoneSummary {
@@ -31,14 +31,24 @@ export interface DnsRecordSummary {
   comment?: string;
 }
 
+/**
+ * tunnel 配置全量形态（configurations GET/PUT 的 config 对象）：ingress 之外
+ * 还可携带 originRequest/warpRouting 等字段——PUT 是全量替换，调用方必须
+ * 先 GET 保留这些非 ingress 字段（B2），否则会静默丢配置。
+ */
+export interface TunnelConfiguration {
+  ingress: IngressRule[];
+  [key: string]: unknown;
+}
+
 /** 控制面窄接口（provision/tui 依赖；测试 fake 此面） */
 export interface CfGateway {
   listZones(): Promise<ZoneSummary[]>;
   listTunnels(accountId: string): Promise<TunnelSummary[]>;
   createTunnel(accountId: string, name: string): Promise<{ id: string; name: string }>;
   getTunnelToken(accountId: string, tunnelId: string): Promise<string>;
-  getConfiguration(accountId: string, tunnelId: string): Promise<IngressConfig | null>;
-  putConfiguration(accountId: string, tunnelId: string, config: IngressConfig): Promise<void>;
+  getConfiguration(accountId: string, tunnelId: string): Promise<TunnelConfiguration | null>;
+  putConfiguration(accountId: string, tunnelId: string, config: TunnelConfiguration): Promise<void>;
   findDnsRecord(zoneId: string, fqdn: string): Promise<DnsRecordSummary | null>;
   createDnsRecord(zoneId: string, fqdn: string, target: string, comment: string): Promise<void>;
   updateDnsRecord(zoneId: string, recordId: string, fqdn: string, target: string, comment: string): Promise<void>;
@@ -77,33 +87,47 @@ type SdkDnsRecord = {
 };
 
 /**
+ * tree-shakable 入口的注入/默认装载面。7.1.0 实测契约（B1 修复）：
+ * createClient 只收一个 options 对象（apiToken + resources 内联）；资源必须
+ * 用 leaf 子路径的具名类——聚合入口 cloudflare/resources 会把 447KB 全量资源
+ * 拉进 bundle，且其具名导出在部分版本缺失（undefined 混入 resources 数组）。
+ * 取最窄 leaf：Zones/DNS 资源类 + zero-trust/tunnels 的 Cloudflared 类
+ * （_key = ["zeroTrust","tunnels","cloudflared"]，恰为本网关的使用面；整个
+ * ZeroTrust 资源类含 Access/Gateway/DLP 等 374KB 无关子资源）。
+ */
+export interface SdkModule {
+  createClient: (options: { apiToken: string; resources: unknown[] }) => SdkLike;
+  /** 挂载的资源类（默认 loader 给最窄 leaf 集；注入面可省略） */
+  resources?: unknown[];
+}
+
+async function loadLeafSdk(): Promise<SdkModule> {
+  const { createClient } = (await import("cloudflare/tree-shakable")) as unknown as {
+    createClient: SdkModule["createClient"];
+  };
+  const [{ Zones }, { DNS }, { Cloudflared }] = await Promise.all([
+    import("cloudflare/resources/zones") as Promise<{ Zones?: unknown }>,
+    import("cloudflare/resources/dns") as Promise<{ DNS?: unknown }>,
+    import("cloudflare/resources/zero-trust/tunnels") as Promise<{ Cloudflared?: unknown }>,
+  ]);
+  const resources = [Zones, DNS, Cloudflared];
+  if (resources.some((r) => r === undefined)) {
+    throw new Error("cloudflare leaf resource modules did not export Zones/DNS/Cloudflared");
+  }
+  return { createClient, resources };
+}
+
+/**
  * 生产网关：cloudflare/tree-shakable createClient（apiToken 即 bearer——
  * OAuth access token 与 API token 同为 Bearer，同一网关可复用）。
  */
 export async function createSdkGateway(
   apiToken: string,
-  opts: { loadSdk?: () => Promise<{ createClient: (o: { apiToken: string }, r?: { resources?: unknown[] }) => SdkLike }> } = {},
+  opts: { loadSdk?: () => Promise<SdkModule> } = {},
 ): Promise<CfGateway> {
   // tree-shakable：resources 必传（全量挂载会拉入整个生成的 SDK）
-  const mod =
-    opts.loadSdk !== undefined
-      ? await opts.loadSdk()
-      : ((await import("cloudflare/tree-shakable")) as unknown as {
-          createClient: (
-            o: { apiToken: string },
-            r: { resources: unknown[] },
-          ) => SdkLike;
-        });
-  const resources: unknown[] = [];
-  if (opts.loadSdk === undefined) {
-    const res = (await import("cloudflare/resources")) as {
-      Zones?: unknown;
-      DNS?: unknown;
-      ZeroTrust?: unknown;
-    };
-    resources.push(res.Zones, res.DNS, res.ZeroTrust);
-  }
-  const client = mod.createClient({ apiToken }, { resources });
+  const mod = await (opts.loadSdk ?? loadLeafSdk)();
+  const client = mod.createClient({ apiToken, resources: mod.resources ?? [] });
 
   const wrap = async <T>(action: string, fn: () => Promise<T>): Promise<T> => {
     try {
@@ -170,16 +194,16 @@ export async function createSdkGateway(
         const res = await client.zeroTrust.tunnels.cloudflared.configurations.get(tunnelId, {
           account_id: accountId,
         });
-        const config = (res as { config?: { ingress?: IngressConfig["ingress"] } }).config;
+        const config = (res as { config?: TunnelConfiguration }).config;
         if (config?.ingress === undefined) return null;
-        return { ingress: config.ingress } satisfies IngressConfig;
+        return config;
       });
     },
-    async putConfiguration(accountId: string, tunnelId: string, config: IngressConfig) {
+    async putConfiguration(accountId: string, tunnelId: string, config: TunnelConfiguration) {
       await wrap("pushing the tunnel configuration", () =>
         client.zeroTrust.tunnels.cloudflared.configurations.update(tunnelId, {
           account_id: accountId,
-          config: { ingress: config.ingress },
+          config,
         }),
       );
     },
@@ -354,20 +378,22 @@ export async function createRestGateway(apiToken: string, fetchImpl: FetchLike =
     },
     async getConfiguration(accountId, tunnelId) {
       return wrap("reading the tunnel configuration", async () => {
-        const { body } = await cfFetch<{ config?: { ingress?: IngressConfig["ingress"] } }>(
+        const { body } = await cfFetch<{ config?: TunnelConfiguration }>(
           t,
           `/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`,
           { fetchImpl: F },
         );
-        const ingress = body.result?.config?.ingress;
-        return ingress === undefined ? null : { ingress };
+        const config = body.result?.config;
+        // 整个 config 对象返回（含 originRequest 等非 ingress 字段）：
+        // PUT 是全量替换，调用方需要它们才能不丢配置（B2）
+        return config?.ingress === undefined ? null : config;
       });
     },
     async putConfiguration(accountId, tunnelId, config) {
       await wrap("pushing the tunnel configuration", () =>
         cfFetch(t, `/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`, {
           method: "PUT",
-          body: JSON.stringify({ config: { ingress: config.ingress } }),
+          body: JSON.stringify({ config }),
           fetchImpl: F,
         }),
       );

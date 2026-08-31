@@ -158,6 +158,67 @@ test("ensure configuration: identical ingress is a no-op; drift triggers a full-
   assert.deepEqual(drifted.calls.putConfiguration[0], { accountId: "acc1", tunnelId: "t-keep", config: desired });
 });
 
+test("ensure configuration: non-ingress fields of the current config are preserved in the PUT (B2)", async () => {
+  const desired = buildIngress({ mode: "single", gatewayHost: HOST, relayHost: RELAY });
+  const g = fakeGateway({
+    tunnels: [{ id: "t-keep", name: "opendweb-gaubee-tweb-xin", status: "active", connections: 0 }],
+    configs: {
+      "t-keep": {
+        ingress: [{ hostname: "old.gaubee.tweb.xin", service: "http://localhost:9999" }],
+        originRequest: { connectTimeout: 10, noTLSVerify: true },
+        warpRouting: { enabled: false },
+      },
+    },
+  });
+  await provision({ ...baseInput(g) });
+  assert.equal(g.calls.putConfiguration.length, 1, "drifted ingress must be pushed");
+  const put = g.calls.putConfiguration[0];
+  assert.deepEqual(put.config.ingress, desired.ingress, "ingress is replaced by the desired rules");
+  // 非 ingress 字段原样带在 PUT body 里——绝不静默丢弃用户已有的全局配置
+  assert.deepEqual(put.config.originRequest, { connectTimeout: 10, noTLSVerify: true });
+  assert.deepEqual(put.config.warpRouting, { enabled: false });
+});
+
+test("ensure configuration: no current config -> PUT is exactly the desired ingress (nothing to preserve)", async () => {
+  const g = fakeGateway({ tunnels: [{ id: "t-keep", name: "opendweb-gaubee-tweb-xin", status: "active", connections: 0 }] });
+  await provision({ ...baseInput(g) });
+  assert.deepEqual(g.calls.putConfiguration[0].config, buildIngress({ mode: "single", gatewayHost: HOST, relayHost: RELAY }));
+});
+
+// ---- tunnel ownership（B3a） ----
+
+test("ensure tunnel (new name): a same-name tunnel is a hard error, not a silent reuse + overwrite (B3a)", async () => {
+  const g = fakeGateway({ tunnels: [{ id: "t-taken", name: "custom-name", status: "active", connections: 0 }] });
+  await assert.rejects(
+    () => provision({ ...baseInput(g), tunnel: { kind: "new", name: "custom-name" } }),
+    /tunnel "custom-name" already exists - choose reuse or a different name/,
+  );
+  assert.deepEqual(g.calls.createTunnel, [], "must not create a second same-name tunnel");
+  assert.deepEqual(g.calls.putConfiguration, [], "must not overwrite the existing tunnel's config");
+});
+
+test("ensure tunnel (new name, dry-run): the collision is logged, nothing throws and nothing is written (B3a)", async () => {
+  const g = fakeGateway({ tunnels: [{ id: "t-taken", name: "custom-name", status: "active", connections: 0 }] });
+  const logs = [];
+  await provision({
+    ...baseInput(g),
+    tunnel: { kind: "new", name: "custom-name" },
+    dryRun: true,
+    log: (l) => logs.push(l),
+  });
+  const out = logs.join("\n");
+  assert.match(out, /dry-run: tunnel "custom-name" already exists \(rerun with reuse or a different name\)/);
+  assert.deepEqual(g.calls.createTunnel, []);
+  assert.deepEqual(g.calls.putConfiguration, []);
+});
+
+test("ensure tunnel (auto): a same-name ownership collision still reuses silently (unchanged 1.0.0 semantics)", async () => {
+  const g = fakeGateway({ tunnels: [{ id: "t-keep", name: "opendweb-gaubee-tweb-xin", status: "active", connections: 0 }] });
+  const r = await provision({ ...baseInput(g), tunnel: { kind: "auto" } });
+  assert.equal(r.tunnelId, "t-keep");
+  assert.deepEqual(g.calls.createTunnel, []);
+});
+
 // ---- ensure DNS ----
 
 test("ensure DNS: no record -> CNAME created with the ownership comment (dual routes relay + gateway)", async () => {

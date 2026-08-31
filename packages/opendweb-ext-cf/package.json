@@ -1,6 +1,6 @@
 {
   "name": "@jixo/opendweb-ext-cf",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "opendweb plugin — Cloudflare Tunnel exposure wizard (ingress push via API, end-to-end verification, optional cloudflared co-spawn)",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
-    "pack:dry": "npm run build && npm pack --dry-run && node -e \"const p=require('./package.json'),fs=require('fs');const deps=p.dependencies??{};if(Object.keys(deps).length>0){console.error('unexpected runtime dependencies:',deps);process.exit(1)}const BUNDLED=['@clack','cloudflare','cloudflared'];let kb=0;for(const f of fs.readdirSync('dist')){const st=fs.statSync('dist/'+f);kb+=st.size;if(!f.endsWith('.mjs'))continue;const text=fs.readFileSync('dist/'+f,'utf8');for(const line of text.split('\\\\n')){const t=line.trim();if((t.startsWith('import')||t.startsWith('export'))&&BUNDLED.some(b=>t.includes('\\\"'+b))){console.error('bundled dependency leaked in dist/'+f+':',t);process.exit(1)}}}console.log('runtime dependencies: none; no bundled imports leaked; dist size:',Math.round(kb/1024),'KB');if(kb>2048*1024){console.error('dist too large');process.exit(1)}\"",
+    "pack:dry": "npm run build && npm pack --dry-run && node -e \"const p=require('./package.json'),fs=require('fs'),path=require('path');const deps=p.dependencies??{};if(Object.keys(deps).length>0){console.error('unexpected runtime dependencies:',deps);process.exit(1)}const BUNDLED=['@clack','cloudflare','cloudflared'];const files=[];(function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const f=path.join(d,e.name);e.isDirectory()?walk(f):files.push(f)}})('dist');let kb=0;const leaks=[];for(const f of files){kb+=fs.statSync(f).size;if(!f.endsWith('.mjs'))continue;const text=fs.readFileSync(f,'utf8');const Q=String.fromCharCode(34);for(const line of text.split(String.fromCharCode(10))){const t=line.trim();if((t.startsWith('import')||t.startsWith('export'))&&BUNDLED.some(b=>t.includes(Q+b))){leaks.push(f+': '+t)}}for(const m of text.matchAll(/import\\s*\\(\\s*['\\\"]([^'\\\"]+)['\\\"]/g)){const s=m[1];if(BUNDLED.some(b=>s===b||s.startsWith(b+'/'))){leaks.push(f+': dynamic import of '+s)}}}if(leaks.length>0){console.error('bundled dependency leaked in dist:');for(const l of leaks)console.error(' ',l);process.exit(1)}console.log('runtime dependencies: none; no bundled imports leaked (recursive scan, static + dynamic); dist size:',Math.round(kb/1024),'KB');if(kb>2048*1024){console.error('dist too large');process.exit(1)}\"",
     "test": "npm run build && node --test --test-force-exit --test-concurrency=1 test/*.test.mjs"
   },
   "repository": {

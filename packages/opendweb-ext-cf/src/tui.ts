@@ -27,7 +27,7 @@ import {
   getApiToken,
   type StoredAuth,
 } from "./auth.js";
-import { createPrompts, sanitizeUI, InteractiveAbort, type ClackApi } from "./prompts.js";
+import { createPrompts, sanitizeUI, InteractiveAbort, type ClackApi, type UiPrompts } from "./prompts.js";
 import { tokenSummary, type FetchLike } from "./cf-api.js";
 
 /** spinner 形状（@clack spinner 的结构化子集；闭包赋值需要命名类型） */
@@ -77,6 +77,33 @@ function ordinal(n: number): string {
 function defaultOpenBrowser(url: string): void {
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
   exec(`${cmd} ${JSON.stringify(url)}`);
+}
+
+/**
+ * 粘贴式 API token 采集（单口累积捕获，0.2.x 交互保留）：多行粘贴碎裂成逐行
+ * 提交，validate 聚合；确认后返回 token。认证步与 B5 的写 scope 降级路径共用。
+ */
+async function promptPastedToken(ui: UiPrompts): Promise<string> {
+  for (;;) {
+    let buffer = "";
+    await ui.password({
+      message: "cloudflare API token (paste the token created at My Profile -> API Tokens)",
+      validate: (v) => {
+        buffer += (v ?? "") + "\n";
+        // 累积器对整块做形态扫描（多行粘贴碎裂重组，0.2.x 交互保留）：
+        // 任一行出现 >=40 的 token 形态串即通过
+        if (firstTokenLine(buffer) === null) {
+          return "no token yet - keep pasting (the token is the >=40-char string shown once at creation)";
+        }
+        return undefined;
+      },
+    });
+    const candidate = firstTokenLine(buffer) ?? buffer.trim();
+    ui.log.message(`api token: ${tokenSummary(candidate)}`);
+    const confirmed = await ui.confirm({ message: "use this token?" });
+    if (confirmed) return candidate;
+    ui.log.message("re-enter the token");
+  }
 }
 
 function dwebHome(env?: Record<string, string | undefined>): string {
@@ -132,7 +159,12 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
       "overview",
     );
 
-    // 1) 认证：env token / 已存登录态 / 浏览器登录 / 粘贴 API token
+    // 1) 认证：env token / 已存登录态 / 浏览器登录 / 粘贴 API token。
+    // 登录态写入缓冲到 apply 才落盘（B7）：dry/abort 的向导全程零凭据写入。
+    let pendingPersist: StoredAuth | null = null;
+    const bufferedPersist = async (a: StoredAuth): Promise<void> => {
+      pendingPersist = a;
+    };
     let apiToken: string | null = null;
     let stored = await loadAuth();
     if (!forceDryRun) {
@@ -160,7 +192,7 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
         apiToken = await getApiToken(dwebHome(env), {
           env,
           stored,
-          persist: persistAuth,
+          persist: bufferedPersist,
           ...(fetchImpl !== undefined ? { fetchImpl } : {}),
         });
         if (apiToken === null) {
@@ -182,8 +214,9 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
           if (tokens.refreshToken === undefined || tokens.refreshToken === "") {
             throw new Error("no refresh token returned (offline_access scope missing?)");
           }
-          stored = { refreshToken: tokens.refreshToken, clientId, accessToken: tokens.accessToken };
-          await persistAuth(stored);
+          // B4a：会话对象只有 {refreshToken, clientId}（access token 不落盘）
+          stored = { refreshToken: tokens.refreshToken, clientId };
+          bufferedPersist(stored);
           apiToken = tokens.accessToken;
           spin.stop("logged in");
         } finally {
@@ -191,30 +224,7 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
         }
       }
       if (apiToken === null && choice === "paste") {
-        // 单口累积捕获（0.2.x 交互保留）：多行粘贴碎裂成逐行提交，validate 聚合
-        for (;;) {
-          let buffer = "";
-          await ui.password({
-            message: "cloudflare API token (paste the token created at My Profile -> API Tokens)",
-            validate: (v) => {
-              buffer += (v ?? "") + "\n";
-              // 累积器对整块做形态扫描（多行粘贴碎裂重组，0.2.x 交互保留）：
-              // 任一行出现 >=40 的 token 形态串即通过
-              if (firstTokenLine(buffer) === null) {
-                return "no token yet - keep pasting (the token is the >=40-char string shown once at creation)";
-              }
-              return undefined;
-            },
-          });
-          const candidate = firstTokenLine(buffer) ?? buffer.trim();
-          ui.log.message(`api token: ${tokenSummary(candidate)}`);
-          const confirmed = await ui.confirm({ message: "use this token?" });
-          if (confirmed) {
-            apiToken = candidate;
-            break;
-          }
-          ui.log.message("re-enter the token");
-        }
+        apiToken = await promptPastedToken(ui);
       }
       if (apiToken === null) {
         throw new Error("no cloudflare credential available (login, CLOUDFLARE_API_TOKEN, or paste a token)");
@@ -299,14 +309,40 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
       const spin = ui.spinner();
       spinState.spin = spin;
       spin.start("listing tunnels");
-      const gateway = await createGateway(apiToken);
+      let gateway = await createGateway(apiToken);
       let tunnels: TunnelSummary[] = [];
       try {
         tunnels = await gateway.listTunnels(zone.accountId);
+        spin.stop(`${tunnels.length} tunnel(s)`);
       } catch {
-        ui.log.message("tunnel listing unavailable (token may lack Tunnel permissions) - will create a new one");
+        // B5 降级建模：listing 失败通常是登录态缺写 scope（只读 OAuth）。旧
+        // 行为只 log 后径直走向 create——那只会在 API 处再失败一次。这里显式
+        // 提示缺写 scope，并重贴 API token（重建网关）后再列；用户也可 abort。
+        spin.stop("tunnel listing failed");
+        spinState.spin = null;
+        ui.log.message("tunnel listing failed - the logged-in session may lack write scopes (read-only)");
+        const recovery = await ui.select<"paste" | "abort">({
+          message: "continue with an API token instead?",
+          options: [
+            {
+              value: "paste",
+              label: "continue with an API token instead (paste)",
+              hint: "needs Account / Cloudflare Tunnel / Edit + Zone / DNS / Edit",
+            },
+            { value: "abort", label: "abort" },
+          ],
+        });
+        if (recovery === "abort") {
+          ui.outro("aborted; nothing was changed");
+          return { exit: 0 };
+        }
+        apiToken = await promptPastedToken(ui);
+        gateway = await createGateway(apiToken);
+        spinState.spin = spin;
+        spin.start("listing tunnels");
+        tunnels = await gateway.listTunnels(zone.accountId); // 再失败即显式抛出
+        spin.stop(`${tunnels.length} tunnel(s)`);
       }
-      spin.stop(`${tunnels.length} tunnel(s)`);
       spinState.spin = null;
       const wantedName = tunnelNameFor(plan0.gatewayHost);
       const existingWanted = tunnels.find((t) => t.name === wantedName);
@@ -384,6 +420,11 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
     if (action === "abort") {
       ui.outro("aborted; nothing was changed");
       return { exit: 0 };
+    }
+    // 登录态/rotation 只在真正 apply 时落盘（B7）：dry 与 abort 全程零写入
+    if (action === "apply" && pendingPersist !== null) {
+      await persistAuth(pendingPersist);
+      pendingPersist = null;
     }
 
     // 7) 执行（DNS 冲突 → 交互确认；非交互 provision 默认 abort）

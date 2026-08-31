@@ -63,7 +63,14 @@ export default {
         throw new Error("cf setup needs options.hostname (or server.publicGatewayUrl) in opendweb.config.toml");
       }
       const home = dwebHome();
-      const apiToken = await getApiToken(home, { env: process.env, stored: await loadStoredAuth(home) });
+      const dryRun = Boolean(ctx.options?.dryRun);
+      // dry-run 零落盘（B7）：需要 access token 时仍走 refresh（网络读），但
+      // 不回写登录态——rotation 结果丢弃，代价是旧 refresh token 可能失效
+      const apiToken = await getApiToken(home, {
+        env: process.env,
+        stored: await loadStoredAuth(home),
+        ...(dryRun ? { persist: async () => {} } : {}),
+      });
       if (apiToken === null) {
         throw new Error(
           "not authenticated with Cloudflare: run `opendweb cf login` (browser) or set CLOUDFLARE_API_TOKEN",
@@ -83,7 +90,7 @@ export default {
         tunnel,
         cwd: ctx.cwd ?? process.cwd(),
         configPath: ctx.configPath ?? null,
-        dryRun: Boolean(ctx.options?.dryRun),
+        dryRun,
         skipVerify: Boolean(ctx.options?.skipVerify),
         log: () => {}, // 钩子内静默执行；状态由 CLI 聚合输出
       });
@@ -134,7 +141,11 @@ export async function pickZoneForHostname(
   }
   const byId = zoneId !== undefined ? zones.find((z) => z.id === zoneId) : undefined;
   if (byId !== undefined) return byId;
-  const match = zones.find((z) => hostname === z.name || hostname.endsWith(`.${z.name}`));
+  // 精确/后缀命中中取最长 zone 名（B3c）：zones 顺序是 API 分页序，取首个
+  // 匹配会在 [example.com, a.example.com] 场景选错父 zone（DNS 记录建错地方）
+  const match = zones
+    .filter((z) => hostname === z.name || hostname.endsWith(`.${z.name}`))
+    .sort((a, b) => b.name.length - a.name.length)[0];
   if (match !== undefined) return match;
   // 最长后缀兜底（zone 列表权限受限时未必列得全）
   const suffix = zones

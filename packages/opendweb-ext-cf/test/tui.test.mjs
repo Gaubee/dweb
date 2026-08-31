@@ -229,7 +229,7 @@ test("auth step: env token option first with a summary hint; stored session opti
   assert.equal(fkEnv.calls.select[0].options[0].hint, tokenSummary(envToken));
   assert.ok(gatewayEnv.calls.tokens.every((t) => t === envToken), JSON.stringify(gatewayEnv.calls.tokens));
 
-  // stored 路径：缓存 access token 未过期 -> 直接使用，无网络刷新
+  // stored 路径（B4a）：磁盘上只有 refresh token——access token 总是现换
   const fkStored = fakeClack([
     A.select("stored"),
     A.select(ZONE_TW),
@@ -245,12 +245,13 @@ test("auth step: env token option first with a summary hint; stored session opti
       gateway: gatewayStored,
       provision: provisionStored,
       env: {},
-      loadAuth: async () => ({ refreshToken: "rt", clientId: "cid", accessToken: "at-cached", expiresAt: Date.now() + 3_600_000 }),
+      loadAuth: async () => ({ refreshToken: "rt", clientId: "cid" }),
+      fetchImpl: async () => new Response(JSON.stringify({ access_token: "at-refreshed", refresh_token: "rt-2" }), { status: 200 }),
     }),
   );
   assert.equal(rStored.exit, 0);
   assert.deepEqual(fkStored.calls.select[0].options.map((o) => o.value), ["stored", "login", "paste"]);
-  assert.ok(gatewayStored.calls.tokens.every((t) => t === "at-cached"), JSON.stringify(gatewayStored.calls.tokens));
+  assert.ok(gatewayStored.calls.tokens.every((t) => t === "at-refreshed"), JSON.stringify(gatewayStored.calls.tokens));
 });
 
 test("auth step: browser login persists the session and uses the returned access token", async () => {
@@ -280,7 +281,8 @@ test("auth step: browser login persists the session and uses the returned access
   );
   assert.equal(r.exit, 0);
   assert.deepEqual(loginCalls, ["cid-9"]);
-  assert.deepEqual(persisted, [{ refreshToken: "rt-browser", clientId: "cid-9", accessToken: "at-browser" }]);
+  // B4a：落盘的会话恰好两字段（access token 不持久化）；B7：apply 时才 flush
+  assert.deepEqual(persisted, [{ refreshToken: "rt-browser", clientId: "cid-9" }]);
   assert.ok(gateway.calls.tokens.length >= 1 && gateway.calls.tokens.every((t) => t === "at-browser"));
   assert.equal(provision.calls.length, 1);
   // login 选项已配置：不带 CF_OAUTH_CLIENT_ID 提示
@@ -476,17 +478,72 @@ test("tunnel step: ownership name first; existing tunnels listed with status/con
   assert.deepEqual(provisionReuse.calls[0].tunnel, { kind: "existing", id: "t-named" });
 });
 
-test("tunnel step: listing failure degrades to create-new with a log line", async () => {
-  const fk = fakeClack(pasteDriveAnswers({ mode: "single" }));
+test("tunnel step (B5): listing failure surfaces the write-scope note and the paste/abort recovery; abort exits 0", async () => {
+  const fk = fakeClack([
+    A.select("paste"),
+    A.password(API_TOKEN),
+    A.confirm(true),
+    A.select(ZONE_TW),
+    A.text(HOST),
+    A.select("single"),
+    A.select("abort"), // B5 降级恢复选择
+  ]);
   const provision = mockProvision();
   const r = await runInteractiveSetup(
     tuiOpts(fk, { gateway: fakeGateway({ failTunnels: true }), provision, env: {} }),
   );
   assert.equal(r.exit, 0);
-  assert.ok(fk.calls.log.some((l) => /tunnel listing unavailable/.test(l)), JSON.stringify(fk.calls.log));
-  const tunnelSel = fk.calls.select.find((c) => c.options?.[0]?.value?.kind !== undefined);
-  assert.equal(tunnelSel.options.length, 1, "only the create option when listing failed");
-  assert.deepEqual(provision.calls[0].tunnel, NEW_TUNNEL_CHOICE);
+  assert.ok(
+    fk.calls.log.some((l) => /tunnel listing failed - the logged-in session may lack write scopes/.test(l)),
+    JSON.stringify(fk.calls.log),
+  );
+  const degraded = fk.calls.select.at(-1);
+  assert.match(degraded.message, /continue with an API token instead\?/);
+  assert.deepEqual(degraded.options.map((o) => o.value), ["paste", "abort"]);
+  assert.match(degraded.options[0].label, /continue with an API token instead \(paste\)/);
+  assert.equal(provision.calls.length, 0, "abort must not provision");
+  assert.match(fk.calls.outro.join("\n"), /aborted; nothing was changed/);
+});
+
+test("tunnel step (B5): choosing paste restarts the gateway with the pasted token and relists before proceeding", async () => {
+  const secondToken = "second-api-token-0123456789abcdef0123456789";
+  const gw1 = fakeGateway({ failTunnels: true });
+  const gw2 = fakeGateway({ tunnels: [{ id: "t-ok", name: "some-other-tunnel", status: "active", connections: 1 }] });
+  const tokens = [];
+  const provision = mockProvision();
+  const fk = fakeClack([
+    A.select("paste"),
+    A.password(API_TOKEN),
+    A.confirm(true),
+    A.select(ZONE_TW),
+    A.text(HOST),
+    A.select("single"),
+    A.select("paste"), // B5 降级：改贴 API token
+    A.password(secondToken),
+    A.confirm(true),
+    A.select(NEW_TUNNEL_CHOICE),
+    A.select("apply"),
+  ]);
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: {},
+    clack: fk,
+    createGateway: async (t) => {
+      tokens.push(t);
+      return t === API_TOKEN ? gw1 : gw2;
+    },
+    loadAuth: async () => null,
+    persistAuth: async () => {},
+    runProvision: provision.run,
+    writeFile: async () => {},
+    exists: () => false,
+  });
+  assert.equal(r.exit, 0);
+  // zones 网关 + 失败的 tunnels 网关用旧 token；重列与 provision 都用新贴的 token
+  assert.deepEqual(tokens, [API_TOKEN, API_TOKEN, secondToken, secondToken], JSON.stringify(tokens));
+  assert.deepEqual(gw2.calls.listTunnels, ["acc1"], "the restarted gateway relists the tunnels");
+  assert.equal(provision.calls.length, 1);
+  assert.equal(provision.calls[0].client, gw2, "provision runs against the gateway built from the pasted token");
 });
 
 // ---- 计划预览与确认 ----
@@ -552,6 +609,50 @@ test("action select: dry passes dryRun to provision and outros without pushing",
   assert.equal(r.exit, 0);
   assert.equal(provision.calls[0].dryRun, true);
   assert.match(fk.calls.outro.join("\n"), /dry-run ok - nothing was pushed/);
+});
+
+test("stored session + dry action (B7): the silent refresh rotation is NOT persisted; apply flushes exactly two fields", async () => {
+  const tokenFetch = async () =>
+    new Response(JSON.stringify({ access_token: "at-refreshed", refresh_token: "rt-rotated" }), { status: 200 });
+  const persisted = [];
+  const persist = async (a) => persisted.push(a);
+  const answers = (action) => [
+    A.select("stored"),
+    A.select(ZONE_TW),
+    A.text(HOST),
+    A.select("single"),
+    A.select(NEW_TUNNEL_CHOICE),
+    A.select(action),
+  ];
+
+  const fkDry = fakeClack(answers("dry"));
+  const rDry = await runInteractiveSetup(
+    tuiOpts(fkDry, {
+      gateway: fakeGateway(),
+      provision: mockProvision(),
+      env: {},
+      loadAuth: async () => ({ refreshToken: "rt", clientId: "cid" }),
+      fetchImpl: tokenFetch,
+      persistAuth: persist,
+    }),
+  );
+  assert.equal(rDry.exit, 0);
+  assert.equal(persisted.length, 0, "a dry-run wizard must not write credentials (B7)");
+  assert.match(fkDry.calls.outro.join("\n"), /dry-run ok - nothing was pushed/);
+
+  const fkApply = fakeClack(answers("apply"));
+  const rApply = await runInteractiveSetup(
+    tuiOpts(fkApply, {
+      gateway: fakeGateway(),
+      provision: mockProvision(),
+      env: {},
+      loadAuth: async () => ({ refreshToken: "rt", clientId: "cid" }),
+      fetchImpl: tokenFetch,
+      persistAuth: persist,
+    }),
+  );
+  assert.equal(rApply.exit, 0);
+  assert.deepEqual(persisted, [{ refreshToken: "rt-rotated", clientId: "cid" }], "apply flushes the buffered rotation");
 });
 
 test("clack cancel (Ctrl+C) maps to abort semantics (exit 0)", async () => {

@@ -8,8 +8,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { planExposure, verifyExposure, type ExposureMode } from "./route-model.js";
 import { runInteractiveSetup } from "./tui.js";
 import { getApiToken, loadStoredAuth, saveStoredAuth, clearStoredAuth, resolveClientId, loginFlow, CF_OAUTH } from "./auth.js";
-import { createGateway } from "./cf-client.js";
-import { provision } from "./provision.js";
+import { createGateway, type CfGateway } from "./cf-client.js";
+import { provision, type TunnelChoice } from "./provision.js";
 import { pickZoneForHostname } from "./index.js";
 
 type Args = Record<string, unknown>;
@@ -67,6 +67,8 @@ interface RunContext {
   cwd: string;
   stdout?: { write(s: string): void };
   stderr?: { write(s: string): void };
+  /** 网关注入面（测试）：缺省真实 createGateway */
+  createGateway?: (apiToken: string) => Promise<CfGateway>;
 }
 
 function dwebHome(): string {
@@ -77,7 +79,7 @@ export default {
   name: "cf",
   apiVersion: 1 as const,
   commands: COMMANDS,
-  async run({ command, args, log, cwd }: RunContext): Promise<{ exit: number }> {
+  async run({ command, args, log, cwd, createGateway: gatewayFactory = createGateway }: RunContext): Promise<{ exit: number }> {
     const mode: ExposureMode = str(args, "mode") === "single" ? "single" : "dual";
     if (command === "login") {
       const clientId = resolveClientId(undefined, process.env);
@@ -91,12 +93,8 @@ export default {
       const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
       const tokens = await loginFlow({ clientId, openBrowser: (url) => void exec(`${opener} ${JSON.stringify(url)}`) });
       if (tokens.refreshToken === undefined) throw new Error("no refresh token returned (offline_access scope missing?)");
-      await saveStoredAuth(dwebHome(), {
-        refreshToken: tokens.refreshToken,
-        clientId,
-        accessToken: tokens.accessToken,
-        ...(tokens.expiresAt !== undefined ? { expiresAt: tokens.expiresAt } : {}),
-      });
+      // B4a：只持久化 {refreshToken, clientId}——access token 绝不落盘
+      await saveStoredAuth(dwebHome(), { refreshToken: tokens.refreshToken, clientId });
       log("logged in (session saved; refresh handled automatically)");
       return { exit: 0 };
     }
@@ -148,24 +146,35 @@ export default {
           skipVerify: bool(args, "skip-verify"),
         });
       }
-      // 非交互：env/登录态 -> 幂等 provision
+      // 非交互：env/登录态 -> 幂等 provision（config 锚点优先：B3b）
       const hostname = str(args, "hostname");
       if (!hostname) throw new Error("--hostname is required (or --interactive / a terminal for the wizard)");
       const home = dwebHome();
-      const apiToken = await getApiToken(home, { env: process.env, stored: await loadStoredAuth(home) });
+      const dryRun = bool(args, "dry-run");
+      // dry-run 零落盘（B7）：refresh 仍发生（网络读），但不回写登录态
+      const apiToken = await getApiToken(home, {
+        env: process.env,
+        stored: await loadStoredAuth(home),
+        ...(dryRun ? { persist: async () => {} } : {}),
+      });
       if (apiToken === null) {
         throw new Error("not authenticated: `opendweb cf login` or set CLOUDFLARE_API_TOKEN");
       }
-      const client = await createGateway(apiToken);
-      const zone = await pickZoneForHostname(client, hostname);
+      const client = await gatewayFactory(apiToken);
+      // 与 index.ts setup 同语义：config 的 zoneId/tunnelId 锚点优先（复跑幂等
+      // 复用资源，不再每次按命名/后缀重新发现）
+      const cfOpts = readConfigState(cwd)?.cfOptions ?? {};
+      const zone = await pickZoneForHostname(client, hostname, cfOpts.zoneId);
+      const tunnel: TunnelChoice =
+        cfOpts.tunnelId !== undefined ? { kind: "existing", id: cfOpts.tunnelId } : { kind: "auto" };
       await provision({
         client,
         hostname,
         mode,
         zone,
-        tunnel: { kind: "auto" },
+        tunnel,
         cwd,
-        dryRun: bool(args, "dry-run"),
+        dryRun,
         skipVerify: bool(args, "skip-verify"),
       });
       return { exit: 0 };

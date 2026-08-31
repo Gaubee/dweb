@@ -5,7 +5,7 @@
 //   属于本产品（命名前缀）或用户显式选择复用时写入
 // - DNS：exact 查询；无记录创建（comment 标记 ownership）；指向本 tunnel 即
 //   no-op；指向他处必须经交互确认（非交互默认 abort，绝不静默覆盖）
-import type { CfGateway, DnsRecordSummary } from "./cf-client.js";
+import type { CfGateway, DnsRecordSummary, TunnelConfiguration } from "./cf-client.js";
 import {
   planExposure,
   buildIngress,
@@ -66,6 +66,16 @@ function ingressEqual(a: IngressConfig, b: IngressConfig): boolean {
   return JSON.stringify(a.ingress) === JSON.stringify(b.ingress);
 }
 
+/**
+ * 期望的完整 tunnel 配置（B2）：configurations PUT 是全量替换——仅发送
+ * {ingress} 会静默丢掉既有 originRequest/warpRouting 等字段。这里把当前
+ * 配置的非 ingress 字段原样保留，仅替换 ingress。
+ */
+function mergeConfiguration(current: TunnelConfiguration | null, desiredIngress: IngressConfig): TunnelConfiguration {
+  if (current === null) return { ingress: desiredIngress.ingress };
+  return { ...current, ingress: desiredIngress.ingress };
+}
+
 export async function provision(input: ProvisionInput): Promise<ProvisionResult> {
   const {
     client,
@@ -90,6 +100,14 @@ export async function provision(input: ProvisionInput): Promise<ProvisionResult>
     const wanted = tunnelChoice.kind === "new" ? tunnelChoice.name : tunnelNameFor(plan.gatewayHost);
     const existing = (await client.listTunnels(zone.accountId)).find((t) => t.name === wanted);
     if (existing !== undefined) {
+      // kind:"new" 是显式命名的新建意图：同名已存在时静默复用会紧接着覆盖其
+      // 配置（所有权缺口 B3a）——非 dry-run 一律显式拒绝，让用户选 reuse 或改名
+      if (tunnelChoice.kind === "new") {
+        if (!dryRun) {
+          throw new Error(`tunnel "${wanted}" already exists - choose reuse or a different name`);
+        }
+        log(`dry-run: tunnel "${wanted}" already exists (rerun with reuse or a different name)`);
+      }
       tunnelId = existing.id;
       log(`tunnel: found existing "${wanted}" (${tunnelId})`);
     } else if (dryRun) {
@@ -102,7 +120,7 @@ export async function provision(input: ProvisionInput): Promise<ProvisionResult>
     }
   }
 
-  // ---- ensure configuration（GET-diff → PUT 全量）----
+  // ---- ensure configuration（GET-diff → PUT 全量，非 ingress 字段保留）----
   if (tunnelId !== null) {
     const current = await client.getConfiguration(zone.accountId, tunnelId);
     if (current !== null && ingressEqual(current, desiredIngress)) {
@@ -111,7 +129,9 @@ export async function provision(input: ProvisionInput): Promise<ProvisionResult>
       log("dry-run: would PUT ingress configuration:");
       for (const rule of desiredIngress.ingress) log(`  ${JSON.stringify(rule)}`);
     } else {
-      await client.putConfiguration(zone.accountId, tunnelId, desiredIngress);
+      // PUT 全量替换：merge 当前配置的非 ingress 字段（originRequest 等），
+      // 仅 ingress 换成期望值（B2：不能静默丢用户已有的全局配置）
+      await client.putConfiguration(zone.accountId, tunnelId, mergeConfiguration(current, desiredIngress));
       log(`ingress: pushed ${desiredIngress.ingress.length} rules (full replacement)`);
     }
   }

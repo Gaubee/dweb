@@ -101,9 +101,17 @@ test("authFilePath/loadStoredAuth: path shape; missing/invalid/incomplete files 
   await fsp.writeFile(file, JSON.stringify({ clientId: "cid" }), "utf8"); // 缺 refreshToken
   assert.equal(await loadStoredAuth(home), null);
 
-  const auth = { refreshToken: "rt-1", clientId: "cid-1", accessToken: "at-1", expiresAt: 123 };
+  const auth = { refreshToken: "rt-1", clientId: "cid-1" };
   await fsp.writeFile(file, JSON.stringify(auth), "utf8");
   assert.deepEqual(await loadStoredAuth(home), auth);
+
+  // B4a：1.0.0 落过盘的 accessToken/expiresAt 被剥离——登录态恰好两字段
+  await fsp.writeFile(
+    file,
+    JSON.stringify({ refreshToken: "rt-1", clientId: "cid-1", accessToken: "leak", expiresAt: 1 }),
+    "utf8",
+  );
+  assert.deepEqual(await loadStoredAuth(home), { refreshToken: "rt-1", clientId: "cid-1" });
 });
 
 test("saveStoredAuth: mkdir + write + chmod 0600 (real fs roundtrip; injectable io)", async () => {
@@ -362,9 +370,10 @@ test("loginFlow: token endpoint failure surfaces HTTP status + body excerpt; no 
   await assert.rejects(() => p2, /returned no access_token/);
 });
 
-test("loginFlow: browser never completing rejects at the timeout", async () => {
+test("loginFlow: browser never completing rejects at the timeout AND releases the loopback listener (B4b)", async () => {
   const keepalive = setTimeout(() => {}, 10_000); // ref'd：未决的 race 不清空事件循环
   try {
+    const f = fakeCallbackServer();
     await assert.rejects(
       () =>
         loginFlow({
@@ -373,15 +382,35 @@ test("loginFlow: browser never completing rejects at the timeout", async () => {
           fetchImpl: async () => {
             throw new Error("unreachable");
           },
-          createServerImpl: () => fakeCallbackServer().srv, // listen 后永不触发回调
+          createServerImpl: () => f.srv, // listen 后永不触发回调
           rand: seqRand(),
           timeoutMs: 300,
         }),
       /browser login did not complete within 0s/,
     );
+    // 端口 18971 的监听必须随超时关停——不再留下卡死的 loopback server
+    assert.equal(f.s.closed, 1, "timeout must close the callback server");
   } finally {
     clearTimeout(keepalive);
   }
+});
+
+test("waitForCallback: an aborted signal closes the server and rejects with the abort reason (B4b)", async () => {
+  const controller = new AbortController();
+  const f = fakeCallbackServer();
+  const p = waitForCallback({ createServerImpl: () => f.srv, signal: controller.signal });
+  controller.abort(new Error("login timed out (test)"));
+  await assert.rejects(() => p, /login timed out \(test\)/);
+  assert.equal(f.s.closed, 1);
+
+  // 已中止的 signal：不监听直接拒绝
+  const fPre = fakeCallbackServer();
+  await assert.rejects(
+    () => waitForCallback({ createServerImpl: () => fPre.srv, signal: AbortSignal.abort(new Error("pre-aborted")) }),
+    /pre-aborted/,
+  );
+  assert.equal(fPre.s.closed, 1);
+  assert.deepEqual(fPre.s.listen, null, "must not bind after a pre-aborted signal");
 });
 
 test("refreshAccessToken: grant_type=refresh_token payload; rotation passthrough", async () => {
@@ -402,7 +431,7 @@ test("refreshAccessToken: grant_type=refresh_token payload; rotation passthrough
 test("getApiToken: env API token wins without touching stored state or network", async () => {
   const token = await getApiToken("/nope", {
     env: { CLOUDFLARE_API_TOKEN: "  env-tok  " },
-    stored: { refreshToken: "rt", clientId: "cid", accessToken: "at-cache", expiresAt: Date.now() + 3_600_000 },
+    stored: { refreshToken: "rt", clientId: "cid" },
     fetchImpl: async () => {
       throw new Error("network must not be reached when env token present");
     },
@@ -410,16 +439,17 @@ test("getApiToken: env API token wins without touching stored state or network",
   assert.equal(token, "env-tok");
 });
 
-test("getApiToken: no stored session -> null; cached access token within expiry -> returned without refresh", async () => {
+test("getApiToken: no stored session -> null; a stored session ALWAYS refreshes (no disk access-token shortcut, B4a)", async () => {
   assert.equal(await getApiToken("/nope", { env: {}, stored: null }), null);
-  const cached = await getApiToken("/nope", {
+  const bodies = [];
+  const token = await getApiToken("/nope", {
     env: {},
-    stored: { refreshToken: "rt", clientId: "cid", accessToken: "at-cache", expiresAt: Date.now() + 120_000 },
-    fetchImpl: async () => {
-      throw new Error("refresh must not run while the cached token is valid");
-    },
+    stored: { refreshToken: "rt", clientId: "cid" },
+    fetchImpl: tokenEndpointFetch({ access_token: "at-fresh" }, 200, bodies),
+    persist: async () => {},
   });
-  assert.equal(cached, "at-cache");
+  assert.equal(token, "at-fresh");
+  assert.deepEqual(bodies, [{ grant_type: "refresh_token", refresh_token: "rt", client_id: "cid" }]);
 });
 
 test("getApiToken: expired token silently refreshes; rotation is persisted (next refresh token kept)", async () => {
@@ -427,33 +457,32 @@ test("getApiToken: expired token silently refreshes; rotation is persisted (next
   const persisted = [];
   const token = await getApiToken("/nope", {
     env: {},
-    stored: { refreshToken: "rt-old", clientId: "cid-1", accessToken: "at-stale", expiresAt: Date.now() - 1000 },
+    stored: { refreshToken: "rt-old", clientId: "cid-1" },
     fetchImpl: tokenEndpointFetch({ access_token: "at-new", refresh_token: "rt-new", expires_in: 3600 }, 200, bodies),
     persist: async (a) => persisted.push(a),
   });
   assert.equal(token, "at-new");
   assert.deepEqual(bodies, [{ grant_type: "refresh_token", refresh_token: "rt-old", client_id: "cid-1" }]);
   assert.equal(persisted.length, 1);
-  assert.equal(persisted[0].refreshToken, "rt-new"); // rotation 持久化
-  assert.equal(persisted[0].accessToken, "at-new");
-  assert.equal(persisted[0].clientId, "cid-1");
+  // B4a：持久化对象恰好 {refreshToken, clientId}——access token 绝不落盘
+  assert.deepEqual(persisted[0], { refreshToken: "rt-new", clientId: "cid-1" });
 });
 
 test("getApiToken: refresh without rotation keeps the old refresh token; refresh failure -> null (not an error)", async () => {
   const persisted = [];
   const token = await getApiToken("/nope", {
     env: {},
-    stored: { refreshToken: "rt-keep", clientId: "cid", expiresAt: Date.now() - 1000 },
+    stored: { refreshToken: "rt-keep", clientId: "cid" },
     fetchImpl: tokenEndpointFetch({ access_token: "at-2" }, 200), // 无新 refresh_token
     persist: async (a) => persisted.push(a),
   });
   assert.equal(token, "at-2");
-  assert.equal(persisted[0].refreshToken, "rt-keep");
+  assert.deepEqual(persisted[0], { refreshToken: "rt-keep", clientId: "cid" });
 
   assert.equal(
     await getApiToken("/nope", {
       env: {},
-      stored: { refreshToken: "revoked", clientId: "cid", expiresAt: Date.now() - 1000 },
+      stored: { refreshToken: "revoked", clientId: "cid" },
       fetchImpl: async () => new Response("invalid_grant", { status: 400 }),
       persist: async () => {
         throw new Error("must not persist a failed refresh");
@@ -461,4 +490,16 @@ test("getApiToken: refresh without rotation keeps the old refresh token; refresh
     }),
     null,
   );
+});
+
+test("getApiToken: dry-run callers pass a no-op persist - refresh happens, nothing is written (B7)", async () => {
+  const bodies = [];
+  const token = await getApiToken("/nope", {
+    env: {},
+    stored: { refreshToken: "rt-old", clientId: "cid-1" },
+    fetchImpl: tokenEndpointFetch({ access_token: "at-dry", refresh_token: "rt-new" }, 200, bodies),
+    persist: async () => {}, // no-op：dry-run 调用方（cli/index/tui）的形态
+  });
+  assert.equal(token, "at-dry");
+  assert.equal(bodies.length, 1, "the refresh (network read) still happens");
 });

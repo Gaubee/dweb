@@ -128,25 +128,34 @@ test("getTunnelToken: result is a plain string in the envelope; empty token reje
   await assert.rejects(() => gw.getTunnelToken("acc1", "t8"), /empty tunnel token/);
 });
 
-test("configurations: GET maps result.config.ingress; missing config -> null; PUT sends {config:{ingress}} full replacement", async () => {
+test("configurations: GET returns the whole config object; PUT sends the full config (non-ingress fields preserved, B2)", async () => {
   const ingress = [{ hostname: "relay.dweb.example.com", service: "http://localhost:3340" }, { service: "http_status:404" }];
   const f = routingFetch([
-    { method: "GET", path: "/client/v4/accounts/acc1/cfd_tunnel/t9/configurations", reply: envelope({ success: true, result: { config: { ingress } } }) },
+    { method: "GET", path: "/client/v4/accounts/acc1/cfd_tunnel/t9/configurations", reply: envelope({ success: true, result: { config: { ingress, originRequest: { connectTimeout: 10 }, warpRouting: { enabled: true } } } }) },
     { method: "GET", path: "/client/v4/accounts/acc1/cfd_tunnel/t8/configurations", reply: envelope({ success: true, result: null }) },
+    { method: "GET", path: "/client/v4/accounts/acc1/cfd_tunnel/t7/configurations", reply: envelope({ success: true, result: { config: { originRequest: { connectTimeout: 1 } } } }) },
     {
       method: "PUT",
       path: "/client/v4/accounts/acc1/cfd_tunnel/t9/configurations",
       reply: (u, init) => {
-        // 全量替换：body 恰为 {config:{ingress}}，无 merge 字段
-        assert.deepEqual(JSON.parse(init.body), { config: { ingress } });
+        // 全量替换：body 是整个 config 对象（非 ingress 字段原样保留）
+        assert.deepEqual(JSON.parse(init.body), {
+          config: { ingress, originRequest: { connectTimeout: 10 }, warpRouting: { enabled: true } },
+        });
         return envelope({ success: true, result: null });
       },
     },
   ]);
   const gw = await createRestGateway("tk", f);
-  assert.deepEqual(await gw.getConfiguration("acc1", "t9"), { ingress });
+  assert.deepEqual(await gw.getConfiguration("acc1", "t9"), {
+    ingress,
+    originRequest: { connectTimeout: 10 },
+    warpRouting: { enabled: true },
+  });
   assert.equal(await gw.getConfiguration("acc1", "t8"), null);
-  await gw.putConfiguration("acc1", "t9", { ingress });
+  // config 无 ingress 字段：视为无配置（返回 null，不让 undefined 进 PUT 链）
+  assert.equal(await gw.getConfiguration("acc1", "t7"), null);
+  await gw.putConfiguration("acc1", "t9", { ingress, originRequest: { connectTimeout: 10 }, warpRouting: { enabled: true } });
 });
 
 test("dns records: find by encoded name query, create CNAME proxied with comment, update by record id", async () => {
@@ -258,8 +267,10 @@ test("network failure is wrapped with the action context (toUserError path)", as
 });
 
 test("createSdkGateway mounts an injected SDK client; createGateway exposes the full gateway surface", async () => {
-  // tree-shakable createClient 的使用面子集（挂载面已对真实 7.1.0 核对）
+  // tree-shakable createClient 的使用面子集（7.1.0 实测：单 options 对象，
+  // resources 内联——B1 修复后的注入契约）
   const calls = [];
+  const fakeResource = { _key: ["fake"] };
   const fakeClient = {
     zones: { list: async function* () {} },
     dns: { records: { list: async () => ({ result: [] }), create: async () => ({}), update: async () => ({}) } },
@@ -271,10 +282,17 @@ test("createSdkGateway mounts an injected SDK client; createGateway exposes the 
     } } },
   };
   const gw = await createSdkGateway("tk", {
-    loadSdk: async () => ({ createClient: (o, r) => { calls.push({ o, r }); return fakeClient; } }),
+    loadSdk: async () => ({
+      createClient: (o) => {
+        calls.push(o);
+        return fakeClient;
+      },
+      resources: [fakeResource],
+    }),
   });
   assert.equal(calls.length, 1, "createClient called once");
-  assert.equal(calls[0].o.apiToken, "tk");
+  assert.equal(calls[0].apiToken, "tk");
+  assert.deepEqual(calls[0].resources, [fakeResource], "resources are forwarded inline in the single options object");
   const gwRest = await createGateway("tk");
   for (const m of [
     "listZones",
@@ -289,5 +307,20 @@ test("createSdkGateway mounts an injected SDK client; createGateway exposes the 
   ]) {
     assert.equal(typeof gw[m], "function", `sdk gateway method ${m}`);
     assert.equal(typeof gwRest[m], "function", `rest gateway method ${m}`);
+  }
+});
+
+test("createSdkGateway (default loader, B1): constructs from the bundled leaf modules without throwing; no network at construction", async () => {
+  const prev = process.env.CF_CLIENT;
+  delete process.env.CF_CLIENT;
+  try {
+    // 不注入 loadSdk：默认 loader 动态 import 打进 dist 的 leaf 资源模块
+    // （zones/dns/zero-trust）。构造是纯挂载——不发生任何网络请求。
+    const gw = await createSdkGateway("x");
+    for (const m of ["listZones", "listTunnels", "createTunnel", "getConfiguration", "putConfiguration"]) {
+      assert.equal(typeof gw[m], "function", `gateway method ${m} present after leaf-module construction`);
+    }
+  } finally {
+    if (prev !== undefined) process.env.CF_CLIENT = prev;
   }
 });
