@@ -1,6 +1,6 @@
 {
   "name": "@jixo/opendweb-ext-cf",
-  "version": "0.2.2",
+  "version": "1.0.0",
   "description": "opendweb plugin — Cloudflare Tunnel exposure wizard (ingress push via API, end-to-end verification, optional cloudflared co-spawn)",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
-    "pack:dry": "npm run build && npm pack --dry-run && node -e \"const p=require('./package.json');const deps=p.dependencies??{};if(Object.keys(deps).length>0){console.error('unexpected runtime dependencies:',deps);process.exit(1)}else{console.log('runtime dependencies: none (bundled via devDependencies)')}\" && ! grep -Eq '^[[:space:]]*(import|export).*@clack' dist/*.mjs",
+    "pack:dry": "npm run build && npm pack --dry-run && node -e \"const p=require('./package.json'),fs=require('fs');const deps=p.dependencies??{};if(Object.keys(deps).length>0){console.error('unexpected runtime dependencies:',deps);process.exit(1)}const BUNDLED=['@clack','cloudflare','cloudflared'];let kb=0;for(const f of fs.readdirSync('dist')){const st=fs.statSync('dist/'+f);kb+=st.size;if(!f.endsWith('.mjs'))continue;const text=fs.readFileSync('dist/'+f,'utf8');for(const line of text.split('\\\\n')){const t=line.trim();if((t.startsWith('import')||t.startsWith('export'))&&BUNDLED.some(b=>t.includes('\\\"'+b))){console.error('bundled dependency leaked in dist/'+f+':',t);process.exit(1)}}}console.log('runtime dependencies: none; no bundled imports leaked; dist size:',Math.round(kb/1024),'KB');if(kb>2048*1024){console.error('dist too large');process.exit(1)}\"",
     "test": "npm run build && node --test --test-force-exit --test-concurrency=1 test/*.test.mjs"
   },
   "repository": {
@@ -30,6 +30,8 @@
   "devDependencies": {
     "@clack/prompts": "^1.7.0",
     "@types/node": "^26.4.0",
+    "cloudflare": "^7.1.0",
+    "cloudflared": "^0.7.3",
     "smol-toml": "^1.8.0",
     "tsdown": "^0.22.14",
     "typescript": "^5.6.0"

@@ -12,7 +12,7 @@ importers:
     devDependencies:
       '@napi-rs/cli':
         specifier: 3.7.0
-        version: 3.7.0(@emnapi/runtime@1.9.2)(@types/node@22.20.1)
+        version: 3.7.0(@emnapi/runtime@1.11.2)(@types/node@22.20.1)
       '@types/node':
         specifier: ^22
         version: 22.20.1
@@ -71,6 +71,12 @@ importers:
       '@types/node':
         specifier: ^26.4.0
         version: 26.4.0
+      cloudflare:
+        specifier: ^7.1.0
+        version: 7.1.0
+      cloudflared:
+        specifier: ^0.7.3
+        version: 0.7.3
       smol-toml:
         specifier: ^1.8.0
         version: 1.8.0
@@ -1242,6 +1248,14 @@ packages:
     peerDependencies:
       typanion: '*'
 
+  cloudflare@7.1.0:
+    resolution: {integrity: sha512-eb6WtiAbhuqdWmBdVo6fuXQgEBkYjhOeujRDYLEUWEZIECuABvDLz2DUYTwpN/4KyFecM4JtMHgZn5prlFUjLg==}
+    hasBin: true
+
+  cloudflared@0.7.3:
+    resolution: {integrity: sha512-dR4QMS4PbD287QqOV/vAoE1BcQCXphLOVrN9vjNUgkLrPDA5qxn9Dz0VId0P7/Czj4Mxu3hoLgbrVx5OtOWr5Q==}
+    hasBin: true
+
   colorette@2.0.20:
     resolution: {integrity: sha512-IfEDxwoWIjkeXL1eXcDiow4UbKjhLdq6/EuSVR9GMN7KVH3r9gQ83e73hsz1Nd1T3ijd5xv1wcWRYO+D6kCI2w==}
 
@@ -1892,7 +1906,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
-  '@napi-rs/cli@3.7.0(@emnapi/runtime@1.9.2)(@types/node@22.20.1)':
+  '@napi-rs/cli@3.7.0(@emnapi/runtime@1.11.2)(@types/node@22.20.1)':
     dependencies:
       '@inquirer/prompts': 8.6.0(@types/node@22.20.1)
       '@napi-rs/cross-toolchain': 1.0.3
@@ -1907,7 +1921,7 @@ snapshots:
       semver: 7.8.5
       typanion: 3.14.0
     optionalDependencies:
-      '@emnapi/runtime': 1.9.2
+      '@emnapi/runtime': 1.11.2
     transitivePeerDependencies:
       - '@napi-rs/cross-toolchain-arm64-target-aarch64'
       - '@napi-rs/cross-toolchain-arm64-target-armv7'
@@ -2522,6 +2536,10 @@ snapshots:
   clipanion@4.0.0-rc.4(typanion@3.14.0):
     dependencies:
       typanion: 3.14.0
+
+  cloudflare@7.1.0: {}
+
+  cloudflared@0.7.3: {}
 
   colorette@2.0.20: {}
 

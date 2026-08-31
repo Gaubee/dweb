@@ -1,39 +1,19 @@
-// TUNNEL_TOKEN 解码与 Cloudflare API 客户端（可注入 fetch，供测试与 dry-run）。
-// TUNNEL_TOKEN = base64(JSON{ a: accountTag, t: tunnelId, s: apiToken })——与
-// cloudflared 的 token 语义一致（dashboard remotely-managed tunnel 的安装串）。
-export const CF_API_BASE = "https://api.cloudflare.com/client/v4";
-
-/** 可注入的 fetch 形态（测试/编排替换全局 fetch） */
-export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-
+// 1.0.0 精简：本模块只保留凭据与输入宽容度工具（REST 控制面已迁至
+// cf-client.ts 的 createRestGateway/createSdkGateway；路由模型在 route-model.ts）。
+import type { IngressConfig } from "./route-model.js";
+export type { IngressConfig };
 export interface TunnelCreds {
   accountTag: string;
   tunnelId: string;
   apiToken: string;
 }
 
-export interface IngressRule {
-  hostname?: string;
-  path?: string;
-  service: string;
-}
-
-export interface IngressConfig {
-  ingress: IngressRule[];
-}
+export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
 /**
- * 解码 TUNNEL_TOKEN → { accountTag, tunnelId, apiToken }。形态不符 → 抛错
- * （错误信息面向终端用户，全 ASCII）。
- * a/t 会拼进 API URL 路径、s 进 Authorization 头——白名单字符集阻断
- * 路径穿越/头注入（合法 CF 值均为 [A-Za-z0-9_-]）。
- */
-/**
- * 从粘贴文本中提取 tunnel token（2026-08-31 Owner 需求）：用户粘贴的常是
- * 整条安装命令（`sudo cloudflared service install eyJ...`）甚至多行说明，
- * 而非裸 token。CF token 是 base64(JSON{a,t,s})——必然以 eyJ（`{"` 的
- * base64）开头、字符集 base64url、无 padding，实际长度 150+（阈值 80 留
- * 余量）。取首个匹配；无匹配返回 null（调用方负责重问）。
+ * 从粘贴文本中提取 tunnel token：用户粘贴的常是整条安装命令甚至多行说明。
+ * CF token 是 base64(JSON{a,t,s})——必然以 eyJ 开头、base64url 字符集、
+ * 实际长度 150+（阈值 80 留余量）。取首个匹配；无匹配返回 null。
  */
 export function extractTunnelToken(raw: string): string | null {
   const m = /eyJ[A-Za-z0-9_-]{80,}/.exec(raw.trim());
@@ -65,162 +45,4 @@ export function decodeTunnelToken(token: string): TunnelCreds {
       `not a valid TUNNEL_TOKEN (${(e as Error).message}); copy it from Zero Trust -> Networks -> Tunnels -> your tunnel -> install`,
     );
   }
-}
-
-/**
- * 构造 ingress 配置（design：双主机名默认 / 单域名路径分流可选）。
- * 服务指向回源地址（相对 compose 网络或本机）。
- */
-export function buildIngress({
-  mode,
-  gatewayHost,
-  relayHost,
-  gatewayService = "http://localhost:8787",
-  relayService = "http://localhost:3340",
-}: {
-  mode: "dual" | "single";
-  gatewayHost: string;
-  relayHost: string;
-  gatewayService?: string;
-  relayService?: string;
-}): IngressConfig {
-  const hostname = (h: string) => h.toLowerCase();
-  if (mode === "single") {
-    return {
-      ingress: [
-        { hostname: hostname(gatewayHost), path: "^/relay.*", service: relayService },
-        { hostname: hostname(gatewayHost), path: "^/ping.*", service: relayService },
-        { hostname: hostname(gatewayHost), service: gatewayService },
-        { service: "http_status:404" },
-      ],
-    };
-  }
-  return {
-    ingress: [
-      { hostname: hostname(relayHost), service: relayService },
-      { hostname: hostname(gatewayHost), service: gatewayService },
-      { service: "http_status:404" },
-    ],
-  };
-}
-
-/** Cloudflare API 响应的公共包裹形态（宽松：只取我们关心的字段） */
-interface CfResponse {
-  success?: boolean;
-  errors?: Array<{ code?: number | string; message?: string }>;
-  result?: Array<{ id?: string }>;
-}
-
-const errsOf = (body: CfResponse | undefined): string =>
-  (body?.errors ?? []).map((e) => `${e.code}: ${e.message}`).join("; ");
-
-/** 推送 ingress 配置（PUT configurations）。 */
-export async function pushIngress({
-  fetchImpl = fetch,
-  apiBase = CF_API_BASE,
-  accountTag,
-  tunnelId,
-  apiToken,
-  ingress,
-}: {
-  fetchImpl?: FetchLike;
-  apiBase?: string;
-} & TunnelCreds & { ingress: IngressConfig }): Promise<CfResponse> {
-  const res = await fetchImpl(`${apiBase}/accounts/${accountTag}/cfd_tunnel/${tunnelId}/configurations`, {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ config: { ingress: ingress.ingress } }),
-  });
-  const body = (await res.json().catch(() => ({}))) as CfResponse;
-  if (!res.ok || body?.success === false) {
-    const errs = errsOf(body);
-    throw new Error(`Cloudflare API rejected ingress config (HTTP ${res.status})${errs ? `: ${errs}` : ""}`);
-  }
-  return body;
-}
-
-/**
- * 查询 host 所属 zone 的名字（证书覆盖建议与 DNS 路由共用）。
- * zone 名先试末两段、再试末三段（example.co.uk 这类公共后缀）；
- * 查不到（token 无 Zone:Read / zone 不在本账号）返回 null。
- */
-export async function lookupZoneName({
-  fetchImpl = fetch,
-  apiBase = CF_API_BASE,
-  accountTag,
-  apiToken,
-  host,
-}: {
-  fetchImpl?: FetchLike;
-  apiBase?: string;
-  host: string;
-} & Omit<TunnelCreds, "tunnelId">): Promise<{ zoneName: string; zoneId: string } | null> {
-  const labels = host.split(".");
-  const zoneCandidates = [...new Set([labels.slice(-2).join("."), labels.slice(-3).join(".")])];
-  for (const zoneName of zoneCandidates) {
-    const qs = new URLSearchParams({ name: zoneName, "account.id": accountTag });
-    const zoneRes = await fetchImpl(`${apiBase}/zones?${qs}`, {
-      headers: { Authorization: `Bearer ${apiToken}` },
-    });
-    const zoneBody = (await zoneRes.json().catch(() => ({}))) as CfResponse;
-    const zoneId = zoneBody?.result?.[0]?.id ?? null;
-    if (zoneId) return { zoneName, zoneId };
-  }
-  return null;
-}
-
-/**
- * DNS 路由（best-effort）：查 zone → 建 CNAME <host> → <tunnelId>.cfargotunnel.com。
- * TUNNEL_TOKEN 的 api token 不一定有 DNS 权限——失败时抛错并提示手工路径。
- * R2-M7：query 经 URLSearchParams 构造（值里疑似 query 的字符一律编码）；
- * zone 名先试末两段、再试末三段（example.co.uk 这类公共后缀）。
- */
-export async function routeDns({
-  fetchImpl = fetch,
-  apiBase = CF_API_BASE,
-  accountTag,
-  tunnelId,
-  apiToken,
-  hostnames,
-}: {
-  fetchImpl?: FetchLike;
-  apiBase?: string;
-  hostnames: string[];
-} & TunnelCreds): Promise<string[]> {
-  const results: string[] = [];
-  for (const host of hostnames) {
-    let zoneId: string | null = null;
-    let lastZoneErr = "";
-    const zone = await lookupZoneName({ fetchImpl, apiBase, accountTag, apiToken, host });
-    if (zone) {
-      zoneId = zone.zoneId;
-    } else {
-      lastZoneErr = `zone lookup for ${host.split(".").slice(-2).join(".")} returned no zone`;
-    }
-    if (!zoneId) {
-      throw new Error(
-        `cannot resolve zone for ${host} (${lastZoneErr || "token may lack Zone:Read"}); create CNAME ${host} -> ${tunnelId}.cfargotunnel.com manually`,
-      );
-    }
-    const cnameRes = await fetchImpl(`${apiBase}/zones/${zoneId}/dns_records`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        type: "CNAME",
-        name: host,
-        content: `${tunnelId}.cfargotunnel.com`,
-        proxied: true,
-      }),
-    });
-    const cnameBody = (await cnameRes.json().catch(() => ({}))) as CfResponse;
-    if (!cnameRes.ok && cnameBody?.errors?.[0]?.code !== 81057) {
-      // 81057 = record already exists —— 幂等成功
-      const errs = errsOf(cnameBody);
-      throw new Error(
-        `DNS record creation failed for ${host}${errs ? `: ${errs}` : ""}; create CNAME ${host} -> ${tunnelId}.cfargotunnel.com manually`,
-      );
-    }
-    results.push(host);
-  }
-  return results;
 }

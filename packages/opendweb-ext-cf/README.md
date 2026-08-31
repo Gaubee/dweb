@@ -1,45 +1,41 @@
-# @jixo/opendweb-ext-cf
+# @jixo/opendweb-ext-cf 1.0
 
-Cloudflare Tunnel plugin for the [opendweb](https://www.npmjs.com/package/opendweb) server CLI: guided exposure setup (ingress push via the Cloudflare API, DNS routing, end-to-end verification) and optional `cloudflared` co-spawn for the server's lifetime.
+Cloudflare Tunnel provider for the [opendweb](https://www.npmjs.com/package/opendweb) server CLI: browser-login (or API-token) discovery of zones and tunnels, idempotent provisioning of ingress rules + DNS + local config, end-to-end verification, and a managed cloudflared connector runtime. Zero runtime dependencies.
 
-Zero runtime dependencies — everything (including the interactive wizard UI) is bundled at build time.
+## What changed in 1.0 (breaking)
 
-## Faces
+- **One credential instead of two.** 0.x asked for a connector token (TUNNEL_TOKEN) *and* a management token (CF_API_TOKEN). 1.0 authenticates once - browser OAuth login (`opendweb cf login`) or a single `CLOUDFLARE_API_TOKEN` - and discovers accounts, zones and tunnels through the API, fetching connector tokens on demand.
+- **Account IDs are derived, never asked for.** The zone object carries its account; pick a zone and everything else follows (0.x's `zones?account.id=` filtering failed for scoped tokens - fixed by design).
+- **Idempotent provisioning.** Re-running setup reuses the tunnel (`opendweb-<hostname>` naming), no-ops equal configs and correct DNS records, and asks before replacing a conflicting DNS record. Nothing is silently overwritten; nothing is deleted.
+- **cloudflared auto-install.** An existing binary on PATH (or `CLOUDFLARED_BIN`) is used; otherwise the official binary is fetched (GitHub releases) into `~/.opendweb/cloudflared/`. Note: the downloader performs no checksum verification - pin `CLOUDFLARED_BIN` to a binary you trust if that matters to you.
+- `TUNNEL_TOKEN` remains the *runtime* credential for `[plugins.options] tunnel = true` (the server co-spawns cloudflared); setup shows it once at the end of a fresh provision. The old two-token wizard is gone.
 
-This package exposes two entry points:
+## Authentication
 
-- `.` — the plugin face, loaded by the opendweb server from `opendweb.config.toml`:
+Two paths, tried in this order at each prompt:
 
-  ```toml
-  [[plugins]]
-  name = "cf"
+1. **Browser login** (preferred): `npx opendweb cf login` runs OAuth Authorization Code + PKCE against Cloudflare, receiving the callback on `http://127.0.0.1:18971/callback`. The refresh token is stored in `~/.opendweb/cf-auth.json` (0600); access tokens live in memory only. Requires an OAuth client: until a bundled public client ships, create one (Manage Account -> OAuth clients, redirect URI `http://127.0.0.1:18971/callback`) and export `CF_OAUTH_CLIENT_ID`. Caveat: third-party OAuth scopes may not cover tunnel writes yet - if so, login covers discovery and the flow falls back to an API token for provisioning.
+2. **API token** (fallback): `CLOUDFLARE_API_TOKEN` with a custom token carrying
+   - Account / Cloudflare Tunnel / Edit
+   - Zone / DNS / Edit
+   - Zone / Zone / Read
 
-  [plugins.options]
-  tokenEnv = "TUNNEL_TOKEN" # default
-  tunnel   = true           # co-spawn cloudflared with the server
-  ```
+   Paste it in the wizard (masked input, head/tail summary, explicit confirm) or export it for CI.
 
-  Hooks: `setup` (non-interactive wizard), `server.postReady` (self-check + co-spawn + banner lines), `server.preStop` (reap the co-spawned child).
+## Flow
 
-- `./opendweb-plugin` — the command face, run by the opendweb CLI: `cf setup` (interactive `@clack/prompts` wizard when on a TTY), plus `verify` / `plan` / `status` subcommands.
-
-## Quick start
-
-```sh
-# 1. get a tunnel token (Zero Trust -> Networks -> Tunnels) and export it
-export TUNNEL_TOKEN=...
-
-# 2. guided setup: hostname, ingress push, DNS route, verification
-npx opendweb cf setup
-
-# 3. let the server own the tunnel process
-npx opendweb server   # with [plugins.options] tunnel = true
+```
+npx opendweb cf login            # once (browser)
+npx opendweb cf setup            # zone -> hostname -> tunnel -> mode -> apply
+npx opendweb server              # with [plugins.options] tunnel = true + TUNNEL_TOKEN
 ```
 
-A tunnel child that dies after the startup grace window is never a silent fake success — a `WARNING` goes to stderr and the banner reflects reality.
+`cf setup` is safe to re-run: it reconciles toward the desired state (reuse/no-op/ask). `cf status` reports config, plan, plugin lock, auth session and resource anchors. `cf verify` runs the public end-to-end check (services.json). `cf plan` previews hostnames and ingress rules.
+
+A tunnel child dying after the startup grace window is never a silent fake success - a WARNING goes to stderr. Ingress is always pushed as a full replacement ending in a `http_status:404` catch-all; this tunnel's config is owned by opendweb, so do not hand-edit it for other purposes.
 
 ## Development
 
-`npm run build` (tsdown) → `npm test`; `npm run pack:dry` gates the release artifact (builds first, asserts zero runtime dependencies and no bundled-import residue in `dist`).
+`npm run build` (tsdown) -> `npm test`; `npm run pack:dry` gates the artifact (builds first; asserts zero runtime dependencies, no bundled-import residue in dist, and a dist size cap). The control-plane gateway defaults to a hand-rolled REST client; `CF_CLIENT=sdk` switches to the official `cloudflare` SDK (tree-shakable) for comparison - both implement the same `CfGateway` interface.
 
 License: MIT OR Apache-2.0.
