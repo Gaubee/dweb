@@ -270,6 +270,7 @@ const RAW_TOKEN = `eyJ${"A1b2c3D4e5".repeat(18)}`;
 
 test("runInteractiveSetup: a pasted bare token passes validation and echoes a head/tail summary", async () => {
   const fk = fakeClack([
+    A.select("bare"),
     A.password(`  ${RAW_TOKEN}  `), // 前后空白自动 trim
     A.password("unit-test-api-token-0123456789abcdef0123456789"),
     A.text("dweb.example.com"),
@@ -287,6 +288,7 @@ test("runInteractiveSetup: a pasted bare token passes validation and echoes a he
 
 test("runInteractiveSetup: pasting the full install command extracts the token (2026-08-31 Owner)", async () => {
   const fk = fakeClack([
+    A.select("bare"),
     A.password(`sudo cloudflared service install ${RAW_TOKEN}`),
     A.password("unit-test-api-token-0123456789abcdef0123456789"),
     A.text("dweb.example.com"),
@@ -301,7 +303,8 @@ test("runInteractiveSetup: pasting the full install command extracts the token (
 
 test("runInteractiveSetup: non-token input is re-asked with an explanation", async () => {
   const fk = fakeClack([
-    A.password("sudo cloudflared service install"), // 无 token：拒
+    A.select("bare"),
+    A.password("sudo cloudflared service install"), // 无 token：拒（同实例重问）
     A.password("hello"),                             // 非 eyJ 形态：拒
     A.password(RAW_TOKEN),                           // 合法：过
     A.password("unit-test-api-token-0123456789abcdef0123456789"),
@@ -555,4 +558,54 @@ test("mode step: no fetch wiring keeps dual recommended for a zone-apex hostname
   const modeSel = fk.calls.select.find((c) => c.options?.[0]?.value === "dual");
   assert.match(modeSel.options.find((o) => o.value === "dual").hint, /recommended/);
   assert.equal(modeSel.initialValue, "dual");
+});
+
+// 2026-08-31 二轮修正：多行粘贴（brew 一行 + 空行 + sudo install 行）在单行
+// password 框里碎裂——首行先提交、token 行停在框里。块捕获通道 readline
+// 逐行收，命中含 token 的行即停；无 token 的块重试。
+test("runInteractiveSetup: multi-line paste block is captured whole (brew + blank + sudo install)", async () => {
+  const fk = fakeClack([
+    A.select("block"),        // 块捕获通道（默认项）
+    A.password("unit-test-api-token-0123456789abcdef0123456789"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const blocks = [
+    ["brew install cloudflared && ", "", "sudo cloudflared service install " + RAW_TOKEN], // Owner 实测形态
+  ];
+  const { calls, impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: {},
+    clack: fk,
+    runSetupImpl: impl,
+    readLinesImpl: async () => blocks.shift() ?? [],
+  });
+  assert.equal(r.exit, 0);
+  assert.equal(calls[0].token, RAW_TOKEN, "token extracted from the multi-line block");
+  const summary = `token: ${RAW_TOKEN.slice(0, 8)}...${RAW_TOKEN.slice(-6)} (${RAW_TOKEN.length} chars)`;
+  assert.ok(fk.calls.log.includes(summary), "summary echoed after capture");
+});
+
+test("runInteractiveSetup: a pasted block without any token re-prompts and accepts the next block", async () => {
+  const fk = fakeClack([
+    A.select("block"),
+    A.password("unit-test-api-token-0123456789abcdef0123456789"),
+    A.text("dweb.example.com"),
+    A.select("dual"),
+    A.select("apply"),
+  ]);
+  const blocks = [["brew install cloudflared", ""], ["sudo cloudflared service install " + RAW_TOKEN]];
+  const { calls, impl } = mockRunSetup();
+  const r = await runInteractiveSetup({
+    cwd: "/proj",
+    env: {},
+    clack: fk,
+    runSetupImpl: impl,
+    readLinesImpl: async () => blocks.shift() ?? [],
+  });
+  assert.equal(r.exit, 0);
+  assert.equal(calls[0].token, RAW_TOKEN);
+  assert.ok(fk.calls.log.some((l) => /no tunnel token found in the pasted text/.test(l)), "retry hint shown");
 });
