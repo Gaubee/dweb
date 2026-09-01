@@ -711,6 +711,8 @@ async function fakePmShim(srcDir) {
       'pkg=""',
       'for a in "$@"; do case "$a" in -*) ;; *) pkg="$a";; esac; done',
       '[ -z "$pkg" ] && exit 1',
+      '# 0.4.2 起 install 显式 @latest：剥尾部 @tag（scoped 前缀的 @ 不受影响）',
+      'pkg="${pkg%@latest}"; pkg="${pkg%@[0-9]*}"',
       'echo "fake-pm: $pkg (src $DWEB_FAKE_PM_SRC/$pkg)" >&2',
       'src="$DWEB_FAKE_PM_SRC/$pkg"',
       '[ -d "$src" ] || { echo "fake-pm: fixture $src missing (shim ran; real npm would differ)" >&2; exit 9; }',

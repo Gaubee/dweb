@@ -178,7 +178,7 @@ test("pluginAdd: --name installs the explicit package and the alias keys the loc
     existsSync: fs.existsSync,
     run: async (cmd, args) => { runs.push([cmd, ...args]); return { code: 0, stderr: "" }; },
   });
-  assert.equal(runs[0].includes(PKG), true, "explicit package name is installed verbatim");
+  assert.equal(runs[0].includes(`${PKG}@latest`), true, "install pins @latest explicitly (ancestor-range hijack guard)");
   assert.equal(r.version, "3.1.4");
   const lock = await loadLockfile(lockPath);
   assert.deepEqual(lock[PKG], { package: PKG, version: "3.1.4" });

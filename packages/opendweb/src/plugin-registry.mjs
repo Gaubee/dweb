@@ -149,7 +149,10 @@ export async function pluginAdd({ alias, pkgName, globs, cwd, lockPath, existsSy
     return { pkg: records[alias].package, version: records[alias].version, skipped: true };
   }
   const pm = detectPackageManager(cwd, existsSync);
-  const [cmd, args] = installCommand(pm, candidate);
+  // 显式 @latest：npm 会沿目录向上找最近 package.json 作为项目根——若祖先
+  // manifest 里残留 ^0.1.x 旧 range，无版本安装会被它劫持而永远装不到新版
+  // （2026-09-01 用户实测的版本粘滞：自愈/add 反复装 0.1.x）
+  const [cmd, args] = installCommand(pm, `${candidate}@latest`);
   const res = await run(cmd, args, { cwd });
   if (res.code !== 0) {
     throw new CliExit(`plugin install failed (${cmd} ${args.join(" ")}):\n${asciiEscape(res.stderr)}`, 1);
