@@ -32,7 +32,16 @@ import {
 test("CF_OAUTH contract: loopback redirect URI, scopes, timeout", () => {
   assert.equal(CF_OAUTH.callbackPort, 18971);
   assert.equal(CF_OAUTH.redirectPath, "/callback");
-  assert.deepEqual(CF_OAUTH.SCOPES, ["offline_access", "account:read", "zone:read"]);
+  // 2026-08-31 实测定稿：点分隔词汇表（GET /oauth/scopes 枚举核对），
+  // argotunnel 即 Cloudflare Tunnel（picker 显示名带 "(Legacy)"）
+  assert.deepEqual(CF_OAUTH.SCOPES, [
+    "offline_access",
+    "zone.read",
+    "dns.read",
+    "dns.write",
+    "argotunnel.read",
+    "argotunnel.write",
+  ]);
   assert.equal(CF_OAUTH.loginTimeoutMs, 300000);
   assert.equal(redirectUri(), "http://127.0.0.1:18971/callback");
 });

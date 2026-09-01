@@ -32,15 +32,28 @@
 
 ## 3. 已知边界与后续项（登记）
 
-- [ ] 3.1 OAuth scope 覆盖度实测：wrangler workers-auth 的 scope 子集无
-      cfd_tunnel 管理/写 scope（最接近的 connectivity:admin 是 Connectivity
-      Directory 绑定）；Owner 在 dashboard 创建 OAuth client 时核对 scope
-      选择器是否有 Tunnel/DNS 写。不覆盖则 login 能力面降级为发现/只读，
-      provision 回落 API token（代码已按此容错）。CF_OAUTH.SCOPES 常量待
-      实测补全 tunnel/dns 写 scope 字符串
+- [x] 3.1 OAuth scope 覆盖度实测（2026-08-31 完成，全链路真实凭据）：
+      Owner 创建私有 OAuth client（Authorization Code + Refresh Token
+      grant、PKCE None、redirect URI http://127.0.0.1:18971/callback）。
+      三项关键实测结论：(a) authorize 端点未登录即校验参数且错误经 303
+      回调 query 返回——构成离线「白名单判定器」（302→login=scope 在
+      client 白名单）；(b) 词汇表为**点分隔资源式**（官方 Create OAuth
+      Client API 文档明言 "Colon-delimited scopes are not accepted"），
+      wrangler 风格冒号串全拒；Tunnel 权限 scope id 为 **argotunnel**
+      （连写，picker 显示名 "Argo Tunnel (Legacy)" 即 Cloudflare Tunnel
+      本尊）；定稿 SCOPES = offline_access zone.read dns.read dns.write
+      argotunnel.read argotunnel.write（六项整包过白名单探测）；(c) 写
+      接口严格按登录请求的 scope 把关（缺 argotunnel.write 时 POST
+      cfd_tunnel 403/10000；带上后 create/PUT configurations/GET token/
+      DELETE 全 200），GET 类宽松（zones/DNS/tunnel list 均可读）。
+      附带发现：GET /oauth/scopes 接受 OAuth access token（文档称需
+      API token），全量 383 条可枚举。SCOPES 已定稿回填 auth.ts 并过
+      两次真实登录验证（refresh token 落盘、rotation 正常）
 - [ ] 3.2 内置 public client：Owner 创建 OAuth client（redirect URI
       http://127.0.0.1:18971/callback）+ tweb.xin TXT 域名验证（不可逆公开）
-      后，把 client id 填入 CF_OAUTH.builtinClientId
+      后，把 client id 填入 CF_OAUTH.builtinClientId（私有 client id
+      474ee62ae21f9cec9853f697e6754b33 已可用于 Owner 自测，发布内置
+      须待 public 化）
 - [ ] 3.3 loopback 回调端口固定 18971：OAuth client 注册时 redirect URI
       精确匹配（含端口）；端口被占时 login 报错并提示（已实现），多端口
       预注册方案待真实 client 实测后评估

@@ -24,15 +24,22 @@ export const CF_OAUTH = {
   /** 登录等待用户在浏览器完成授权的截止（毫秒） */
   loginTimeoutMs: 5 * 60 * 1000,
   /**
-   * 请求的 scope。identity 基础 + 发现类已确认存在（wrangler 先例）；
-   * tunnel/DNS 写 scope 字符串待 dashboard 实测填入（见文件头注）。
+   * 请求的 scope。2026-08-31 全链路实测（真实私有 client + authorize 端点
+   * 白名单探测 + 登录后写操作验证）：新 self-managed client 词汇表为点分
+   * 隔资源式（GET /oauth/scopes 全量 383 条枚举核对），wrangler 风格冒号
+   * 串（zone:read 等）全部被拒。Tunnel 权限的 scope id 是 argotunnel
+   * （连写，源自旧品牌 Argo Tunnel；picker 界面显示名 "Argo Tunnel
+   * (Legacy)"，实际即 Cloudflare Tunnel）。实证语义：GET 类（zones/DNS/
+   * tunnel list）对授权宽松，写接口严格按登录请求的 scope 把关——缺
+   * argotunnel.write 时 POST cfd_tunnel 403(10000)。六项组合整包过白名单。
    */
   SCOPES: [
     "offline_access",
-    "account:read",
-    "zone:read",
-    // 实测占位：Tunnel 写 / DNS 写 的平台 scope 字符串
-    // "cloudflare_tunnel:write", "dns_records:write",
+    "zone.read",
+    "dns.read",
+    "dns.write",
+    "argotunnel.read",
+    "argotunnel.write",
   ],
 } as const;
 
