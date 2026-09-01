@@ -63,6 +63,12 @@
 
 ## 4. 复审闭环（2026-08-31）
 
+- [x] 4.0 用户实测反馈修复（2026-09-01，1.0.3）：向导认证选择改为可重试
+      循环——选 browser login 而未配 CF_OAUTH_CLIENT_ID（或浏览器授权
+      失败/超时）时提示可操作原因（含回调 URI 与 env 名）后回到选择菜
+      单，不再整体中断向导；`cf login` 直连命令保持报错语义（无回退
+      面）。tui 用例 -1/+2（未配置重试 / 授权失败重试），128 用例
+
 - [x] 4.1 Codex R1（gpt-5.6-terra xhigh，46min）：**3.5/10 Not release-ready**
       ——七项阻塞：SDK 聚合导入构造失败且引入 447KB chunk、PUT 全量替换丢
       originRequest 等非 ingress 字段、ownership 三缺口（new 撞名/锚点未消

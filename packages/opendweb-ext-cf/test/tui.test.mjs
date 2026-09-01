@@ -289,13 +289,44 @@ test("auth step: browser login persists the session and uses the returned access
   assert.equal(fk.calls.select[0].options[0].hint, undefined);
 });
 
-test("auth step: browser login without a configured client id is a hard error", async () => {
-  const fk = fakeClack([A.select("login")]);
+test("auth step: browser login without a configured client id warns and re-prompts (wizard survives)", async () => {
+  // 2026-09-01 用户实测反馈：选 login 而未配 client id 曾整体中断向导；现在
+  // 提示可操作原因（含回调 URI 与 env 名）后回到认证选择，改选 paste 可走完。
+  const fk = fakeClack([A.select("login"), ...pasteDriveAnswers()]);
   const gateway = fakeGateway();
-  await assert.rejects(
-    () => runInteractiveSetup(tuiOpts(fk, { gateway, provision: mockProvision(), env: {} })),
-    /browser login is not configured: create an OAuth client .* CF_OAUTH_CLIENT_ID, or use an API token/s,
+  const provision = mockProvision();
+  const r = await runInteractiveSetup(tuiOpts(fk, { gateway, provision, env: {} }));
+  assert.equal(r.exit, 0);
+  // 提示出现在两次认证选择之间，含 env 名与回调 URI
+  assert.ok(
+    fk.calls.log.some((l) => /browser login is not configured: .*CF_OAUTH_CLIENT_ID/.test(l) && l.includes("http://127.0.0.1:18971/callback")),
+    JSON.stringify(fk.calls.log),
   );
+  // 认证选择出现两次（重问后选项不变），最终用粘贴的 token 走完全程
+  const authSelects = fk.calls.select.filter((c) => c.message === "cloudflare authentication");
+  assert.equal(authSelects.length, 2);
+  assert.deepEqual(authSelects.map((c) => c.options.map((o) => o.value)), [["login", "paste"], ["login", "paste"]]);
+  assert.ok(gateway.calls.tokens.every((t) => t === API_TOKEN), JSON.stringify(gateway.calls.tokens));
+  assert.equal(provision.calls.length, 1);
+});
+
+test("auth step: failed browser login (declined/timeout) warns and re-prompts instead of aborting", async () => {
+  const fk = fakeClack([A.select("login"), ...pasteDriveAnswers()]);
+  const gateway = fakeGateway();
+  const provision = mockProvision();
+  const r = await runInteractiveSetup(
+    tuiOpts(fk, {
+      gateway,
+      provision,
+      env: { CF_OAUTH_CLIENT_ID: "cid-9" },
+      login: async () => {
+        throw new Error("authorization declined: access_denied");
+      },
+    }),
+  );
+  assert.equal(r.exit, 0);
+  assert.ok(fk.calls.log.some((l) => l.includes("browser login failed (authorization declined: access_denied)")), JSON.stringify(fk.calls.log));
+  assert.ok(gateway.calls.tokens.every((t) => t === API_TOKEN), JSON.stringify(gateway.calls.tokens));
 });
 
 test("paste step: declining the confirmation restarts entry; the second token wins", async () => {

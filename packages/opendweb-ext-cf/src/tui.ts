@@ -161,6 +161,9 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
 
     // 1) 认证：env token / 已存登录态 / 浏览器登录 / 粘贴 API token。
     // 登录态写入缓冲到 apply 才落盘（B7）：dry/abort 的向导全程零凭据写入。
+    // 选择可重试（2026-09-01 用户实测反馈）：login 未配置 client id 或浏览器
+    // 授权失败/超时不再整体中断向导——提示原因后回到本选择，用户可改选
+    // saved session / paste，或 Ctrl+C 退出。
     let pendingPersist: StoredAuth | null = null;
     const bufferedPersist = async (a: StoredAuth): Promise<void> => {
       pendingPersist = a;
@@ -169,62 +172,73 @@ export async function runInteractiveSetup(opts: RunInteractiveOptions): Promise<
     let stored = await loadAuth();
     if (!forceDryRun) {
       const envToken = env.CLOUDFLARE_API_TOKEN?.trim() ?? "";
-      const options: Array<{ value: string; label: string; hint?: string }> = [];
-      if (envToken !== "") {
-        options.push({ value: "env", label: "use CLOUDFLARE_API_TOKEN from the environment", hint: tokenSummary(envToken) });
-      }
-      if (stored !== null) {
-        options.push({ value: "stored", label: "use the logged-in Cloudflare session", hint: "browser login saved earlier" });
-      }
       const clientId = resolveClientId(undefined, env);
-      options.push({
-        value: "login",
-        label: "log in with Cloudflare (opens the browser)",
-        ...(clientId === null
-          ? { hint: "needs CF_OAUTH_CLIENT_ID until the bundled public client ships" }
-          : {}),
-      });
-      options.push({ value: "paste", label: "paste an API token", hint: "input hidden" });
-      const choice = await ui.select<string>({ message: "cloudflare authentication", options });
-      if (choice === "env") {
-        apiToken = envToken;
-      } else if (choice === "stored") {
-        apiToken = await getApiToken(dwebHome(env), {
-          env,
-          stored,
-          persist: bufferedPersist,
-          ...(fetchImpl !== undefined ? { fetchImpl } : {}),
+      for (;;) {
+        const options: Array<{ value: string; label: string; hint?: string }> = [];
+        if (envToken !== "") {
+          options.push({ value: "env", label: "use CLOUDFLARE_API_TOKEN from the environment", hint: tokenSummary(envToken) });
+        }
+        if (stored !== null) {
+          options.push({ value: "stored", label: "use the logged-in Cloudflare session", hint: "browser login saved earlier" });
+        }
+        options.push({
+          value: "login",
+          label: "log in with Cloudflare (opens the browser)",
+          ...(clientId === null
+            ? { hint: "needs CF_OAUTH_CLIENT_ID until the bundled public client ships" }
+            : {}),
         });
-        if (apiToken === null) {
-          ui.log.message("the saved session is no longer valid - logging in again");
-          stored = null;
-        }
-      }
-      if (apiToken === null && (choice === "login" || (choice === "stored" && stored === null))) {
-        if (clientId === null) {
-          throw new Error(
-            "browser login is not configured: create an OAuth client (Manage Account -> OAuth clients) and export CF_OAUTH_CLIENT_ID, or use an API token",
-          );
-        }
-        const spin = ui.spinner();
-        spinState.spin = spin;
-        spin.start("waiting for the browser login to complete");
-        try {
-          const tokens = await login(clientId);
-          if (tokens.refreshToken === undefined || tokens.refreshToken === "") {
-            throw new Error("no refresh token returned (offline_access scope missing?)");
+        options.push({ value: "paste", label: "paste an API token", hint: "input hidden" });
+        const choice = await ui.select<string>({ message: "cloudflare authentication", options });
+        if (choice === "env") {
+          apiToken = envToken;
+        } else if (choice === "stored") {
+          apiToken = await getApiToken(dwebHome(env), {
+            env,
+            stored,
+            persist: bufferedPersist,
+            ...(fetchImpl !== undefined ? { fetchImpl } : {}),
+          });
+          if (apiToken === null) {
+            ui.log.message("the saved session is no longer valid - logging in again");
+            stored = null;
           }
-          // B4a：会话对象只有 {refreshToken, clientId}（access token 不落盘）
-          stored = { refreshToken: tokens.refreshToken, clientId };
-          bufferedPersist(stored);
-          apiToken = tokens.accessToken;
-          spin.stop("logged in");
-        } finally {
-          spinState.spin = null;
         }
-      }
-      if (apiToken === null && choice === "paste") {
-        apiToken = await promptPastedToken(ui);
+        if (apiToken === null && (choice === "login" || (choice === "stored" && stored === null))) {
+          if (clientId === null) {
+            ui.log.message(
+              "browser login is not configured: create an OAuth client (Manage Account -> OAuth clients, redirect URI " +
+                `http://127.0.0.1:${CF_OAUTH.callbackPort}/callback) and export CF_OAUTH_CLIENT_ID, ` +
+                "or pick another method",
+            );
+            continue;
+          }
+          const spin = ui.spinner();
+          spinState.spin = spin;
+          spin.start("waiting for the browser login to complete");
+          try {
+            const tokens = await login(clientId);
+            if (tokens.refreshToken === undefined || tokens.refreshToken === "") {
+              throw new Error("no refresh token returned (offline_access scope missing?)");
+            }
+            // B4a：会话对象只有 {refreshToken, clientId}（access token 不落盘）
+            stored = { refreshToken: tokens.refreshToken, clientId };
+            bufferedPersist(stored);
+            apiToken = tokens.accessToken;
+            spin.stop("logged in");
+          } catch (err) {
+            spin.stop("browser login failed");
+            const reason = err instanceof Error ? err.message : String(err);
+            ui.log.message(`browser login failed (${reason}) - pick a method to continue`);
+          } finally {
+            spinState.spin = null;
+          }
+          if (apiToken === null) continue;
+        }
+        if (apiToken === null && choice === "paste") {
+          apiToken = await promptPastedToken(ui);
+        }
+        break;
       }
       if (apiToken === null) {
         throw new Error("no cloudflare credential available (login, CLOUDFLARE_API_TOKEN, or paste a token)");
